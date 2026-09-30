@@ -1,5 +1,6 @@
 import type { Environment } from '../config/index.ts';
 import type { Logger, TextWriter } from '../logging/index.ts';
+import type { AiProviderRegistry } from '../ai/index.ts';
 import type { WorkerRegistry } from '../workers/index.ts';
 
 /** Process exit codes used by the CLI. */
@@ -27,6 +28,8 @@ export interface CliContext {
   readonly logger: Logger;
   /** Worker registry; defaults to the built-in workers configured from `env`. */
   readonly workers?: WorkerRegistry;
+  /** AI role providers (planner, reviewer); defaults to the built-in ones. */
+  readonly aiProviders?: AiProviderRegistry;
   /** Aborted when the user interrupts (Ctrl+C); cancels running workers. */
   readonly signal?: AbortSignal;
 }

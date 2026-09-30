@@ -1,7 +1,15 @@
 import { ObjectReader, SchemaViolation, isPlainObject } from '../core/validation.ts';
 import { checkWorkflowInvariants } from './invariants.ts';
+import { decodePlanDocument } from './plan-schema.ts';
 import {
+  AI_LIMITS,
   ATTEMPT_OUTCOMES,
+  FINDING_SEVERITIES,
+  PLAN_STATUSES,
+  REVIEW_CONFIDENCE,
+  REVIEW_DECISIONS,
+  REVIEW_RECOMMENDATIONS,
+  REVIEW_STATUSES,
   CHANGE_ATTRIBUTIONS,
   CHECK_STATUSES,
   DECISION_STATUSES,
@@ -19,6 +27,13 @@ import {
   WORKER_RUN_TRIGGERS,
 } from './model.ts';
 import type {
+  AiCallMetadata,
+  ContextSummary,
+  PlanMapping,
+  PlanProposal,
+  ReviewDecision,
+  ReviewFinding,
+  TaskReview,
   AttemptExecutor,
   DecisionRecord,
   MilestoneRecord,
@@ -104,6 +119,13 @@ export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
       }),
     })),
   }),
+  // 4 -> 5: AI planning & review. No proposals or reviews existed before.
+  4: (document) => {
+    if (Object.hasOwn(document, 'planProposals') || Object.hasOwn(document, 'taskReviews')) {
+      throw new SchemaViolation('planProposals', 'is not a recognised field in schema version 4');
+    }
+    return { ...document, schemaVersion: 5, planProposals: [], taskReviews: [] };
+  },
 };
 
 function arrayOfObjects(value: unknown, path: string): Record<string, unknown>[] {
@@ -133,6 +155,8 @@ export function decodeProjectState(raw: unknown): ProjectState {
     'tasks',
     'decisions',
     'workerRuns',
+    'planProposals',
+    'taskReviews',
     'createdAt',
     'updatedAt',
   ]);
@@ -148,6 +172,8 @@ export function decodeProjectState(raw: unknown): ProjectState {
     tasks: r.array('tasks', decodeTask, 5_000),
     decisions: r.array('decisions', decodeDecision),
     workerRuns: r.array('workerRuns', decodeWorkerRun, 20_000),
+    planProposals: r.array('planProposals', decodePlanProposal, AI_LIMITS.proposals),
+    taskReviews: r.array('taskReviews', decodeTaskReview, 20_000),
     createdAt: r.timestamp('createdAt'),
     updatedAt: r.timestamp('updatedAt'),
   };
@@ -408,6 +434,129 @@ function decodeDecision(value: unknown, path: string): DecisionRecord {
     throw new SchemaViolation(`${path}.resolvedAt`, 'must be null exactly when the decision is pending');
   }
   return decision;
+}
+
+function decodePlanProposal(value: unknown, path: string): PlanProposal {
+  const r = new ObjectReader(value, path, [
+    'id',
+    'goal',
+    'status',
+    'plan',
+    'call',
+    'context',
+    'createdAt',
+    'decidedAt',
+    'reason',
+    'appliedMilestones',
+    'appliedTasks',
+  ]);
+  return {
+    id: r.id('id'),
+    goal: r.string('goal', { maxLength: AI_LIMITS.goal }),
+    status: r.oneOf('status', PLAN_STATUSES),
+    plan: r.field('plan', decodePlanDocument),
+    call: r.field('call', decodeCallMetadata),
+    context: r.field('context', decodeContextSummary),
+    createdAt: r.timestamp('createdAt'),
+    decidedAt: r.nullableTimestamp('decidedAt'),
+    reason: r.nullableString('reason', { maxLength: AI_LIMITS.reason }),
+    appliedMilestones: r.array('appliedMilestones', decodeMapping, AI_LIMITS.planMilestones),
+    appliedTasks: r.array('appliedTasks', decodeMapping, AI_LIMITS.planTasks),
+  };
+}
+
+function decodeMapping(value: unknown, path: string): PlanMapping {
+  const r = new ObjectReader(value, path, ['proposalId', 'forgeId']);
+  return { proposalId: r.string('proposalId', { maxLength: 32 }), forgeId: r.id('forgeId') };
+}
+
+function decodeCallMetadata(value: unknown, path: string): AiCallMetadata {
+  const r = new ObjectReader(value, path, ['provider', 'model', 'durationMs', 'costUsd', 'inputTokens', 'outputTokens']);
+  return {
+    provider: r.string('provider', NAME_RULES),
+    model: r.nullableString('model', NAME_RULES),
+    durationMs: r.integer('durationMs', { min: 0 }),
+    costUsd: r.nullable('costUsd', decodeNonNegativeNumber),
+    inputTokens: r.nullable('inputTokens', (item, itemPath) => decodeNonNegativeInteger(item, itemPath)),
+    outputTokens: r.nullable('outputTokens', (item, itemPath) => decodeNonNegativeInteger(item, itemPath)),
+  };
+}
+
+function decodeContextSummary(value: unknown, path: string): ContextSummary {
+  const r = new ObjectReader(value, path, ['files', 'bytes', 'truncated']);
+  return { files: r.integer('files', { min: 0 }), bytes: r.integer('bytes', { min: 0 }), truncated: r.field('truncated', decodeBoolean) };
+}
+
+function decodeTaskReview(value: unknown, path: string): TaskReview {
+  const r = new ObjectReader(value, path, [
+    'id',
+    'taskId',
+    'attempt',
+    'status',
+    'recommendation',
+    'confidence',
+    'summary',
+    'findings',
+    'call',
+    'context',
+    'diagnostic',
+    'createdAt',
+    'decision',
+  ]);
+  return {
+    id: r.id('id'),
+    taskId: r.id('taskId'),
+    attempt: r.integer('attempt', { min: 1 }),
+    status: r.oneOf('status', REVIEW_STATUSES),
+    recommendation: r.nullable('recommendation', (item, itemPath) => decodeOneOfValue(item, itemPath, REVIEW_RECOMMENDATIONS)),
+    confidence: r.nullable('confidence', (item, itemPath) => decodeOneOfValue(item, itemPath, REVIEW_CONFIDENCE)),
+    summary: r.nullableString('summary', { maxLength: AI_LIMITS.reviewSummary }),
+    findings: r.array('findings', decodeFinding, AI_LIMITS.reviewFindings),
+    call: r.field('call', decodeCallMetadata),
+    context: r.field('context', decodeContextSummary),
+    diagnostic: r.nullableString('diagnostic', { maxLength: AI_LIMITS.diagnostic }),
+    createdAt: r.timestamp('createdAt'),
+    decision: r.nullable('decision', decodeReviewDecision),
+  };
+}
+
+export function decodeFinding(value: unknown, path: string): ReviewFinding {
+  const r = new ObjectReader(value, path, ['severity', 'title', 'detail', 'paths', 'remediation']);
+  return {
+    severity: r.oneOf('severity', FINDING_SEVERITIES),
+    title: r.string('title', { maxLength: AI_LIMITS.findingTitle }),
+    detail: r.string('detail', { maxLength: AI_LIMITS.findingDetail }),
+    paths: r.array('paths', (item, itemPath) => {
+      if (typeof item !== 'string' || item === '' || item.length > EVIDENCE_LIMITS.path) {
+        throw new SchemaViolation(itemPath, 'must be a path');
+      }
+      return item;
+    }, AI_LIMITS.findingPaths),
+    remediation: r.nullableString('remediation', { maxLength: AI_LIMITS.findingRemediation }),
+  };
+}
+
+function decodeReviewDecision(value: unknown, path: string): ReviewDecision {
+  const r = new ObjectReader(value, path, ['kind', 'reason', 'decidedAt']);
+  return {
+    kind: r.oneOf('kind', REVIEW_DECISIONS),
+    reason: r.string('reason', { maxLength: AI_LIMITS.reason }),
+    decidedAt: r.timestamp('decidedAt'),
+  };
+}
+
+function decodeOneOfValue<T extends string>(value: unknown, path: string, allowed: readonly T[]): T {
+  if (typeof value !== 'string' || !(allowed as readonly string[]).includes(value)) {
+    throw new SchemaViolation(path, `must be one of: ${allowed.join(', ')}`);
+  }
+  return value as T;
+}
+
+function decodeNonNegativeNumber(value: unknown, path: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new SchemaViolation(path, 'must be a non-negative number');
+  }
+  return value;
 }
 
 function decodeWorkerRun(value: unknown, path: string): WorkerRunRecord {

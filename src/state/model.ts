@@ -14,11 +14,13 @@
  * 3 — Milestone 4: task & milestone engine — ordered milestones, tasks with
  *     instructions/dependencies/attempt budgets, attempts linked to worker
  *     runs (migrated from 2; see STATE_MIGRATIONS).
+ * 5 — Milestone 6: AI planning & review — plan proposals and task reviews
+ *     (migrated from 4 as empty lists); `review-rejected` attempt outcome.
  * 4 — Milestone 5: deterministic validation & Git safety — attempts carry
  *     the Git baseline/changeset, validation evidence, and commit record;
  *     new attempt outcomes (migrated from 3).
  */
-export const STATE_SCHEMA_VERSION = 4;
+export const STATE_SCHEMA_VERSION = 5;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -63,6 +65,8 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
  * - `accepted`: Milestone 4 manual acceptance (kept for existing state only)
  * - `rejected`: a human rejected it
  * - `scope-violation`: changes appeared outside the permitted scope
+ * - `review-rejected`: validated, but a human decided (after an AI review)
+ *   that remediation is required; the validation evidence is kept
  * - `failed`, `timeout`, `cancelled`, `unavailable`, `invalid-output`,
  *   `integrity-violation`: the invocation did not succeed (same as the run status)
  * - `interrupted`: Forge stopped before recording an outcome; set by recovery
@@ -83,6 +87,7 @@ export const ATTEMPT_OUTCOMES = [
   'validation-failed',
   'overridden',
   'scope-violation',
+  'review-rejected',
 ] as const;
 export type AttemptOutcome = (typeof ATTEMPT_OUTCOMES)[number];
 
@@ -356,6 +361,173 @@ export interface DecisionRecord {
   readonly resolvedAt: string | null;
 }
 
+/** Plan proposal lifecycle: proposed -> applied | rejected (both terminal). */
+export const PLAN_STATUSES = ['proposed', 'applied', 'rejected'] as const;
+export type PlanStatus = (typeof PLAN_STATUSES)[number];
+
+/** Bounds on AI planning and review records. */
+export const AI_LIMITS = {
+  goal: 2_000,
+  planMilestones: 10,
+  planTasks: 50,
+  planDependencies: 20,
+  planListItems: 20,
+  planItemText: 500,
+  planTitle: 200,
+  planDescription: 2_000,
+  planInstruction: 4_000,
+  planContext: 4_000,
+  planSuggestedValidation: 10,
+  proposals: 200,
+  reviewFindings: 30,
+  reviewSummary: 2_000,
+  findingTitle: 200,
+  findingDetail: 2_000,
+  findingRemediation: 1_000,
+  findingPaths: 10,
+  reviewsPerTask: 20,
+  reason: 1_000,
+  diagnostic: 500,
+} as const;
+
+export interface PlanMilestone {
+  /** Proposal-local ID, e.g. `m1`. */
+  readonly id: string;
+  readonly title: string;
+  readonly description: string | null;
+}
+
+export interface PlanTask {
+  /** Proposal-local ID, e.g. `t1`. */
+  readonly id: string;
+  readonly milestone: string;
+  readonly title: string;
+  readonly instruction: string;
+  readonly context: string | null;
+  /** Proposal-local IDs of tasks listed EARLIER in the plan. */
+  readonly dependsOn: readonly string[];
+  /** Informational only: never becomes a validation command. */
+  readonly suggestedValidation: readonly string[];
+}
+
+/** A planner's structured output, after Forge validated it. */
+export interface PlanDocument {
+  readonly summary: string;
+  readonly assumptions: readonly string[];
+  readonly milestones: readonly PlanMilestone[];
+  readonly tasks: readonly PlanTask[];
+  readonly risks: readonly string[];
+  readonly notes: string | null;
+}
+
+/** Bounded metadata about an AI call (never prompts, responses, or credentials). */
+export interface AiCallMetadata {
+  /** Provider/adapter ID, e.g. `claude-code`. */
+  readonly provider: string;
+  readonly model: string | null;
+  readonly durationMs: number;
+  readonly costUsd: number | null;
+  readonly inputTokens: number | null;
+  readonly outputTokens: number | null;
+}
+
+/** Summary of the bounded context an AI role received. */
+export interface ContextSummary {
+  readonly files: number;
+  readonly bytes: number;
+  readonly truncated: boolean;
+}
+
+export interface PlanMapping {
+  readonly proposalId: string;
+  readonly forgeId: string;
+}
+
+/**
+ * An AI-generated plan awaiting a human decision. It is not work: only
+ * `forge plan apply` turns it into milestones and tasks.
+ */
+export interface PlanProposal {
+  readonly id: string;
+  readonly goal: string;
+  readonly status: PlanStatus;
+  readonly plan: PlanDocument;
+  readonly call: AiCallMetadata;
+  readonly context: ContextSummary;
+  readonly createdAt: string;
+  readonly decidedAt: string | null;
+  /** Human reason for a rejection. */
+  readonly reason: string | null;
+  /** Proposal ID -> Forge ID, set when applied. */
+  readonly appliedMilestones: readonly PlanMapping[];
+  readonly appliedTasks: readonly PlanMapping[];
+}
+
+/**
+ * Review status, derived by Forge from finding severities (never taken
+ * from the model's own verdict):
+ *   clear             no findings above `info`
+ *   concerns          at least one `warning`
+ *   blocking-concerns at least one `error` or `critical`
+ * or the reason no review was obtained.
+ */
+export const REVIEW_STATUSES = [
+  'clear',
+  'concerns',
+  'blocking-concerns',
+  'unavailable',
+  'failed',
+  'timeout',
+  'cancelled',
+  'invalid-output',
+] as const;
+export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
+
+export const FINDING_SEVERITIES = ['info', 'warning', 'error', 'critical'] as const;
+export type FindingSeverity = (typeof FINDING_SEVERITIES)[number];
+
+export const REVIEW_RECOMMENDATIONS = ['accept', 'revise', 'reject'] as const;
+export type ReviewRecommendation = (typeof REVIEW_RECOMMENDATIONS)[number];
+
+export const REVIEW_CONFIDENCE = ['low', 'medium', 'high'] as const;
+export type ReviewConfidence = (typeof REVIEW_CONFIDENCE)[number];
+
+export interface ReviewFinding {
+  readonly severity: FindingSeverity;
+  readonly title: string;
+  readonly detail: string;
+  readonly paths: readonly string[];
+  readonly remediation: string | null;
+}
+
+/** `accepted`: implementation stands despite the review. `remediation-required`: the task is reopened. */
+export const REVIEW_DECISIONS = ['accepted', 'remediation-required'] as const;
+export type ReviewDecisionKind = (typeof REVIEW_DECISIONS)[number];
+
+export interface ReviewDecision {
+  readonly kind: ReviewDecisionKind;
+  readonly reason: string;
+  readonly decidedAt: string;
+}
+
+/** An advisory AI review of one validated task attempt. Never a validation result. */
+export interface TaskReview {
+  readonly id: string;
+  readonly taskId: string;
+  readonly attempt: number;
+  readonly status: ReviewStatus;
+  /** The model's own recommendation; advisory. */
+  readonly recommendation: ReviewRecommendation | null;
+  readonly confidence: ReviewConfidence | null;
+  readonly summary: string | null;
+  readonly findings: readonly ReviewFinding[];
+  readonly call: AiCallMetadata;
+  readonly context: ContextSummary;
+  readonly diagnostic: string | null;
+  readonly createdAt: string;
+  readonly decision: ReviewDecision | null;
+}
+
 export interface ProjectState {
   readonly schemaVersion: typeof STATE_SCHEMA_VERSION;
   readonly projectId: string;
@@ -367,6 +539,10 @@ export interface ProjectState {
   readonly decisions: readonly DecisionRecord[];
   /** Worker invocations, oldest first. */
   readonly workerRuns: readonly WorkerRunRecord[];
+  /** AI plan proposals; only applied proposals became work. */
+  readonly planProposals: readonly PlanProposal[];
+  /** Advisory AI reviews of validated task attempts. */
+  readonly taskReviews: readonly TaskReview[];
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -383,6 +559,8 @@ export function createInitialState(projectId: string, now: Date): ProjectState {
     tasks: [],
     decisions: [],
     workerRuns: [],
+    planProposals: [],
+    taskReviews: [],
     createdAt: timestamp,
     updatedAt: timestamp,
   };

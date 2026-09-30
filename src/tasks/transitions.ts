@@ -33,7 +33,8 @@ export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]
   running: ['succeeded', 'awaiting-validation', 'failed'],
   'awaiting-validation': ['succeeded', 'failed'],
   failed: ['running', 'cancelled'],
-  succeeded: [],
+  // Only via an explicit human remediation decision after an AI review (reopenForRemediation).
+  succeeded: ['failed'],
   cancelled: [],
 };
 
@@ -318,6 +319,32 @@ export function overrideTask(state: ProjectState, taskId: string, reason: string
   return replaceTask(state, resolveLastAttempt(task, 'overridden', `override: ${note}`, now, 'succeeded'));
 }
 
+/**
+ * succeeded -> failed, ONLY as an explicit human decision after an AI
+ * review ("remediation required"). The attempt keeps its validation evidence
+ * and is marked `review-rejected`; the task becomes retryable if attempts
+ * remain. Refused when dependents already ran on top of it or its milestone
+ * is completed — create a follow-up task instead.
+ */
+export function reopenForRemediation(state: ProjectState, taskId: string, attemptNumber: number, reason: string, now: Date): ProjectState {
+  const task = findTask(state, taskId);
+  const last = task.attempts.at(-1);
+  if (task.status !== 'succeeded' || last === undefined || last.number !== attemptNumber || last.outcome !== 'validated') {
+    throw new WorkflowError(`Task "${task.title}" is not a validated, succeeded task at attempt ${attemptNumber}; it cannot be reopened`);
+  }
+  const executedDependents = state.tasks.filter((candidate) => candidate.dependsOn.includes(taskId) && candidate.attempts.length > 0);
+  if (executedDependents.length > 0) {
+    throw new WorkflowError(
+      `Task "${task.title}" cannot be reopened: dependent task(s) already ran on top of it (${executedDependents.map((t) => `"${t.title}"`).join(', ')}); add a follow-up task instead`,
+    );
+  }
+  if (findMilestone(state, task.milestoneId).status === 'completed') {
+    throw new WorkflowError(`Task "${task.title}" belongs to a completed milestone; add a follow-up task instead`);
+  }
+  const note = requireText(reason, 'Remediation reason', TASK_LIMITS.note);
+  return replaceTask(state, resolveLastAttempt(task, 'review-rejected', `review remediation: ${note}`, now, 'failed'));
+}
+
 /** Records the local commit Forge created for a validated task. */
 export function recordCommit(state: ProjectState, taskId: string, attemptNumber: number, commit: CommitRecord, now: Date): ProjectState {
   const task = findTask(state, taskId);
@@ -420,7 +447,13 @@ function finishLastAttempt(task: TaskRecord, outcome: AttemptOutcome, note: stri
 }
 
 /** Records the validation verdict on the last (already finished) attempt. */
-function resolveLastAttempt(task: TaskRecord, outcome: 'overridden' | 'rejected', note: string | null, now: Date, to: TaskStatus): TaskRecord {
+function resolveLastAttempt(
+  task: TaskRecord,
+  outcome: 'overridden' | 'rejected' | 'review-rejected',
+  note: string | null,
+  now: Date,
+  to: TaskStatus,
+): TaskRecord {
   const attempts = task.attempts.map((attempt, index) =>
     index === task.attempts.length - 1 ? { ...attempt, outcome, note } : attempt,
   );

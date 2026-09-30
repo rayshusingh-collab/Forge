@@ -91,6 +91,12 @@ export function formatTask(task: TaskView, view: WorkflowView, state: ProjectSta
           : `  Commit:      not committed; ${eligibility.reason}`,
     );
   }
+  const review = state.taskReviews.filter((candidate) => candidate.taskId === task.task.id).at(-1);
+  if (review !== undefined) {
+    lines.push(
+      `  AI review:   ${review.status} (attempt ${review.attempt}, advisory)${review.decision === null ? '' : ` — decided: ${review.decision.kind}`}   (forge task review-show ${task.key})`,
+    );
+  }
   if (task.task.attempts.length > 0) {
     lines.push('  History:');
     for (const attempt of task.task.attempts) {

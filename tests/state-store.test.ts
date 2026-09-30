@@ -140,6 +140,13 @@ function populatedState(): ProjectState {
   };
 }
 
+/** Removes fields introduced in schema version 5, for documents of older versions. */
+function stripV5(doc: Record<string, unknown>): Record<string, unknown> {
+  delete doc['planProposals'];
+  delete doc['taskReviews'];
+  return doc;
+}
+
 async function writeRaw(file: string, value: unknown): Promise<void> {
   await writeFile(file, typeof value === 'string' ? value : JSON.stringify(value));
 }
@@ -258,6 +265,7 @@ describe('StateStore: rejecting bad data', () => {
     const decisions = [{ ...populatedState().decisions[0]!, taskId: null }];
     const v1: Record<string, unknown> = { ...valid(), schemaVersion: 1, milestones: [], tasks: [], decisions, phase: 'planning' };
     delete v1['workerRuns'];
+    stripV5(v1);
     await writeRaw(f.stateFile, v1);
     const loaded = await f.store.load();
     assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
@@ -273,7 +281,7 @@ describe('StateStore: rejecting bad data', () => {
 
   /** A version 2 document as Milestone 3 wrote it. */
   const v2 = (overrides: Record<string, unknown> = {}): Record<string, unknown> => {
-    const doc: Record<string, unknown> = {
+    const doc: Record<string, unknown> = stripV5({
       ...valid(),
       schemaVersion: 2,
       milestones: [],
@@ -296,7 +304,7 @@ describe('StateStore: rejecting bad data', () => {
         },
       ],
       ...overrides,
-    };
+    });
     return doc;
   };
 
@@ -317,7 +325,7 @@ describe('StateStore: rejecting bad data', () => {
 
   /** A version 3 document as Milestone 4 wrote it: attempts without changes/commit. */
   const v3 = (validation: unknown = null): Record<string, unknown> => {
-    const doc = valid();
+    const doc = stripV5(valid());
     doc['schemaVersion'] = 3;
     for (const task of doc['tasks'] as Record<string, unknown>[]) {
       task['attempts'] = (task['attempts'] as Record<string, unknown>[]).map((attempt) => {
@@ -344,9 +352,95 @@ describe('StateStore: rejecting bad data', () => {
   it('refuses version 3 validation data it cannot map', () =>
     expectLoadError(v3({ status: 'passed', checks: [], completedAt: T0.toISOString() }), /validation data that schema version 3 never recorded/));
 
+  it('migrates version 4 state: plan proposals and task reviews start empty', async () => {
+    const v4 = stripV5(valid());
+    v4['schemaVersion'] = 4;
+    await writeRaw(f.stateFile, v4);
+    const loaded = await f.store.load();
+    assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
+    assert.deepEqual([loaded.planProposals, loaded.taskReviews], [[], []]);
+    assert.deepEqual(loaded.tasks, populatedState().tasks, 'attempts, validation, and Git evidence are preserved');
+  });
+
+  it('refuses version 4 state that already contains version 5 fields', () =>
+    expectLoadError({ ...valid(), schemaVersion: 4 }, /planProposals is not a recognised field in schema version 4/));
+
+  describe('AI record invariants', () => {
+    const call = { provider: 'fake', model: null, durationMs: 1, costUsd: null, inputTokens: null, outputTokens: null };
+    const review = (fields: Record<string, unknown>) => ({
+      id: 'rv1',
+      taskId: 't1',
+      attempt: 1,
+      status: 'concerns',
+      recommendation: 'revise',
+      confidence: 'low',
+      summary: 's',
+      findings: [],
+      call,
+      context: { files: 1, bytes: 1, truncated: false },
+      diagnostic: null,
+      createdAt: T0.toISOString(),
+      decision: null,
+      ...fields,
+    });
+
+    it('accepts a valid review', async () => {
+      await writeRaw(f.stateFile, { ...valid(), taskReviews: [review({})] });
+      assert.equal((await f.store.load()).taskReviews.length, 1);
+    });
+
+    it('rejects a review of an unknown task or attempt', async () => {
+      await expectLoadError({ ...valid(), taskReviews: [review({ taskId: 'ghost' })] }, /references unknown task/);
+      await expectLoadError({ ...valid(), taskReviews: [review({ attempt: 9 })] }, /attempt 9, which does not exist/);
+    });
+
+    it('rejects a decision on a review that did not complete', () =>
+      expectLoadError(
+        { ...valid(), taskReviews: [review({ status: 'invalid-output', decision: { kind: 'accepted', reason: 'x', decidedAt: T0.toISOString() } })] },
+        /only allowed on a completed review/,
+      ));
+
+    it('rejects a remediation decision whose attempt was not reopened', () =>
+      expectLoadError(
+        { ...valid(), taskReviews: [review({ decision: { kind: 'remediation-required', reason: 'x', decidedAt: T0.toISOString() } })] },
+        /requires remediation, but the attempt was not reopened/,
+      ));
+
+    it('rejects an applied proposal whose mapping does not cover the plan', () =>
+      expectLoadError(
+        {
+          ...valid(),
+          planProposals: [
+            {
+              id: 'p1',
+              goal: 'g',
+              status: 'applied',
+              plan: {
+                summary: 's',
+                assumptions: [],
+                milestones: [{ id: 'm1', title: 'M', description: null }],
+                tasks: [{ id: 't1', milestone: 'm1', title: 'T', instruction: 'i', context: null, dependsOn: [], suggestedValidation: [] }],
+                risks: [],
+                notes: null,
+              },
+              call,
+              context: { files: 0, bytes: 0, truncated: false },
+              createdAt: T0.toISOString(),
+              decidedAt: T0.toISOString(),
+              reason: null,
+              appliedMilestones: [],
+              appliedTasks: [],
+            },
+          ],
+        },
+        /applied but its mapping does not cover the plan/,
+      ));
+  });
+
   it('still chains every migration from version 1', async () => {
     const v1: Record<string, unknown> = { ...valid(), schemaVersion: 1, milestones: [], tasks: [], decisions: [] };
     delete v1['workerRuns'];
+    stripV5(v1);
     await writeRaw(f.stateFile, v1);
     const loaded = await f.store.load();
     assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);

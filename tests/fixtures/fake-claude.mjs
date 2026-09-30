@@ -20,6 +20,7 @@ Options:
   -p, --print                      Print response and exit
   --restricted                     Restricted mode
   --strict-mcp-config              Only use MCP servers from --mcp-config
+  --system-prompt <prompt>         System prompt to use for the session
   --tools <tools...>               Specify the list of available tools
 `;
 
@@ -47,6 +48,17 @@ process.stdin.on('data', (chunk) => {
 });
 process.stdin.on('end', () => {
   writeFileSync(new URL('invocation.json', here), JSON.stringify({ argv: args, stdin, cwd: process.cwd() }));
+  // AI roles (planner/reviewer) replace the system prompt; answer with the configured JSON.
+  const systemPrompt = args.find((arg) => arg.startsWith('--system-prompt='));
+  if (systemPrompt !== undefined && config.mode !== 'error' && config.mode !== 'garbage' && config.mode !== 'sleep') {
+    const role = systemPrompt.includes('You are the planner') ? 'planner' : 'reviewer';
+    writeFileSync(new URL(`${role}-invocation.json`, here), JSON.stringify({ argv: args, stdin, cwd: process.cwd() }));
+    const answer = role === 'planner' ? config.plannerResult : config.reviewerResult;
+    if (answer !== undefined) {
+      process.stdout.write(`${result({ result: answer })}\n`);
+      process.exit(0);
+    }
+  }
   respond();
 });
 

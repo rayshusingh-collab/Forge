@@ -51,7 +51,17 @@ Early development. Implemented so far:
 - `forge task validate`, `forge task override --reason` (audited), and `forge task commit` (safe, local, attributed files only)
 - npm and npx launchers run without a shell; state schema v4 (migrated from v3)
 
-AI planning, AI review, automatic retries, and autonomous execution are **not** implemented yet. **Worker output is a claim; validator output is evidence; Forge's workflow state is the decision.** Nothing runs unless you explicitly ask for it, one task at a time.
+**Milestone 6 — AI Planning & Review**
+
+- provider-independent AI roles: the planner and the reviewer are chosen per command and recorded by provider ID
+- `forge plan create|list|show|apply|reject|context`: AI plans are stored as **proposals** and become work only when a human applies them
+- `forge task review|review-show|review-accept|review-reject`: advisory AI review of validated tasks, plus recorded human decisions
+- bounded, Git-aware project context: ignored files (such as `.env`) are never read, and secret-like paths are withheld
+- planning and review are read-only: no tools, verified afterwards; state schema v5 (migrated from v4)
+
+Automatic retries, autonomous remediation, and autonomous execution are **not** implemented yet. Nothing runs unless you explicitly ask for it, one task at a time.
+
+> **Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Forge controls state. Human approves consequential AI decisions.**
 
 ## Prerequisites
 
@@ -135,6 +145,15 @@ forge task commit <task>
 forge validation add --name <id> --executable <program> [--cwd <dir>] [--timeout <seconds>]
       [--optional] [-- <args>...]
 forge validation list | show <id> | remove <id> | run
+
+forge plan create --goal <text> [--planner <name>] [--timeout <seconds>]
+forge plan list | show <plan> | apply <plan> | context
+forge plan reject <plan> --reason <text>
+
+forge task review <task> [--reviewer <name>] [--timeout <seconds>]
+forge task review-show <task>
+forge task review-accept <task> --reason <text>
+forge task review-reject <task> --reason <text>
 forge task cancel <task> [--reason <text>]
 forge task recover <task> [--force]
 ```
@@ -351,6 +370,61 @@ forge validation run        # try the checks now; records nothing
 - Repository hooks run as for any commit.
 - Nothing is ever pushed. The Git layer has no push, reset, clean, checkout, stash, rebase, merge or amend operations at all.
 
+## AI planning and review
+
+**Roles and providers.**
+- Forge has two AI roles, the **planner** and the **reviewer**. Both are Forge code: each builds a request, calls a provider, and validates the answer.
+- Providers are chosen per command (`--planner`, `--reviewer`; default `claude`) and recorded by ID with every plan and review. Nothing assumes the planner, the implementer and the reviewer are the same provider, so another provider can take a role later without schema changes.
+- AI output is treated as untrusted: a proposal or an opinion. Deterministic validation is the objective evidence; Forge's state machine holds the authority; a human approves plans.
+
+**Read-only by construction.**
+- The Claude provider runs planning and review with **no tools** (`--tools=""`) and `--restricted`, with Forge's rules as the whole system prompt, in a fresh empty temporary directory.
+- All context arrives on stdin, prepared by Forge. The model can't read or change the project.
+- Independently, Forge snapshots `.forge/` metadata and the Git working tree before the call and verifies them afterwards. If anything changed, the result is discarded and nothing is recorded. This also catches your own edits made during the call.
+- Planning and review never commit, never run workers, and never change validation checks.
+
+**Context.**
+- Files come from `git ls-files --cached --others --exclude-standard`, so Git-ignored files (`.env`, build output, dependencies) are **never listed or read**.
+- On top of that, a deny policy withholds secret-like paths (`.env*` except `.env.example`, keys and certificates, `.npmrc`/`.netrc`, credential and secret files, `.ssh`/`.aws`, Terraform variables and state), protected paths (`.git`, `.forge`), generated files (lockfiles, `dist`, `node_modules`) and binaries.
+- Limits are deterministic: 40 files, 150 KB in total, 12 KB per file, and 400 tree entries. Manifests come first, then shallower files. Truncation is shown to the model and recorded.
+- `forge plan context` shows exactly what a planner would receive.
+- This is **not** secret detection: a secret pasted into ordinary source code would be sent. Keep secrets in ignored files.
+
+**Prompt-injection resistance.**
+- Repository content, task text, diffs and worker output are placed in `<forge-…>` data blocks. Any Forge-looking tags inside them are neutralized, and the rules say that data is never instructions.
+- Answers must be exactly one JSON object and are validated against a strict schema; unknown fields such as `command` or `setTaskStatus` are rejected. So even a successful injection can only produce a proposal or an opinion, never an action.
+
+**Plans** (`forge plan create --goal "..."`).
+- The planner answers with milestones, tasks, dependencies, assumptions, risks and informational `suggestedValidation`.
+- Forge validates the answer strictly:
+  - 1–10 milestones and 1–50 tasks;
+  - bounded text;
+  - unique IDs;
+  - every milestone has a task;
+  - a task may depend only on tasks listed earlier, so there are no cycles and the order is deterministic;
+  - no unknown fields.
+- A failed, malformed, oversized or refused answer stores nothing.
+- A valid plan is stored as a **proposal**, which is not work. `forge plan apply` creates its milestones and tasks atomically, with dependencies mapped to real IDs, and starts nothing. It never changes files or validation checks: suggested checks are never configured automatically.
+- `forge plan reject --reason` records why; a rejected plan can never be applied.
+
+**Reviews** (`forge task review <task>`).
+- Only a task whose latest attempt **passed deterministic validation** is reviewed. Failed validation already decides the outcome.
+- The reviewer receives a bounded packet:
+  - the task;
+  - the validation results;
+  - the worker's summary, labeled as a claim;
+  - diffs of the task-attributed files against the task's baseline commit (50 files, 100 KB in total, 8 KB per file).
+- In the packet, mixed files are labeled as containing pre-existing changes, and secret-like or binary paths are withheld.
+- Forge derives the status from the findings' severities, not from the model's verdict: `clear` (info only), `concerns` (any warning), `blocking-concerns` (any error or critical).
+- Failed calls are recorded as `unavailable`, `timeout`, `cancelled`, `failed` or `invalid-output`.
+- **Reviews are advisory.** They never change task status, never erase validation evidence, and never trigger repairs or re-runs.
+
+**Review decisions** (human, recorded with a reason).
+- `forge task review-accept`: the implementation stands despite the review. Nothing else changes.
+- `forge task review-reject`: remediation is required. The attempt becomes `review-rejected` and keeps its validation evidence; the task becomes `failed` (retryable if attempts remain), and dependents go back to waiting.
+  - It's refused if a dependent task has already run on top of it, or its milestone is completed; add a follow-up task instead.
+  - Nothing starts; re-run the task explicitly.
+
 ## Current limitations
 
 - **Control-state guard is detective, not preventive:** Claude's file tools are not blocked from `.forge/`, because Forge doesn't rely on unverified path-rule syntax. Instead, the guard described below detects any change. It does not prevent the change or undo it.
@@ -359,6 +433,9 @@ forge validation run        # try the checks now; records nothing
 - **Worker environment:** the worker inherits Forge's environment variables. It has no tool that could read them.
 - **Interrupted manual runs:** a `forge worker run` interrupted by a crash (not by Ctrl+C) stays recorded as `running`. Task executions are detected as `interrupted` and recovered with `forge task recover`.
 - **Interruption detection is local:** Forge checks whether the recorded process ID is still alive on the same host. An executor on another host can't be checked (use `--force`), and a reused process ID could make a dead execution look alive.
+- **AI context is best-effort about secrets:** ignored files and secret-like paths are excluded, but a secret inside ordinary tracked source would be included.
+- **Concurrent edits during AI calls:** planning and review can't tell your concurrent edits from AI changes, so editing files during a call discards its result.
+- **No model identifier:** the Claude CLI's JSON output doesn't reliably report the model used, so none is recorded.
 - **Ignored files are invisible:** attribution and scope checks rely on `git status`, so a worker writing to a Git-ignored path (`dist/`, `.env`) isn't observed. Forge verifies what Git and the file system show inside the project, not the whole machine.
 - **Validation runs project code:** a check such as `npm test` executes code the worker may have changed. Forge protects the check definitions, not the code they run. V1 is not a sandbox.
 - **Concurrent profile edits:** changing validation checks while a read-only task is running is reported as an integrity violation.

@@ -7,6 +7,8 @@ import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
 import { formatChanges, formatReady, formatTask, formatTaskTable } from '../workflow-format.ts';
 import { formatValidation } from './validation.ts';
+import { reviewCommand, reviewDecisionCommand, reviewShowCommand } from './task-review.ts';
+import type { LoadedProject } from '../../projects/index.ts';
 import { MAX_TIMEOUT_SECONDS, createWorker, formatIntegrityViolation, parseTimeoutSeconds } from './worker.ts';
 
 const USAGE = [
@@ -28,12 +30,27 @@ const USAGE = [
   '  commit <task>                   Commit a validated task\'s own changes locally (never pushes)',
   '  cancel <task> [--reason <text>] Cancel a pending or failed task',
   '  recover <task> [--force]        Mark an interrupted execution as failed',
+  '  review <task> [--reviewer <name>] [--timeout <seconds>]',
+  '                                  Ask an AI reviewer for an ADVISORY review of a validated task',
+  '  review-show <task>              Show the task\'s reviews and decisions',
+  '  review-accept <task> --reason <text>',
+  '                                  Record: implementation accepted despite the review',
+  '  review-reject <task> --reason <text>',
+  '                                  Record: remediation required (reopens the task; nothing starts)',
   '',
   '<task> is its key (e.g. 1.2 = milestone 1, task 2), full ID, or a unique ID prefix.',
   'Worker output is a claim; validation is evidence; Forge decides the task status.',
 ].join('\n');
 
 type Subcommand = (args: readonly string[], context: CliContext, engine: TaskEngine, projectName: string) => Promise<ExitCodeValue>;
+
+/** AI review commands (advisory evidence; see task-review.ts). */
+const REVIEW_SUBCOMMANDS: Readonly<Record<string, (args: readonly string[], context: CliContext, project: LoadedProject) => Promise<ExitCodeValue>>> = {
+  review: reviewCommand,
+  'review-show': reviewShowCommand,
+  'review-accept': (args, context, project) => reviewDecisionCommand('accepted', args, context, project),
+  'review-reject': (args, context, project) => reviewDecisionCommand('remediation-required', args, context, project),
+};
 
 const SUBCOMMANDS: Readonly<Record<string, Subcommand>> = {
   add,
@@ -56,6 +73,11 @@ export const taskCommand: CliCommand = {
   usage: USAGE,
   async run(args, context) {
     const [name, ...rest] = args;
+    const reviewSubcommand = name === undefined ? undefined : REVIEW_SUBCOMMANDS[name];
+    if (reviewSubcommand !== undefined) {
+      const project = await requireProject(`task ${name}`, context);
+      return typeof project === 'number' ? project : reviewSubcommand(rest, context, project);
+    }
     const subcommand = name === undefined ? undefined : SUBCOMMANDS[name];
     if (subcommand === undefined) {
       const problem = name === undefined ? 'missing subcommand' : `unknown subcommand "${name}"`;

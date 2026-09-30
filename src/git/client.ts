@@ -67,6 +67,31 @@ export class GitClient {
     return parsePorcelainV2(result.stdout);
   }
 
+  /**
+   * Tracked files plus untracked files that are NOT ignored (Git's own
+   * `.gitignore` rules). Ignored files, such as `.env`, are never listed.
+   */
+  async listFiles(): Promise<string[]> {
+    const result = await this.run(['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--full-name'], {
+      maxOutputBytes: MAX_STATUS_BYTES,
+    });
+    if (result.stdoutTruncated) {
+      throw new GitError('git ls-files output exceeded the capture limit');
+    }
+    return [...new Set(result.stdout.split('\0').filter((path) => path !== ''))].sort();
+  }
+
+  /**
+   * Unified diff of one path between `commit` and the working tree
+   * (read-only; external diff tools and text conversion are disabled).
+   */
+  async diffPath(commit: string, path: string, maxBytes: number): Promise<{ readonly text: string; readonly truncated: boolean }> {
+    const result = await this.run(['diff', '--no-color', '--no-ext-diff', '--no-textconv', '-U3', commit, '--', path], {
+      maxOutputBytes: maxBytes,
+    });
+    return { text: result.stdout, truncated: result.stdoutTruncated };
+  }
+
   /** Stages explicit new files. Paths are literal and follow `--`. */
   async addPaths(paths: readonly string[]): Promise<void> {
     if (paths.length > 0) {

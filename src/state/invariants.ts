@@ -1,5 +1,6 @@
 import { SchemaViolation } from '../core/validation.ts';
 import { describeDependencyProblem, findDependencyProblem } from './graph.ts';
+import { AI_LIMITS } from './model.ts';
 import type { AttemptOutcome, ProjectState, TaskAttempt, TaskRecord, TaskStatus, WorkerRunRecord, WorkerRunStatus } from './model.ts';
 
 /**
@@ -20,6 +21,7 @@ export const FAILED_ATTEMPT_OUTCOMES: readonly AttemptOutcome[] = [
   'interrupted',
   'validation-failed',
   'scope-violation',
+  'review-rejected',
 ];
 
 /** Attempt outcomes that make a task succeeded. `accepted` exists only in Milestone 4 state. */
@@ -55,6 +57,7 @@ export function runStatusForAttempt(outcome: AttemptOutcome): WorkerRunStatus {
     case 'validation-failed':
     case 'overridden':
     case 'scope-violation':
+    case 'review-rejected':
       // Validation and scope verdicts come after a worker invocation that succeeded.
       return 'success';
     default:
@@ -119,6 +122,100 @@ export function checkWorkflowInvariants(state: ProjectState): void {
       throw new SchemaViolation(`decisions[${index}].taskId`, `references unknown task "${decision.taskId}"`);
     }
   });
+
+  checkPlanProposals(state, milestoneIds, taskIds);
+  checkTaskReviews(state);
+}
+
+/** Proposal status must match its decision fields; applied mappings must point at real work. */
+function checkPlanProposals(state: ProjectState, milestoneIds: ReadonlySet<string>, taskIds: ReadonlySet<string>): void {
+  uniqueIds(state.planProposals, 'planProposals');
+  state.planProposals.forEach((proposal, index) => {
+    const path = `planProposals[${index}]`;
+    const mapped = proposal.appliedMilestones.length + proposal.appliedTasks.length > 0;
+    switch (proposal.status) {
+      case 'proposed':
+        if (proposal.decidedAt !== null || proposal.reason !== null || mapped) {
+          throw new SchemaViolation(path, 'is proposed but carries a decision');
+        }
+        break;
+      case 'rejected':
+        if (proposal.decidedAt === null || proposal.reason === null || mapped) {
+          throw new SchemaViolation(path, 'is rejected but lacks a reason or has applied work');
+        }
+        break;
+      case 'applied': {
+        const complete =
+          proposal.decidedAt !== null &&
+          sameIds(proposal.appliedMilestones.map((m) => m.proposalId), proposal.plan.milestones.map((m) => m.id)) &&
+          sameIds(proposal.appliedTasks.map((t) => t.proposalId), proposal.plan.tasks.map((t) => t.id));
+        if (!complete) {
+          throw new SchemaViolation(path, 'is applied but its mapping does not cover the plan');
+        }
+        for (const mapping of proposal.appliedMilestones) {
+          if (!milestoneIds.has(mapping.forgeId)) {
+            throw new SchemaViolation(`${path}.appliedMilestones`, `references unknown milestone "${mapping.forgeId}"`);
+          }
+        }
+        for (const mapping of proposal.appliedTasks) {
+          if (!taskIds.has(mapping.forgeId)) {
+            throw new SchemaViolation(`${path}.appliedTasks`, `references unknown task "${mapping.forgeId}"`);
+          }
+        }
+        break;
+      }
+    }
+  });
+}
+
+/**
+ * Reviews must reference real attempts; decisions only follow a completed
+ * review; a `remediation-required` decision and a `review-rejected` attempt
+ * always appear together.
+ */
+function checkTaskReviews(state: ProjectState): void {
+  uniqueIds(state.taskReviews, 'taskReviews');
+  const tasks = new Map(state.tasks.map((task) => [task.id, task]));
+  const perTask = new Map<string, number>();
+  const remediated = new Set<string>();
+  state.taskReviews.forEach((review, index) => {
+    const path = `taskReviews[${index}]`;
+    const task = tasks.get(review.taskId);
+    if (task === undefined) {
+      throw new SchemaViolation(`${path}.taskId`, `references unknown task "${review.taskId}"`);
+    }
+    const attempt = task.attempts[review.attempt - 1];
+    if (attempt === undefined) {
+      throw new SchemaViolation(`${path}.attempt`, `references attempt ${review.attempt}, which does not exist`);
+    }
+    perTask.set(review.taskId, (perTask.get(review.taskId) ?? 0) + 1);
+    const completed = review.status === 'clear' || review.status === 'concerns' || review.status === 'blocking-concerns';
+    if (review.decision !== null && !completed) {
+      throw new SchemaViolation(`${path}.decision`, 'is only allowed on a completed review');
+    }
+    if (review.decision?.kind === 'remediation-required') {
+      if (attempt.outcome !== 'review-rejected') {
+        throw new SchemaViolation(`${path}.decision`, 'requires remediation, but the attempt was not reopened');
+      }
+      remediated.add(`${review.taskId}#${review.attempt}`);
+    }
+  });
+  for (const [taskId, count] of perTask) {
+    if (count > AI_LIMITS.reviewsPerTask) {
+      throw new SchemaViolation('taskReviews', `contain more than ${AI_LIMITS.reviewsPerTask} reviews for task "${taskId}"`);
+    }
+  }
+  for (const task of state.tasks) {
+    task.attempts.forEach((attempt) => {
+      if (attempt.outcome === 'review-rejected' && !remediated.has(`${task.id}#${attempt.number}`)) {
+        throw new SchemaViolation(`tasks`, `attempt ${attempt.number} of "${task.id}" is review-rejected without a recorded review decision`);
+      }
+    });
+  }
+}
+
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
 }
 
 function checkTask(

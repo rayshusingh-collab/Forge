@@ -1,3 +1,4 @@
+import { fenceData } from '../core/fence.ts';
 import type { WorkerRequest } from './types.ts';
 
 /**
@@ -34,15 +35,10 @@ export function buildPromptEnvelope(request: WorkerRequest): PromptEnvelope {
     '- When finished, reply with a concise summary of what you did and anything left unresolved.',
   ].join('\n');
 
-  const sections = [`<forge-task>\n${fence(request.task)}\n</forge-task>`];
+  const sections = [`<forge-task>\n${fenceData(request.task)}\n</forge-task>`];
   if (request.context !== null) {
-    sections.push(`<forge-context>\n${fence(request.context)}\n</forge-context>`);
+    sections.push(`<forge-context>\n${fenceData(request.context)}\n</forge-context>`);
   }
 
   return { instructions, message: sections.join('\n\n') };
-}
-
-/** Prevents text from closing (or opening) Forge's fences. */
-function fence(text: string): string {
-  return text.replace(/<(\/?)(forge-[a-z]+)/gi, '<$1​$2');
 }

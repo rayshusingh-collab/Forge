@@ -1,5 +1,7 @@
 export {
   CLAUDE_TOOLS,
+  REQUIRED_ROLE_OPTIONS,
+  buildClaudeRoleArgs,
   FORBIDDEN_CLAUDE_OPTIONS,
   REQUIRED_CLAUDE_OPTIONS,
   buildClaudeArgs,

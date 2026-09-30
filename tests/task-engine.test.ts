@@ -252,7 +252,7 @@ describe('runnability', () => {
       running: ['succeeded', 'awaiting-validation', 'failed'],
       'awaiting-validation': ['succeeded', 'failed'],
       failed: ['running', 'cancelled'],
-      succeeded: [],
+      succeeded: ['failed'],
       cancelled: [],
     });
   });

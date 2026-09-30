@@ -1,6 +1,8 @@
 import { DEFAULT_CONFIG, loadConfig } from '../config/index.ts';
 import type { ForgeConfig } from '../config/index.ts';
 import { ProcessRunner } from '../execution/index.ts';
+import { createAiProviderRegistry } from '../ai/index.ts';
+import type { AiProvider, AiProviderRegistry } from '../ai/index.ts';
 import { createWorkerRegistry } from '../workers/index.ts';
 import type { WorkerRegistry } from '../workers/index.ts';
 import type { CliContext } from './types.ts';
@@ -42,4 +44,23 @@ export function resolveWorkers(context: CliContext, options: { lenient?: boolean
     config = DEFAULT_CONFIG;
   }
   return createWorkerRegistry({ config, runner: createRunner(context, config), logger: context.logger });
+}
+
+export function resolveAiProviders(context: CliContext): AiProviderRegistry {
+  if (context.aiProviders !== undefined) {
+    return context.aiProviders;
+  }
+  const config = lenientConfig(context);
+  return createAiProviderRegistry({ config, runner: createRunner(context, config), logger: context.logger });
+}
+
+/** The named provider for an AI role, or undefined after explaining on stderr. */
+export function createAiProvider(name: string, role: string, context: CliContext): AiProvider | undefined {
+  const registry = resolveAiProviders(context);
+  const provider = registry.create(name);
+  if (provider === undefined) {
+    const known = registry.list().flatMap((entry) => [entry.id, ...entry.aliases]);
+    context.stderr.write(`forge: unknown ${role} "${name}" (available: ${known.join(', ')})\n`);
+  }
+  return provider;
 }

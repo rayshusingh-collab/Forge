@@ -3,7 +3,15 @@ export type { HeldFileLock } from './files.ts';
 export { describeDependencyProblem, findCycle, findDependencyProblem } from './graph.ts';
 export type { DependencyNode, DependencyProblem } from './graph.ts';
 export { FAILED_ATTEMPT_OUTCOMES, checkWorkflowInvariants, runStatusForAttempt, statusImpliedByAttempts } from './invariants.ts';
+export { decodePlanDocument } from './plan-schema.ts';
 export {
+  AI_LIMITS,
+  FINDING_SEVERITIES,
+  PLAN_STATUSES,
+  REVIEW_CONFIDENCE,
+  REVIEW_DECISIONS,
+  REVIEW_RECOMMENDATIONS,
+  REVIEW_STATUSES,
   ATTEMPT_OUTCOMES,
   CHANGE_ATTRIBUTIONS,
   CHECK_STATUSES,
@@ -23,6 +31,22 @@ export {
   createInitialState,
 } from './model.ts';
 export type {
+  AiCallMetadata,
+  ContextSummary,
+  FindingSeverity,
+  PlanDocument,
+  PlanMapping,
+  PlanMilestone,
+  PlanProposal,
+  PlanStatus,
+  PlanTask,
+  ReviewConfidence,
+  ReviewDecision,
+  ReviewDecisionKind,
+  ReviewFinding,
+  ReviewRecommendation,
+  ReviewStatus,
+  TaskReview,
   AttemptExecutor,
   AttemptOutcome,
   DecisionRecord,
@@ -50,7 +74,7 @@ export type {
   WorkerRunStatus,
   WorkerRunTrigger,
 } from './model.ts';
-export { STATE_MIGRATIONS, decodeProjectState } from './schema.ts';
+export { STATE_MIGRATIONS, decodeFinding, decodeProjectState } from './schema.ts';
 export { DEFAULT_LOCK_TIMEOUT_MS, StateStore } from './state-store.ts';
 export type { StateLease, StateStoreOptions } from './state-store.ts';
 export { UnsupportedVersionError, readSchemaVersion, upgradeDocument } from './versioning.ts';

@@ -18,6 +18,7 @@ export {
   recordCommit,
   recordValidation,
   recoverTask,
+  reopenForRemediation,
   rejectTask,
   startAttempt,
   taskStatusForOutcome,

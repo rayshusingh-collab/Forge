@@ -183,6 +183,8 @@ export function formatStatus(
     ['Attention', attention.length === 0 ? 'none' : attention.join('; ')],
     ['Validation', formatValidationSummary(validation)],
     ['Uncommitted', formatUncommitted(view)],
+    ['Plans', formatPlans(state)],
+    ['Reviews', formatReviews(state, view)],
     ['Worker runs', formatWorkerRuns(state)],
     ['Revision', String(state.revision)],
     ['Updated', state.updatedAt],
@@ -211,6 +213,26 @@ function formatUncommitted(view: WorkflowView): string {
       return `${task.key} (${eligibility.ok ? 'committable' : 'commit refused'})`;
     })
     .join(', ');
+}
+
+function formatPlans(state: ProjectState): string {
+  if (state.planProposals.length === 0) {
+    return 'none';
+  }
+  const count = (status: string): number => state.planProposals.filter((plan) => plan.status === status).length;
+  return `${state.planProposals.length} (proposed ${count('proposed')}, applied ${count('applied')}, rejected ${count('rejected')})`;
+}
+
+/** Latest review per task that raised concerns and has no human decision yet. */
+function formatReviews(state: ProjectState, view: WorkflowView): string {
+  if (state.taskReviews.length === 0) {
+    return 'none';
+  }
+  const latest = new Map(state.taskReviews.map((review) => [review.taskId, review]));
+  const undecided = [...latest.values()].filter((review) => (review.status === 'concerns' || review.status === 'blocking-concerns') && review.decision === null);
+  return undecided.length === 0
+    ? `${state.taskReviews.length} (no undecided concerns)`
+    : `${state.taskReviews.length}; undecided concerns on ${undecided.map((review) => view.task(review.taskId)?.key ?? '?').join(', ')}`;
 }
 
 function formatMilestoneCounts(state: ProjectState): string {

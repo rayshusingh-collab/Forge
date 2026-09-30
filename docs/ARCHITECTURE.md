@@ -272,6 +272,10 @@ Converts a high-level objective into structured milestones and tasks.
 
 
 
+Implemented (Milestone 6, `src/planning/`, `src/ai/`, `src/context/`): the planner is a Forge role backed by any registered `AiProvider`. It receives bounded, Git-aware project context: ignored files are never read, and secret-like and protected paths are withheld. Its answer must be one JSON object that passes a strict schema (bounded counts, unique IDs, dependencies only on earlier tasks, no unknown fields), and it is stored as a **proposal**. Only `forge plan apply`, a human decision, turns a proposal into milestones and tasks, atomically and through the normal task transitions. Planning is read-only: the provider has no tools and runs in an empty scratch directory, and Forge verifies `.forge/` and the working tree before and after.
+
+
+
 Planning and implementation should remain separate concepts.
 
 
@@ -459,6 +463,12 @@ Implemented (Milestone 5, `src/validation/`): worker output is a claim, validato
 
 
 Evaluates whether implementation satisfies the task.
+
+
+
+Implemented (Milestone 6, `src/review/`): the AI reviewer critiques an attempt that already passed deterministic validation, using a bounded packet: the task, validation results, the worker's claim labeled as such, and task-attributed diffs with mixed files labeled. Its output is **advisory evidence**, kept separate from validation everywhere. Forge derives the review status from finding severities, and a review never changes task status. Only a recorded human decision has consequences: `review-accept` records it; `review-reject` reopens the task (the attempt becomes `review-rejected` with its validation evidence kept) and starts nothing.
+
+Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Forge controls state. Human approves consequential AI decisions.
 
 
 

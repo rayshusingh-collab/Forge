@@ -91,10 +91,40 @@ export function buildClaudeArgs(input: ClaudeArgsInput): string[] {
   return args;
 }
 
+/** Options an AI *role* (planner, reviewer) additionally needs. */
+export const REQUIRED_ROLE_OPTIONS = ['--system-prompt'] as const;
+
+/**
+ * Invocation for a read-only AI role. Stricter than the implementer:
+ * - `--tools=` (empty): NO tools at all — no file reads, no edits, no
+ *   commands. All context arrives on stdin, prepared and bounded by Forge.
+ * - `--system-prompt=`: Forge's role rules REPLACE the default coding-agent
+ *   system prompt.
+ * - `--permission-mode=dontAsk` with `--permission-prompts=none`: anything
+ *   requiring permission is denied.
+ * The caller runs it in an empty temporary directory, never in the project.
+ */
+export function buildClaudeRoleArgs(instructions: string): string[] {
+  const args = [
+    '--print',
+    '--output-format=json',
+    '--restricted',
+    '--tools=',
+    '--permission-mode=dontAsk',
+    '--permission-prompts=none',
+    '--strict-mcp-config',
+    '--disable-slash-commands',
+    '--no-session-persistence',
+    `--system-prompt=${instructions}`,
+  ];
+  assertNoForbiddenOptions(args);
+  return args;
+}
+
 function assertNoForbiddenOptions(args: readonly string[]): void {
   for (const arg of args) {
-    // The appended system prompt is Forge's own text and may mention anything.
-    if (arg.startsWith('--append-system-prompt=')) {
+    // System prompts are Forge's own text and may mention anything.
+    if (arg.startsWith('--append-system-prompt=') || arg.startsWith('--system-prompt=')) {
       continue;
     }
     for (const forbidden of FORBIDDEN_CLAUDE_OPTIONS) {
