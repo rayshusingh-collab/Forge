@@ -55,6 +55,38 @@ describe('ProcessRunner', () => {
     assert.equal(result.stderr, 'err');
   });
 
+  it('writes input to stdin and closes it', async () => {
+    const input = 'line one\n$(whoami) && echo "quoted" %PATH%\nünïcødé ✓';
+    const result = await runner.run(
+      nodeScript(`let s=''; process.stdin.on('data', d => s += d); process.stdin.on('end', () => process.stdout.write(s))`, {
+        input,
+      }),
+    );
+    assert.equal(result.outcome, 'success');
+    assert.equal(result.stdout, input);
+  });
+
+  it('keeps stdin closed when no input is given', async () => {
+    const result = await runner.run(
+      nodeScript(`process.stdin.on('data', () => {}); process.stdin.on('end', () => process.stdout.write('eof'))`, {
+        timeoutMs: 10_000,
+      }),
+    );
+    assert.equal(result.stdout, 'eof');
+  });
+
+  it('tolerates a process that exits without reading its input', async () => {
+    const result = await runner.run(nodeScript(`process.exit(0)`, { input: 'x'.repeat(1024 * 1024) }));
+    assert.equal(result.outcome, 'success');
+  });
+
+  it('applies a per-request output limit', async () => {
+    const result = await runner.run(nodeScript(`process.stdout.write('x'.repeat(5000))`, { maxOutputBytes: 10 }));
+    assert.equal(result.stdout.length, 10);
+    assert.equal(result.stdoutTruncated, true);
+    await assert.rejects(runner.run(nodeScript('', { maxOutputBytes: 0 })), ValidationError);
+  });
+
   it('passes arguments verbatim without shell interpretation', async () => {
     const tricky = ['a b', '"quoted"', '$HOME', '%PATH%', '&& echo injected', '|', '*'];
     const result = await runner.run({

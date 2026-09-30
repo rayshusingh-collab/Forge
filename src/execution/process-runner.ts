@@ -7,7 +7,7 @@ import { performance } from 'node:perf_hooks';
 import { ValidationError } from '../core/errors.ts';
 import { silentLogger } from '../logging/index.ts';
 import type { Logger } from '../logging/index.ts';
-import type { ProcessOutcome, ProcessRequest, ProcessResult, ProcessSpawnFailure } from './types.ts';
+import type { ProcessExecutor, ProcessOutcome, ProcessRequest, ProcessResult, ProcessSpawnFailure } from './types.ts';
 
 export interface ProcessRunnerOptions {
   /** Timeout applied when a request does not specify one. */
@@ -35,7 +35,7 @@ export const DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
  * invalid request throws (`ValidationError`). Use `assertProcessSucceeded`
  * when a failure should become an exception.
  */
-export class ProcessRunner {
+export class ProcessRunner implements ProcessExecutor {
   private readonly defaultTimeoutMs: number;
   private readonly killGraceMs: number;
   private readonly maxOutputBytes: number;
@@ -56,6 +56,12 @@ export class ProcessRunner {
     const timeoutMs = request.timeoutMs ?? this.defaultTimeoutMs;
     validateCommand(request.command, args);
     assertPositiveInteger(timeoutMs, 'timeoutMs');
+    if (request.maxOutputBytes !== undefined) {
+      assertPositiveInteger(request.maxOutputBytes, 'maxOutputBytes');
+    }
+    if (request.input !== undefined && typeof request.input !== 'string') {
+      throw new ValidationError('Process input must be a string');
+    }
     await validateWorkingDirectory(request.cwd);
 
     const base = { command: request.command, args, cwd: request.cwd, timeoutMs };
@@ -115,7 +121,8 @@ export class ProcessRunner {
         cwd: base.cwd,
         env: { ...process.env, ...request.env },
         shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        // stdin stays closed unless input is supplied, so no child can block waiting for it.
+        stdio: [request.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
         windowsHide: true,
       });
     } catch (error) {
@@ -124,8 +131,16 @@ export class ProcessRunner {
     }
 
     return new Promise<ProcessResult>((resolve) => {
-      const stdout = new OutputCollector(this.maxOutputBytes);
-      const stderr = new OutputCollector(this.maxOutputBytes);
+      const outputLimit = request.maxOutputBytes ?? this.maxOutputBytes;
+      const stdout = new OutputCollector(outputLimit);
+      const stderr = new OutputCollector(outputLimit);
+
+      if (request.input !== undefined && child.stdin !== null) {
+        // A child that exits without reading its input raises EPIPE; the
+        // process outcome already describes what happened.
+        child.stdin.on('error', () => undefined);
+        child.stdin.end(request.input, 'utf8');
+      }
       const timers: NodeJS.Timeout[] = [];
       let settled = false;
       let terminationReason: 'timeout' | 'cancelled' | undefined;

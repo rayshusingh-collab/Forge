@@ -15,7 +15,8 @@ export type ForgeErrorCode =
   | 'PROJECT_ERROR'
   | 'STATE_ERROR'
   | 'STATE_CONFLICT'
-  | 'AUTHORIZATION_ERROR';
+  | 'AUTHORIZATION_ERROR'
+  | 'INTEGRITY_VIOLATION';
 
 export type ErrorDetails = Readonly<Record<string, unknown>>;
 
@@ -92,6 +93,13 @@ export class StateConflictError extends ForgeError {
 export class AuthorizationError extends ForgeError {
   constructor(message: string, options: ForgeErrorOptions = {}) {
     super('AUTHORIZATION_ERROR', message, options);
+  }
+}
+
+/** Forge control state (`.forge/`) was changed by something other than Forge. */
+export class IntegrityError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('INTEGRITY_VIOLATION', message, options);
   }
 }
 

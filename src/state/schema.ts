@@ -7,6 +7,10 @@ import {
   STATE_SCHEMA_VERSION,
   TASK_STATUSES,
   VALIDATION_STATUSES,
+  WORKER_ACCESS_MODES,
+  WORKER_RUN_LIMITS,
+  WORKER_RUN_STATUSES,
+  WORKER_RUN_TRIGGERS,
 } from './model.ts';
 import type {
   AttemptRecord,
@@ -16,11 +20,27 @@ import type {
   TaskRecord,
   ValidationCheckSummary,
   ValidationSummary,
+  WorkerRunRecord,
 } from './model.ts';
+import type { Migration } from './versioning.ts';
 
 const TITLE_RULES = { maxLength: 200 } as const;
 const TEXT_RULES = { maxLength: 4_000 } as const;
 const NAME_RULES = { maxLength: 100 } as const;
+
+/**
+ * Migrations from older state versions, keyed by the version they upgrade
+ * from. Each returns the document at the next version.
+ */
+export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
+  // 1 -> 2: standalone worker runs were introduced; version 1 state has none.
+  1: (document) => {
+    if (Object.hasOwn(document, 'workerRuns')) {
+      throw new SchemaViolation('workerRuns', 'is not a recognised field in schema version 1');
+    }
+    return { ...document, schemaVersion: 2, workerRuns: [] };
+  },
+};
 
 /** Structural and referential validation of a current-version state document. */
 export function decodeProjectState(raw: unknown): ProjectState {
@@ -32,6 +52,7 @@ export function decodeProjectState(raw: unknown): ProjectState {
     'milestones',
     'tasks',
     'decisions',
+    'workerRuns',
     'createdAt',
     'updatedAt',
   ]);
@@ -46,6 +67,7 @@ export function decodeProjectState(raw: unknown): ProjectState {
     milestones: r.array('milestones', decodeMilestone),
     tasks: r.array('tasks', decodeTask),
     decisions: r.array('decisions', decodeDecision),
+    workerRuns: r.array('workerRuns', decodeWorkerRun, 1_000),
     createdAt: r.timestamp('createdAt'),
     updatedAt: r.timestamp('updatedAt'),
   };
@@ -158,11 +180,61 @@ function decodeDecision(value: unknown, path: string): DecisionRecord {
   return decision;
 }
 
+function decodeWorkerRun(value: unknown, path: string): WorkerRunRecord {
+  const r = new ObjectReader(value, path, [
+    'id',
+    'worker',
+    'trigger',
+    'access',
+    'task',
+    'workingDirectory',
+    'status',
+    'startedAt',
+    'finishedAt',
+    'durationMs',
+    'summary',
+    'diagnostic',
+  ]);
+  const run: WorkerRunRecord = {
+    id: r.id('id'),
+    worker: r.string('worker', NAME_RULES),
+    trigger: r.oneOf('trigger', WORKER_RUN_TRIGGERS),
+    access: r.oneOf('access', WORKER_ACCESS_MODES),
+    task: r.string('task', { maxLength: WORKER_RUN_LIMITS.taskExcerpt }),
+    workingDirectory: r.string('workingDirectory', { maxLength: 1_000 }),
+    status: r.oneOf('status', WORKER_RUN_STATUSES),
+    startedAt: r.timestamp('startedAt'),
+    finishedAt: r.nullableTimestamp('finishedAt'),
+    durationMs: r.nullable('durationMs', (item, itemPath) => decodeNonNegativeInteger(item, itemPath)),
+    summary: r.nullableString('summary', { maxLength: WORKER_RUN_LIMITS.summary }),
+    diagnostic: r.nullableString('diagnostic', { maxLength: WORKER_RUN_LIMITS.diagnostic }),
+  };
+  // Stored relative to the project root with "/" separators; never absolute or escaping.
+  const segments = run.workingDirectory.split('/');
+  const absoluteLike = /^[\\/]/.test(run.workingDirectory) || /^[A-Za-z]:/.test(run.workingDirectory);
+  if (absoluteLike || run.workingDirectory.includes('\\') || segments.includes('..')) {
+    throw new SchemaViolation(`${path}.workingDirectory`, 'must be a relative path inside the project using "/"');
+  }
+  const running = run.status === 'running';
+  if (running !== (run.finishedAt === null) || running !== (run.durationMs === null)) {
+    throw new SchemaViolation(`${path}.finishedAt`, 'finishedAt and durationMs must be null exactly when the run is running');
+  }
+  return run;
+}
+
+function decodeNonNegativeInteger(value: unknown, path: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new SchemaViolation(path, 'must be a non-negative integer');
+  }
+  return value;
+}
+
 /** IDs must be unique and every reference must point at an existing record. */
 function checkReferences(state: ProjectState): void {
   const milestoneIds = uniqueIds(state.milestones, 'milestones');
   const taskIds = uniqueIds(state.tasks, 'tasks');
   uniqueIds(state.decisions, 'decisions');
+  uniqueIds(state.workerRuns, 'workerRuns');
 
   state.tasks.forEach((task, index) => {
     if (task.milestoneId !== null && !milestoneIds.has(task.milestoneId)) {

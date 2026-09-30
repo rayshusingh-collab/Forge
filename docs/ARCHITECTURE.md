@@ -356,6 +356,18 @@ CodexWorker
 
 
 
+Implemented (Milestone 3): `src/workers/` defines `Worker` (`id`, `capabilities`, `healthCheck()`, `execute(request, { signal })`), with cancellation through an `AbortSignal` rather than a separate `cancel()`. `execute` resolves with a `WorkerResult` for every runtime outcome: success, failed, timeout, cancelled, unavailable or invalid-output. Requests can only be built by `prepareWorkerRequest`, which authorizes the working directory through the project path boundary. The Forge prompt envelope separates Forge's rules from the fenced task and context. Standalone runs are persisted as bounded `workerRuns` in state (schema v2). Provider specifics (CLI flags, output format, permission policy) live only in adapters: `ClaudeCodeWorker` invokes the headless Claude Code CLI through the `ProcessRunner`, with the task sent on stdin.
+
+
+
+`.forge/` is Forge's control plane, never worker-owned. Edit-enabled worker runs hold the state lease (the state lock) for the whole run, so no legitimate Forge write can occur between the pre-run snapshot and post-run verification. Any byte change under `.forge/` is therefore attributed to something other than Forge. It yields an `integrity-violation` verdict that overrides the worker's own outcome, with evidence preserved and nothing restored. State is written afterwards only if it is provably untouched (`src/projects/control-integrity.ts`, `src/workers/run-recorder.ts`).
+
+
+
+Executables are resolved to absolute programs before spawning (`src/execution/executable-resolver.ts`). Windows npm `.cmd` launchers are unwrapped to the program they wrap, so no shell is ever needed.
+
+
+
 \---
 
 

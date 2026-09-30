@@ -26,6 +26,20 @@ export interface ProcessRequest {
   readonly env?: Readonly<Record<string, string>>;
   /** Aborting terminates the process and yields a `cancelled` result. */
   readonly signal?: AbortSignal;
+  /**
+   * Text written to the process's stdin, which is then closed. Use this for
+   * large or untrusted payloads (e.g. prompts) instead of arguments: it avoids
+   * command-line length limits, option parsing, and process-list exposure.
+   * Never logged.
+   */
+  readonly input?: string;
+  /** Overrides the runner's per-stream capture limit for this run. */
+  readonly maxOutputBytes?: number;
+}
+
+/** Anything that can run a `ProcessRequest`; lets consumers accept fakes in tests. */
+export interface ProcessExecutor {
+  run(request: ProcessRequest): Promise<ProcessResult>;
 }
 
 export interface ProcessSpawnFailure {

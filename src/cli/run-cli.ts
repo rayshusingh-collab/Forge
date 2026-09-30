@@ -1,11 +1,12 @@
 import { isForgeError } from '../core/errors.ts';
 import { doctorCommand } from './commands/doctor.ts';
 import { projectCommand } from './commands/project.ts';
+import { workerCommand } from './commands/worker.ts';
 import { ExitCode } from './types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from './types.ts';
 
 /** Registered commands. New commands are added here. */
-export const COMMANDS: readonly CliCommand[] = [projectCommand, doctorCommand];
+export const COMMANDS: readonly CliCommand[] = [projectCommand, workerCommand, doctorCommand];
 
 /**
  * Parses top-level arguments and dispatches to a command.

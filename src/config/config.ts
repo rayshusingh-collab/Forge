@@ -1,3 +1,5 @@
+import { isAbsolute } from 'node:path';
+
 import { ConfigurationError } from '../core/errors.ts';
 import { LOG_LEVELS, isLogLevel } from '../logging/index.ts';
 import type { LogLevel } from '../logging/index.ts';
@@ -11,6 +13,13 @@ export interface ForgeConfig {
   /** Default timeout applied to external processes that do not specify one. */
   readonly processTimeoutMs: number;
   readonly mode: RuntimeMode;
+  /** Default timeout for an AI worker run (much longer than ordinary processes). */
+  readonly workerTimeoutMs: number;
+  /**
+   * Absolute path to the Claude Code executable, or `null` to look up
+   * `claude` on PATH. Only configurable here, never from task input.
+   */
+  readonly claudeExecutable: string | null;
 }
 
 /** Environment variables Forge reads. Kept in one place so docs and code agree. */
@@ -18,12 +27,16 @@ export const ENV_VARS = {
   logLevel: 'FORGE_LOG_LEVEL',
   processTimeoutMs: 'FORGE_PROCESS_TIMEOUT_MS',
   mode: 'FORGE_ENV',
+  workerTimeoutMs: 'FORGE_WORKER_TIMEOUT_MS',
+  claudeExecutable: 'FORGE_CLAUDE_EXECUTABLE',
 } as const;
 
 export const DEFAULT_CONFIG: ForgeConfig = Object.freeze({
   logLevel: 'info',
   processTimeoutMs: 120_000,
   mode: 'production',
+  workerTimeoutMs: 600_000,
+  claudeExecutable: null,
 });
 
 /** Upper bound on the default timeout (24h) so a typo cannot disable timeouts in practice. */
@@ -50,11 +63,20 @@ export function loadConfig(env: Environment = process.env): ForgeConfig {
     issues,
   );
 
+  const workerTimeoutMs = readInteger(
+    env,
+    ENV_VARS.workerTimeoutMs,
+    { min: 1, max: MAX_PROCESS_TIMEOUT_MS },
+    DEFAULT_CONFIG.workerTimeoutMs,
+    issues,
+  );
+  const claudeExecutable = readAbsolutePath(env, ENV_VARS.claudeExecutable, issues);
+
   if (issues.length > 0) {
     throw new ConfigurationError(issues);
   }
 
-  return Object.freeze({ logLevel, processTimeoutMs, mode });
+  return Object.freeze({ logLevel, processTimeoutMs, mode, workerTimeoutMs, claudeExecutable });
 }
 
 function isRuntimeMode(value: string): value is RuntimeMode {
@@ -104,4 +126,16 @@ function readInteger(
     return fallback;
   }
   return value;
+}
+
+function readAbsolutePath(env: Environment, name: string, issues: string[]): string | null {
+  const raw = readRaw(env, name);
+  if (raw === undefined) {
+    return null;
+  }
+  if (raw.includes('\0') || !isAbsolute(raw)) {
+    issues.push(`${name} must be an absolute path (received "${raw}")`);
+    return null;
+  }
+  return raw;
 }

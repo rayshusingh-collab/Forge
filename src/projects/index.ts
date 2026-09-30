@@ -24,3 +24,17 @@ export {
 export type { AuthorizedPath, PathRules } from './path-boundary.ts';
 export { registerProject } from './registration.ts';
 export type { RegisterProjectOptions, RegisteredProject } from './registration.ts';
+export {
+  describeIntegrityChanges,
+  snapshotControlState,
+  verifyControlState,
+  writeIntegrityEvidence,
+} from './control-integrity.ts';
+export type {
+  ControlSnapshot,
+  ControlSnapshotScope,
+  EntryFingerprint,
+  EntryKind,
+  IntegrityChange,
+  IntegrityReport,
+} from './control-integrity.ts';

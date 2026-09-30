@@ -3,6 +3,7 @@ import type { Environment } from '../config/index.ts';
 import { ProcessRunner } from '../execution/index.ts';
 import { DEFAULT_GIT_EXECUTABLE } from '../git/repository.ts';
 import type { Logger } from '../logging/index.ts';
+import type { Worker } from '../workers/index.ts';
 import { MIN_NODE_VERSION, isSupportedNodeVersion } from './node-version.ts';
 
 /**
@@ -33,6 +34,11 @@ export interface DoctorDependencies {
   readonly cwd: string;
   /** Git executable; project registration requires Git. Defaults to `git` on PATH. */
   readonly gitExecutable?: string;
+  /**
+   * Workers whose installation and usability to report. Health checks are
+   * local only (version, capabilities, login status); no AI call is made.
+   */
+  readonly workers?: readonly Pick<Worker, 'displayName' | 'healthCheck'>[];
   readonly logger?: Logger;
 }
 
@@ -41,12 +47,15 @@ const RUNNER_CHECK_TIMEOUT_MS = 15_000;
 const RUNNER_CHECK_MARKER = 'forge-doctor-ok';
 
 export async function runDoctor(deps: DoctorDependencies): Promise<DoctorReport> {
-  const checks = [
+  const checks: DoctorCheckResult[] = [
     checkNodeVersion(deps.nodeVersion),
     checkConfiguration(deps.env),
     await checkProcessRunner(deps),
     await checkGit(deps),
   ];
+  for (const worker of deps.workers ?? []) {
+    checks.push(await checkWorker(worker));
+  }
   return { ok: checks.every((check) => check.status === 'pass'), checks };
 }
 
@@ -88,6 +97,21 @@ async function checkProcessRunner(deps: DoctorDependencies): Promise<DoctorCheck
       status: 'fail',
       detail: `unexpected result: outcome=${result.outcome} exitCode=${String(result.exitCode)}`,
     };
+  } catch (error) {
+    return { name, status: 'fail', detail: describeError(error) };
+  }
+}
+
+async function checkWorker(worker: Pick<Worker, 'displayName' | 'healthCheck'>): Promise<DoctorCheckResult> {
+  const name = `Worker: ${worker.displayName}`;
+  try {
+    const health = await worker.healthCheck();
+    if (health.available) {
+      const auth = health.authenticated === true ? 'logged in' : 'login status unknown';
+      return { name, status: 'pass', detail: `${health.version ?? 'unknown version'} at ${health.executable ?? '?'} (${auth})` };
+    }
+    const failures = health.checks.filter((check) => !check.ok).map((check) => `${check.name}: ${check.detail}`);
+    return { name, status: 'fail', detail: failures.join('\n') || 'not available' };
   } catch (error) {
     return { name, status: 'fail', detail: describeError(error) };
   }

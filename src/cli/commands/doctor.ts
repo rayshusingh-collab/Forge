@@ -1,5 +1,6 @@
 import { runDoctor } from '../../core/doctor.ts';
 import type { DoctorReport } from '../../core/doctor.ts';
+import { resolveWorkers } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand } from '../types.ts';
 
@@ -13,11 +14,18 @@ export const doctorCommand: CliCommand = {
       return ExitCode.Usage;
     }
 
+    const registry = resolveWorkers(context, { lenient: true });
+    const workers = registry
+      .list()
+      .map((descriptor) => registry.create(descriptor.id))
+      .filter((worker) => worker !== undefined);
+
     const report = await runDoctor({
       nodeVersion: context.nodeVersion,
       env: context.env,
       nodeExecutable: context.nodeExecutable,
       cwd: context.cwd,
+      workers,
       logger: context.logger.child('doctor'),
     });
 

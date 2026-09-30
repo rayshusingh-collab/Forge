@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { lstat, open, rename, unlink } from 'node:fs/promises';
+import { lstat, open, readFile, rename, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -114,16 +114,67 @@ export interface LockOptions {
  * that decision is left to the user, and the error says how.
  */
 export async function withFileLock<T>(lockPath: string, options: LockOptions, action: () => Promise<T>): Promise<T> {
-  const handle = await acquireLock(lockPath, options);
+  const lock = await acquireFileLock(lockPath, options);
   try {
     return await action();
   } finally {
-    await handle.close().catch(() => undefined);
-    await unlink(lockPath).catch(() => undefined);
+    await lock.release();
   }
 }
 
-async function acquireLock(lockPath: string, options: LockOptions): Promise<FileHandle> {
+/** An exclusive lock file held by this process until released. */
+export interface HeldFileLock {
+  readonly path: string;
+  /**
+   * True if the lock file on disk is still exactly the one this process
+   * wrote (same random token), i.e. nobody deleted or replaced it.
+   */
+  isIntact(): Promise<boolean>;
+  /**
+   * Removes the lock file, but only while it is intact: a lock that was
+   * deleted or replaced may now belong to someone else and is left alone.
+   * Returns whether the lock was removed.
+   */
+  release(): Promise<boolean>;
+}
+
+export async function acquireFileLock(lockPath: string, options: LockOptions): Promise<HeldFileLock> {
+  const content = JSON.stringify({
+    pid: process.pid,
+    acquiredAt: new Date().toISOString(),
+    token: randomBytes(16).toString('hex'),
+  });
+  const handle = await acquireLock(lockPath, options, content);
+  let released = false;
+
+  const isIntact = async (): Promise<boolean> => {
+    try {
+      const info = await lstat(lockPath);
+      return info.isFile() && (await readFile(lockPath, 'utf8')) === content;
+    } catch {
+      return false;
+    }
+  };
+
+  return {
+    path: lockPath,
+    isIntact,
+    release: async () => {
+      if (released) {
+        return false;
+      }
+      released = true;
+      await handle.close().catch(() => undefined);
+      if (!(await isIntact())) {
+        return false;
+      }
+      await unlink(lockPath).catch(() => undefined);
+      return true;
+    },
+  };
+}
+
+async function acquireLock(lockPath: string, options: LockOptions, content: string): Promise<FileHandle> {
   const retryIntervalMs = options.retryIntervalMs ?? 25;
   const deadline = Date.now() + options.timeoutMs;
   for (;;) {
@@ -145,8 +196,8 @@ async function acquireLock(lockPath: string, options: LockOptions): Promise<File
       continue;
     }
     try {
-      // Owner info is diagnostic only; nothing parses it.
-      await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }), 'utf8');
+      // pid/time are diagnostic; the token lets the owner prove the lock is still its own.
+      await handle.writeFile(content, 'utf8');
       return handle;
     } catch (error) {
       await handle.close().catch(() => undefined);

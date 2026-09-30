@@ -7,16 +7,30 @@ import type { ExitCodeValue } from './types.ts';
 
 /** Wires the real process environment into the CLI. */
 export async function main(argv: readonly string[]): Promise<ExitCodeValue> {
-  return runCli(argv, {
-    stdout: process.stdout,
-    stderr: process.stderr,
-    env: process.env,
-    cwd: process.cwd(),
-    version: readForgeVersion(),
-    nodeVersion: process.version,
-    nodeExecutable: process.execPath,
-    logger: createLogger({ level: resolveLogLevel(), sink: createConsoleSink(process.stderr) }),
-  });
+  // The first Ctrl+C cancels running work (workers are stopped and the
+  // outcome recorded); a second one falls through to Node's default exit.
+  const interrupt = new AbortController();
+  const onInterrupt = (): void => {
+    process.stderr.write('\nInterrupted: cancelling…\n');
+    interrupt.abort();
+  };
+  process.once('SIGINT', onInterrupt);
+
+  try {
+    return await runCli(argv, {
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: process.env,
+      cwd: process.cwd(),
+      version: readForgeVersion(),
+      nodeVersion: process.version,
+      nodeExecutable: process.execPath,
+      logger: createLogger({ level: resolveLogLevel(), sink: createConsoleSink(process.stderr) }),
+      signal: interrupt.signal,
+    });
+  } finally {
+    process.removeListener('SIGINT', onInterrupt);
+  }
 }
 
 /**

@@ -10,6 +10,8 @@ describe('loadConfig', () => {
       logLevel: 'info',
       processTimeoutMs: 120_000,
       mode: 'production',
+      workerTimeoutMs: 600_000,
+      claudeExecutable: null,
     });
   });
 
@@ -18,12 +20,21 @@ describe('loadConfig', () => {
   });
 
   it('applies valid overrides', () => {
+    const claudePath = process.platform === 'win32' ? 'C:\\Tools\\Claude Code\\claude.exe' : '/opt/claude code/claude';
     const config = loadConfig({
       FORGE_LOG_LEVEL: 'debug',
       FORGE_PROCESS_TIMEOUT_MS: '5000',
       FORGE_ENV: 'development',
+      FORGE_WORKER_TIMEOUT_MS: '900000',
+      FORGE_CLAUDE_EXECUTABLE: claudePath,
     });
-    assert.deepEqual(config, { logLevel: 'debug', processTimeoutMs: 5000, mode: 'development' });
+    assert.deepEqual(config, {
+      logLevel: 'debug',
+      processTimeoutMs: 5000,
+      mode: 'development',
+      workerTimeoutMs: 900_000,
+      claudeExecutable: claudePath,
+    });
   });
 
   it('normalizes case and surrounding whitespace of enum values', () => {
@@ -64,6 +75,18 @@ describe('loadConfig', () => {
         assert.match(error.message, /FORGE_PROCESS_TIMEOUT_MS must be an integer/);
         return true;
       });
+    });
+  }
+
+  for (const value of ['0', 'forever', '-1']) {
+    it(`rejects worker timeout "${value}"`, () => {
+      assert.throws(() => loadConfig({ FORGE_WORKER_TIMEOUT_MS: value }), /FORGE_WORKER_TIMEOUT_MS must be an integer/);
+    });
+  }
+
+  for (const value of ['claude', './bin/claude', 'bin\\claude.exe']) {
+    it(`rejects a non-absolute Claude executable "${value}"`, () => {
+      assert.throws(() => loadConfig({ FORGE_CLAUDE_EXECUTABLE: value }), /FORGE_CLAUDE_EXECUTABLE must be an absolute path/);
     });
   }
 

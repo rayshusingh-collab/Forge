@@ -1,10 +1,10 @@
 import { StateConflictError, StateError } from '../core/errors.ts';
 import { SchemaViolation } from '../core/validation.ts';
-import { readJsonDocument, serializeJson, withFileLock, writeFileAtomic } from './files.ts';
-import type { ProjectState } from './model.ts';
-import { decodeProjectState } from './schema.ts';
-import { UnsupportedVersionError, upgradeDocument } from './versioning.ts';
+import { acquireFileLock, readJsonDocument, serializeJson, withFileLock, writeFileAtomic } from './files.ts';
 import { STATE_SCHEMA_VERSION } from './model.ts';
+import type { ProjectState } from './model.ts';
+import { STATE_MIGRATIONS, decodeProjectState } from './schema.ts';
+import { UnsupportedVersionError, upgradeDocument } from './versioning.ts';
 
 export interface StateStoreOptions {
   /** Absolute path of the state document, e.g. `<root>/.forge/state.json`. */
@@ -19,6 +19,17 @@ export interface StateStoreOptions {
 }
 
 export const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
+
+/** Exclusive write access to project state, held until released. */
+export interface StateLease {
+  readonly lockFile: string;
+  /** Read-modify-write under the held lock; fails if the lock is no longer intact. */
+  update(change: (state: ProjectState) => ProjectState): Promise<ProjectState>;
+  /** True while the lock file on disk is still this lease's own. */
+  isIntact(): Promise<boolean>;
+  /** Releases the lock if it is still intact; returns whether it was removed. */
+  release(): Promise<boolean>;
+}
 
 /**
  * Loads and saves one project's state document.
@@ -72,22 +83,68 @@ export class StateStore {
    */
   async save(next: ProjectState): Promise<ProjectState> {
     this.validateForWrite(next);
-    return this.locked(async () => {
-      const current = await this.load();
-      if (current.revision !== next.revision) {
-        throw new StateConflictError(
-          `Project state was modified by another process (expected revision ${next.revision}, found ${current.revision}); reload and retry`,
-          { details: { path: this.options.stateFile, expected: next.revision, found: current.revision } },
-        );
-      }
-      const stored = this.validateForWrite({
-        ...next,
-        revision: current.revision + 1,
-        updatedAt: this.clock().toISOString(),
-      });
-      await writeFileAtomic(this.options.stateFile, serializeJson(stored));
-      return stored;
+    return this.locked(() => this.saveWhileLocked(next));
+  }
+
+  /**
+   * Takes the state lock and keeps it until `release()`, so no other Forge
+   * process can write state in between. Used to fence off a period in which
+   * state must not change except through this lease (e.g. an edit-enabled
+   * worker run). Other writers wait, then fail with `StateConflictError`.
+   */
+  async acquireLease(): Promise<StateLease> {
+    const lock = await acquireFileLock(this.options.lockFile, { timeoutMs: this.lockTimeoutMs });
+    return {
+      lockFile: lock.path,
+      isIntact: () => lock.isIntact(),
+      release: () => lock.release(),
+      update: async (change) => {
+        // Never write through a lock that is no longer provably ours.
+        if (!(await lock.isIntact())) {
+          throw new StateConflictError('State lock was removed or replaced while held; refusing to write', {
+            details: { path: lock.path },
+          });
+        }
+        const current = await this.load();
+        return this.saveWhileLocked(this.validateForWrite({ ...change(current), revision: current.revision }));
+      },
+    };
+  }
+
+  private async saveWhileLocked(next: ProjectState): Promise<ProjectState> {
+    const current = await this.load();
+    if (current.revision !== next.revision) {
+      throw new StateConflictError(
+        `Project state was modified by another process (expected revision ${next.revision}, found ${current.revision}); reload and retry`,
+        { details: { path: this.options.stateFile, expected: next.revision, found: current.revision } },
+      );
+    }
+    const stored = this.validateForWrite({
+      ...next,
+      revision: current.revision + 1,
+      updatedAt: this.clock().toISOString(),
     });
+    await writeFileAtomic(this.options.stateFile, serializeJson(stored));
+    return stored;
+  }
+
+  /**
+   * Read-modify-write: loads the latest state, applies `change`, and saves.
+   * On a conflict the change is re-applied to freshly loaded state, at most
+   * `maxAttempts` times in total, so `change` must be a pure function of the
+   * state it receives. Other errors (e.g. invalid state) are not retried.
+   */
+  async update(change: (state: ProjectState) => ProjectState, maxAttempts = 3): Promise<ProjectState> {
+    for (let attempt = 1; ; attempt++) {
+      const current = await this.load();
+      try {
+        return await this.save({ ...change(current), revision: current.revision });
+      } catch (error) {
+        if (!(error instanceof StateConflictError) || attempt >= maxAttempts) {
+          throw error;
+        }
+      }
+    }
   }
 
   private locked<T>(action: () => Promise<T>): Promise<T> {
@@ -102,7 +159,7 @@ export class StateStore {
   private decode(raw: unknown, problem: string): ProjectState {
     let state: ProjectState;
     try {
-      state = decodeProjectState(upgradeDocument(raw, STATE_SCHEMA_VERSION));
+      state = decodeProjectState(upgradeDocument(raw, STATE_SCHEMA_VERSION, STATE_MIGRATIONS));
     } catch (error) {
       if (error instanceof SchemaViolation || error instanceof UnsupportedVersionError) {
         throw new StateError(`${problem}: ${error.message}`, {

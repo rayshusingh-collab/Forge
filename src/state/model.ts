@@ -7,7 +7,12 @@
  * Large outputs (logs, diffs, worker transcripts) must not be stored here.
  */
 
-export const STATE_SCHEMA_VERSION = 1;
+/**
+ * Version history:
+ * 1 — Milestone 2: phase, milestones, tasks (with attempts), decisions.
+ * 2 — Milestone 3: adds `workerRuns` (migrated from 1 as an empty list).
+ */
+export const STATE_SCHEMA_VERSION = 2;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -37,6 +42,66 @@ export type ValidationStatus = (typeof VALIDATION_STATUSES)[number];
 
 export const DECISION_STATUSES = ['pending', 'approved', 'rejected'] as const;
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
+
+/**
+ * Final or in-progress status of a worker run: the worker outcomes, plus
+ * `running`, plus `integrity-violation` — Forge's verdict when protected
+ * control state (`.forge/`) changed during the run, which overrides
+ * whatever the worker reported.
+ */
+export const WORKER_RUN_STATUSES = [
+  'running',
+  'success',
+  'failed',
+  'timeout',
+  'cancelled',
+  'unavailable',
+  'invalid-output',
+  'integrity-violation',
+] as const;
+export type WorkerRunStatus = (typeof WORKER_RUN_STATUSES)[number];
+
+/** How a worker run was started. Only manual runs exist before the task engine. */
+export const WORKER_RUN_TRIGGERS = ['manual'] as const;
+export type WorkerRunTrigger = (typeof WORKER_RUN_TRIGGERS)[number];
+
+export const WORKER_ACCESS_MODES = ['read-only', 'edit'] as const;
+export type WorkerAccessMode = (typeof WORKER_ACCESS_MODES)[number];
+
+/** Bounds keeping worker run records small; enforced on write and on load. */
+export const WORKER_RUN_LIMITS = {
+  /** Most recent runs retained in state; older ones are dropped. */
+  retainedRuns: 100,
+  taskExcerpt: 200,
+  summary: 1_000,
+  diagnostic: 500,
+} as const;
+
+/**
+ * Bounded record of one worker invocation that is not (yet) tied to a task,
+ * e.g. `forge worker run`. Holds metadata only: never transcripts, raw
+ * output, or secrets.
+ */
+export interface WorkerRunRecord {
+  /** Request ID (UUID) shared with the worker result. */
+  readonly id: string;
+  /** Worker identifier, e.g. `claude-code`. */
+  readonly worker: string;
+  readonly trigger: WorkerRunTrigger;
+  readonly access: WorkerAccessMode;
+  /** Truncated excerpt of the instruction. */
+  readonly task: string;
+  /** Working directory relative to the project root (`.` for the root). */
+  readonly workingDirectory: string;
+  readonly status: WorkerRunStatus;
+  readonly startedAt: string;
+  readonly finishedAt: string | null;
+  readonly durationMs: number | null;
+  /** Truncated worker summary. */
+  readonly summary: string | null;
+  /** Truncated reason for a non-success outcome. */
+  readonly diagnostic: string | null;
+}
 
 export interface ValidationCheckSummary {
   /** e.g. `typecheck`, `test`. */
@@ -104,6 +169,8 @@ export interface ProjectState {
   readonly milestones: readonly MilestoneRecord[];
   readonly tasks: readonly TaskRecord[];
   readonly decisions: readonly DecisionRecord[];
+  /** Most recent standalone worker runs, oldest first. */
+  readonly workerRuns: readonly WorkerRunRecord[];
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -119,6 +186,7 @@ export function createInitialState(projectId: string, now: Date): ProjectState {
     milestones: [],
     tasks: [],
     decisions: [],
+    workerRuns: [],
     createdAt: timestamp,
     updatedAt: timestamp,
   };

@@ -219,7 +219,26 @@ describe('StateStore: rejecting bad data', () => {
     await expectLoadError(doc, /resolvedAt must be null exactly when the decision is pending/);
   });
 
-  it('rejects a newer schema version', () => expectLoadError({ ...valid(), schemaVersion: 2 }, /newer than this Forge supports/));
+  it('rejects a newer schema version', () =>
+    expectLoadError({ ...valid(), schemaVersion: STATE_SCHEMA_VERSION + 1 }, /newer than this Forge supports/));
+
+  it('migrates version 1 state (without worker runs) and preserves its content', async () => {
+    const v1: Record<string, unknown> = { ...valid(), schemaVersion: 1 };
+    delete v1['workerRuns'];
+    await writeRaw(f.stateFile, v1);
+    const loaded = await f.store.load();
+    assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
+    assert.deepEqual(loaded.workerRuns, []);
+    assert.deepEqual(loaded.tasks, populatedState().tasks);
+
+    const saved = await f.store.save({ ...loaded, phase: 'planning' });
+    const onDisk = JSON.parse(await readFile(f.stateFile, 'utf8')) as Record<string, unknown>;
+    assert.equal(onDisk['schemaVersion'], STATE_SCHEMA_VERSION);
+    assert.equal(saved.revision, loaded.revision + 1);
+  });
+
+  it('rejects version 1 state that already contains version 2 fields', () =>
+    expectLoadError({ ...valid(), schemaVersion: 1 }, /workerRuns is not a recognised field in schema version 1/));
   it('rejects a non-integer schema version', () => expectLoadError({ ...valid(), schemaVersion: '1' }, /schemaVersion must be an integer/));
   it('rejects a missing schema version', async () => {
     const doc = valid();

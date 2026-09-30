@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { runCli } from '../src/cli/run-cli.ts';
@@ -8,6 +10,7 @@ import { isSupportedNodeVersion } from '../src/core/node-version.ts';
 import { readForgeVersion } from '../src/core/version.ts';
 import { silentLogger } from '../src/logging/index.ts';
 import { CapturingWriter } from './helpers.ts';
+import { FakeWorker, fakeRegistry } from './worker-fixtures.ts';
 
 interface TestCli {
   readonly context: CliContext;
@@ -27,6 +30,8 @@ function createTestCli(overrides: Partial<CliContext> = {}): TestCli {
     nodeVersion: 'v24.0.0',
     nodeExecutable: process.execPath,
     logger: silentLogger,
+    // A healthy fake worker keeps these tests independent of a local Claude install.
+    workers: fakeRegistry(new FakeWorker(undefined, { id: 'claude-code' })),
     ...overrides,
   };
   return { context, stdout, stderr };
@@ -88,6 +93,39 @@ describe('CLI', () => {
   it('doctor rejects unexpected arguments', async () => {
     const cli = createTestCli();
     assert.equal(await runCli(['doctor', 'extra'], cli.context), 2);
+  });
+
+  it('doctor reports an available worker', async () => {
+    const cli = createTestCli();
+    assert.equal(await runCli(['doctor'], cli.context), 0);
+    assert.match(cli.stdout.text, /\[PASS\] Worker: Fake Worker: 1\.0\.0 at \/fake\/worker \(logged in\)/);
+  });
+
+  it('doctor fails clearly when the Claude worker is unavailable', async () => {
+    const cli = createTestCli({ workers: fakeRegistry(new FakeWorker(undefined, { id: 'claude-code', available: false })) });
+    assert.equal(await runCli(['doctor'], cli.context), 1);
+    assert.match(cli.stdout.text, /\[FAIL\] Worker: Fake Worker: executable: not found on PATH/);
+    assert.match(cli.stdout.text, /1 check\(s\) failed/);
+  });
+
+  it('doctor reports a configured Claude executable that does not exist', async () => {
+    const missing = join(tmpdir(), 'forge-no-such-dir-7f3a', 'claude.exe');
+    const stdout = new CapturingWriter();
+    // No injected registry: the real Claude worker and resolver are used, and
+    // nothing is installed at the configured path.
+    const context: CliContext = {
+      stdout,
+      stderr: new CapturingWriter(),
+      env: { FORGE_CLAUDE_EXECUTABLE: missing },
+      cwd: process.cwd(),
+      version: '9.9.9',
+      nodeVersion: 'v24.0.0',
+      nodeExecutable: process.execPath,
+      logger: silentLogger,
+    };
+
+    assert.equal(await runCli(['doctor'], context), 1);
+    assert.match(stdout.text, /\[FAIL\] Worker: Claude Code: executable: Executable not found: .*claude\.exe/);
   });
 });
 

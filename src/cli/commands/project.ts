@@ -1,11 +1,10 @@
 import { parseArgs } from 'node:util';
 
-import { loadConfig } from '../../config/index.ts';
-import { ProcessRunner } from '../../execution/index.ts';
 import { discoverProject, openStateStore, registerProject } from '../../projects/index.ts';
 import type { LoadedProject, ProjectRecord } from '../../projects/index.ts';
 import { TASK_STATUSES } from '../../state/index.ts';
 import type { ProjectState } from '../../state/index.ts';
+import { createRunner, requireConfig } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
 
@@ -64,7 +63,8 @@ async function runAdd(args: readonly string[], context: CliContext): Promise<Exi
     cwd: context.cwd,
     ...(typeof name === 'string' ? { name } : {}),
     ...(typeof description === 'string' ? { description } : {}),
-    runner: createRunner(context),
+    // Project commands need valid configuration; a ConfigurationError surfaces as a failure.
+    runner: createRunner(context, requireConfig(context)),
     logger: context.logger.child('projects'),
   });
 
@@ -136,12 +136,6 @@ function parseSubcommandArgs(
   }
 }
 
-function createRunner(context: CliContext): ProcessRunner {
-  // Project commands need valid configuration; a ConfigurationError surfaces as a failure.
-  const config = loadConfig(context.env);
-  return new ProcessRunner({ defaultTimeoutMs: config.processTimeoutMs, logger: context.logger });
-}
-
 export function formatProject(project: ProjectRecord, forgeDir: string): string {
   return formatFields([
     ['Name', project.name],
@@ -166,9 +160,18 @@ export function formatStatus(project: ProjectRecord, state: ProjectState): strin
     ['Milestones', `${state.milestones.length} total, ${milestonesDone} completed`],
     ['Tasks', formatTaskCounts(state)],
     ['Decisions', pendingDecisions === 0 ? 'none pending' : `${pendingDecisions} pending — human input required`],
+    ['Worker runs', formatWorkerRuns(state)],
     ['Revision', String(state.revision)],
     ['Updated', state.updatedAt],
   ]);
+}
+
+function formatWorkerRuns(state: ProjectState): string {
+  const last = state.workerRuns.at(-1);
+  if (last === undefined) {
+    return '0';
+  }
+  return `${state.workerRuns.length} (last: ${last.worker} ${last.status} at ${last.startedAt})`;
 }
 
 function formatTaskCounts(state: ProjectState): string {
