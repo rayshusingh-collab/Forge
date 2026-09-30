@@ -218,6 +218,14 @@ Stores project-level information and ensures operations remain within the author
 
 
 
+Implemented (Milestone 2): a project is the root of a Git work tree, identified by a stable UUID. Its metadata lives in `<project-root>/.forge/`, which is Git-ignored by a `.forge/.gitignore` so registration never changes the user's working tree. Metadata records its canonical root path; metadata that has been moved or copied elsewhere is refused.
+
+
+
+The project path boundary (`src/projects/path-boundary.ts`) is the single authority on whether a path is inside a project. It checks paths lexically (normalized, case-insensitive on Windows, no string-prefix matching), then resolves existing links so a symlink or junction pointing outside the project is rejected.
+
+
+
 \---
 
 
@@ -245,6 +253,10 @@ Forge must be able to recover from:
 
 
 State should not exist only in memory.
+
+
+
+Implemented (Milestone 2): state is a versioned JSON document per project (`.forge/state.json`), validated on every load and before every write. It is written atomically (temp file then rename). Concurrent writers are handled with an optimistic `revision` checked under a short-lived exclusive lock file, so a stale writer gets a conflict instead of silently overwriting. Documents from unsupported schema versions are rejected; migrations are added at a single version boundary.
 
 
 

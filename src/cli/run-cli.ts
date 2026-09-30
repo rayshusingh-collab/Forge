@@ -1,9 +1,11 @@
+import { isForgeError } from '../core/errors.ts';
 import { doctorCommand } from './commands/doctor.ts';
+import { projectCommand } from './commands/project.ts';
 import { ExitCode } from './types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from './types.ts';
 
 /** Registered commands. New commands are added here. */
-export const COMMANDS: readonly CliCommand[] = [doctorCommand];
+export const COMMANDS: readonly CliCommand[] = [projectCommand, doctorCommand];
 
 /**
  * Parses top-level arguments and dispatches to a command.
@@ -37,7 +39,12 @@ export async function runCli(argv: readonly string[], context: CliContext): Prom
     return await command.run(rest, context);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    context.logger.error(`Command "${command.name}" failed`, { error: message });
+    if (isForgeError(error)) {
+      // Expected failure with a user-facing message; details only at debug level.
+      context.logger.debug(`Command "${command.name}" failed`, { code: error.code, details: error.details });
+    } else {
+      context.logger.error(`Command "${command.name}" failed unexpectedly`, { error: message });
+    }
     context.stderr.write(`forge ${command.name}: ${message}\n`);
     return ExitCode.Failure;
   }

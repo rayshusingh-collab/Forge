@@ -11,7 +11,11 @@ export type ForgeErrorCode =
   | 'CONFIGURATION_ERROR'
   | 'VALIDATION_ERROR'
   | 'PROCESS_EXECUTION_ERROR'
-  | 'PROCESS_TIMEOUT';
+  | 'PROCESS_TIMEOUT'
+  | 'PROJECT_ERROR'
+  | 'STATE_ERROR'
+  | 'STATE_CONFLICT'
+  | 'AUTHORIZATION_ERROR';
 
 export type ErrorDetails = Readonly<Record<string, unknown>>;
 
@@ -60,6 +64,34 @@ export class ProcessExecutionError extends ForgeError {
 export class ProcessTimeoutError extends ForgeError {
   constructor(message: string, options: ForgeErrorOptions = {}) {
     super('PROCESS_TIMEOUT', message, options);
+  }
+}
+
+/** A project cannot be registered, found, or trusted (e.g. not a Git work tree, invalid metadata). */
+export class ProjectError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('PROJECT_ERROR', message, options);
+  }
+}
+
+/** Persisted state is unreadable, malformed, or of an unsupported version. Never auto-repaired. */
+export class StateError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('STATE_ERROR', message, options);
+  }
+}
+
+/** A write was refused because the state changed or is locked by another writer. */
+export class StateConflictError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('STATE_CONFLICT', message, options);
+  }
+}
+
+/** A path falls outside the authorized project boundary. */
+export class AuthorizationError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('AUTHORIZATION_ERROR', message, options);
   }
 }
 

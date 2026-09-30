@@ -66,10 +66,13 @@ export class ProcessRunner {
     const summary = { command: result.command, outcome: result.outcome, exitCode: result.exitCode, durationMs: result.durationMs };
     if (result.outcome === 'success') {
       this.logger.debug('Process finished', summary);
+    } else if (result.outcome === 'non-zero-exit') {
+      // Often an expected answer (e.g. a probe command); callers decide whether it is a failure.
+      this.logger.debug('Process exited unsuccessfully', summary);
     } else if (result.outcome === 'spawn-error') {
       this.logger.warn('Process could not be started', { ...summary, error: result.spawnError?.message });
     } else {
-      this.logger.warn('Process did not succeed', summary);
+      this.logger.warn('Process was terminated', summary);
     }
     return result;
   }

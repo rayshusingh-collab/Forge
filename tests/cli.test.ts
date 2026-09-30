@@ -73,6 +73,7 @@ describe('CLI', () => {
     assert.match(cli.stdout.text, /\[PASS\] Node.js runtime/);
     assert.match(cli.stdout.text, /\[PASS\] Configuration/);
     assert.match(cli.stdout.text, /\[PASS\] Process runner/);
+    assert.match(cli.stdout.text, /\[PASS\] Git: git version/);
     assert.match(cli.stdout.text, /All checks passed/);
   });
 
@@ -97,6 +98,14 @@ describe('runDoctor', () => {
     const report = await runDoctor({ ...base, nodeVersion: 'v20.11.0' });
     assert.equal(report.ok, false);
     assert.equal(report.checks.find((check) => check.name === 'Node.js runtime')?.status, 'fail');
+  });
+
+  it('fails the Git check when Git is missing', async () => {
+    const report = await runDoctor({ ...base, nodeVersion: 'v24.0.0', gitExecutable: 'forge-missing-git-7f3a' });
+    assert.equal(report.ok, false);
+    const git = report.checks.find((check) => check.name === 'Git');
+    assert.equal(git?.status, 'fail');
+    assert.match(git?.detail ?? '', /not found on PATH/);
   });
 
   it('fails the runner check when the executable is missing', async () => {
