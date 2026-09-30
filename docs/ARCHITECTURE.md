@@ -310,6 +310,16 @@ FAILED
 
 
 
+Implemented (Milestone 4, `src/tasks/`): AI workers execute work; Forge owns workflow state.
+
+The stored task statuses are `pending`, `running`, `awaiting-validation`, `succeeded`, `failed` and `cancelled`. Readiness, blocking, retryability, exhaustion and interruption are derived from dependencies, attempt budgets and executor liveness, and are never stored, so they cannot drift. The conceptual VALIDATING / REVIEWING / RETRYING / BLOCKED states map onto these: VALIDATING is `awaiting-validation`, RETRYING is a `failed` task that still has attempts left, and BLOCKED is derived.
+
+All transitions live in `transitions.ts` as pure `state -> state` functions with explicit transition tables. They are applied through `StateStore.update`, so every rule is re-checked against the latest state under the state lock. Invariants (dependency DAG, ordering, status/attempt consistency, attempt ↔ worker-run links) are enforced on every load and write.
+
+A task execution is one attempt linked to exactly one worker run. Worker `success` moves the task to `awaiting-validation`, which is the seam where Milestone 5's deterministic validator decides `succeeded` or `failed`; until then, manual accept and reject stand in for it. One command executes at most one attempt of one task, and there is no automatic continuation or retry.
+
+
+
 \---
 
 

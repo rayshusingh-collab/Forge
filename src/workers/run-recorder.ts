@@ -21,6 +21,10 @@ export interface RecordedRunOptions {
   /** Defaults to the project's own state store. */
   readonly store?: StateStore;
   readonly trigger: WorkerRunTrigger;
+  /** Required for `task` runs: the task and attempt this run executes. */
+  readonly link?: { readonly taskId: string; readonly attempt: number };
+  /** Task-engine transitions applied atomically with the run records. */
+  readonly hooks?: RunHooks;
   readonly signal?: AbortSignal;
   readonly clock?: () => Date;
   /** Where integrity evidence reports are written; never inside the project. Defaults to the OS temp directory. */
@@ -42,6 +46,25 @@ export interface RecordedRun {
   readonly record: WorkerRunRecord | undefined;
   /** Why the outcome was not persisted, if it was not. */
   readonly persistenceError: Error | undefined;
+}
+
+/**
+ * State changes that must happen in the same write as the run records, so
+ * the run and the workflow never disagree on disk.
+ */
+export interface RunHooks {
+  /**
+   * Applied together with the `running` record, under the same lock. May
+   * throw to refuse the run (e.g. the task is no longer runnable); the worker
+   * is then not started and nothing is written.
+   */
+  readonly onStart?: (state: ProjectState) => ProjectState;
+  /**
+   * Applied together with the final record. Receives Forge's verdict. Not
+   * called when Forge fails closed (state untrusted), in which case the
+   * workflow stays as `onStart` left it and must be recovered explicitly.
+   */
+  readonly onFinish?: (state: ProjectState, status: WorkerRunStatus, record: WorkerRunRecord) => ProjectState;
 }
 
 type Persist = (change: (state: ProjectState) => ProjectState) => Promise<ProjectState>;
@@ -70,7 +93,7 @@ export async function runRecordedWorker(options: RecordedRunOptions): Promise<Re
   const running = runningRecord(options, clock);
 
   if (options.request.access !== 'edit') {
-    await store.update((state) => withRun(state, running));
+    await store.update((state) => started(options, withRun(state, running)));
     const snapshot = await snapshotControlState(options.project.layout, 'metadata');
     const result = await execute(options);
     return finish(options, clock, running, result, snapshot, (change) => store.update(change));
@@ -79,7 +102,7 @@ export async function runRecordedWorker(options: RecordedRunOptions): Promise<Re
   // Throws StateConflictError if another Forge process holds the lock: the worker is not started.
   const lease = await store.acquireLease();
   try {
-    await lease.update((state) => withRun(state, running));
+    await lease.update((state) => started(options, withRun(state, running)));
     const snapshot = await snapshotControlState(options.project.layout, 'full');
     const result = await execute(options);
     return await finish(options, clock, running, result, snapshot, (change) => lease.update(change));
@@ -108,7 +131,7 @@ async function finish(
   };
 
   if (integrity.ok) {
-    return save(result, result.outcome, integrity, undefined, finished, persist);
+    return save(options, result, result.outcome, integrity, undefined, finished, persist);
   }
 
   let evidencePath: string | undefined;
@@ -145,10 +168,11 @@ async function finish(
     );
     return { result, status: 'integrity-violation', integrity, evidencePath, record: undefined, persistenceError: error };
   }
-  return save(result, 'integrity-violation', integrity, evidencePath, violation, persist);
+  return save(options, result, 'integrity-violation', integrity, evidencePath, violation, persist);
 }
 
 async function save(
+  options: RecordedRunOptions,
   result: WorkerResult,
   status: WorkerRunStatus,
   integrity: IntegrityReport,
@@ -157,7 +181,10 @@ async function save(
   persist: Persist,
 ): Promise<RecordedRun> {
   try {
-    await persist((state) => withRun(state, record));
+    await persist((state) => {
+      const next = withRun(state, record);
+      return options.hooks?.onFinish === undefined ? next : options.hooks.onFinish(next, status, record);
+    });
     return { result, status, integrity, evidencePath, record, persistenceError: undefined };
   } catch (error) {
     const persistenceError = error instanceof Error ? error : new Error(String(error));
@@ -174,6 +201,8 @@ function runningRecord(options: RecordedRunOptions, clock: () => Date): WorkerRu
     id: options.request.id,
     worker: options.worker.id,
     trigger: options.trigger,
+    taskId: options.link?.taskId ?? null,
+    attempt: options.link?.attempt ?? null,
     access: options.request.access,
     task: excerpt(options.request.task, WORKER_RUN_LIMITS.taskExcerpt),
     workingDirectory: options.request.relativeWorkingDirectory,
@@ -186,9 +215,17 @@ function runningRecord(options: RecordedRunOptions, clock: () => Date): WorkerRu
   };
 }
 
-/** Inserts or replaces the run by ID, keeping only the most recent runs. */
+function started(options: RecordedRunOptions, state: ProjectState): ProjectState {
+  return options.hooks?.onStart === undefined ? state : options.hooks.onStart(state);
+}
+
+/** Inserts or replaces the run by ID. */
 function withRun(state: ProjectState, run: WorkerRunRecord): ProjectState {
   const others = state.workerRuns.filter((existing) => existing.id !== run.id);
-  const runs = [...others, run].slice(-WORKER_RUN_LIMITS.retainedRuns);
-  return { ...state, workerRuns: runs };
+  const runs = [...others, run];
+  // Manual runs are capped; task runs stay as long as the attempt that references them.
+  const manual = runs.filter((candidate) => candidate.trigger === 'manual');
+  const excess = Math.max(0, manual.length - WORKER_RUN_LIMITS.retainedRuns);
+  const dropped = new Set(manual.slice(0, excess).map((candidate) => candidate.id));
+  return { ...state, workerRuns: runs.filter((candidate) => !dropped.has(candidate.id)) };
 }

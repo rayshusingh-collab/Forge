@@ -16,7 +16,8 @@ export type ForgeErrorCode =
   | 'STATE_ERROR'
   | 'STATE_CONFLICT'
   | 'AUTHORIZATION_ERROR'
-  | 'INTEGRITY_VIOLATION';
+  | 'INTEGRITY_VIOLATION'
+  | 'WORKFLOW_ERROR';
 
 export type ErrorDetails = Readonly<Record<string, unknown>>;
 
@@ -100,6 +101,16 @@ export class AuthorizationError extends ForgeError {
 export class IntegrityError extends ForgeError {
   constructor(message: string, options: ForgeErrorOptions = {}) {
     super('INTEGRITY_VIOLATION', message, options);
+  }
+}
+
+/**
+ * A workflow operation is not allowed in the current state: an illegal
+ * transition, a task that is not runnable, an unknown or ambiguous ID.
+ */
+export class WorkflowError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('WORKFLOW_ERROR', message, options);
   }
 }
 

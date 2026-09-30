@@ -1,11 +1,15 @@
 export { MAX_DOCUMENT_BYTES, acquireFileLock, readJsonDocument, serializeJson, withFileLock, writeFileAtomic } from './files.ts';
 export type { HeldFileLock } from './files.ts';
+export { describeDependencyProblem, findCycle, findDependencyProblem } from './graph.ts';
+export type { DependencyNode, DependencyProblem } from './graph.ts';
+export { FAILED_ATTEMPT_OUTCOMES, checkWorkflowInvariants, runStatusForAttempt, statusImpliedByAttempts } from './invariants.ts';
 export {
-  ATTEMPT_STATUSES,
+  ATTEMPT_OUTCOMES,
   DECISION_STATUSES,
   MILESTONE_STATUSES,
   PROJECT_PHASES,
   STATE_SCHEMA_VERSION,
+  TASK_LIMITS,
   TASK_STATUSES,
   VALIDATION_STATUSES,
   WORKER_ACCESS_MODES,
@@ -15,14 +19,15 @@ export {
   createInitialState,
 } from './model.ts';
 export type {
-  AttemptRecord,
-  AttemptStatus,
+  AttemptExecutor,
+  AttemptOutcome,
   DecisionRecord,
   DecisionStatus,
   MilestoneRecord,
   MilestoneStatus,
   ProjectPhase,
   ProjectState,
+  TaskAttempt,
   TaskRecord,
   TaskStatus,
   ValidationCheckSummary,

@@ -33,7 +33,16 @@ Early development. Implemented so far:
 - bounded records of manual worker runs in project state
 - `forge worker list | check | run`, and a Claude check in `forge doctor`
 
-Planning, the task engine, validation, review, and autonomous execution are **not** implemented yet. Workers run only when you invoke them explicitly, one run at a time.
+**Milestone 4 — Task & Milestone Engine**
+
+- manually created, ordered milestones and tasks with dependencies (validated as an acyclic graph)
+- a deterministic state machine with explicit legal transitions
+- derived runnability (ready / waiting / blocked / retryable / exhausted / interrupted)
+- `forge task run`: one explicit command executes exactly one attempt of one task
+- `awaiting-validation` after a successful worker run, with manual accept and reject
+- bounded retry accounting, explicit crash recovery, and state schema v3 (migrated from v2)
+
+AI planning, deterministic validation, review, automatic retries, and autonomous execution are **not** implemented yet. **AI workers execute work; Forge owns workflow state.** Nothing runs unless you explicitly ask for it, one task at a time.
 
 ## Prerequisites
 
@@ -100,6 +109,19 @@ forge worker run <worker> --task <text>
       [--cwd <dir>]            Directory inside the project (default: project root)
       [--timeout <seconds>]    Default: FORGE_WORKER_TIMEOUT_MS
       [--allow-edits]          Allow file changes (default: read-only)
+
+forge milestone add --title <text> [--description <text>]
+forge milestone list | show <m> | complete <m> | cancel <m> [--reason <text>]
+
+forge task add --milestone <m> --title <text> --instruction <text>
+      [--context <text>] [--depends-on <task>]... [--max-attempts <n>]
+forge task list [--milestone <m>] | show <task> | ready
+forge task run <task> [--worker claude] [--timeout <seconds>] [--allow-edits]
+      [--acknowledge-integrity-violation]
+forge task accept <task> [--note <text>]
+forge task reject <task> --reason <text>
+forge task cancel <task> [--reason <text>]
+forge task recover <task> [--force]
 ```
 
 Exit codes: `0` success, `1` failure, `2` usage error.
@@ -127,7 +149,7 @@ Registration only creates `<project-root>/.forge/`. It does not initialize or co
 | `.gitignore`   | Contains `*`, so Git ignores all Forge metadata without touching the project's own `.gitignore` |
 | `state.lock`   | Exists only briefly while state is being written                                             |
 
-`.forge/` holds **Forge metadata only — never credentials**, and no logs or raw worker output. Both documents carry a `schemaVersion`. They are validated whenever they are read, because they may have been edited by hand. Forge refuses (rather than repairs) malformed, unsupported-version, or relocated metadata. State written by Milestone 2 (schema v1) is migrated to v2 automatically on load.
+`.forge/` holds **Forge metadata only — never credentials**, and no logs or raw worker output. Both documents carry a `schemaVersion`. They are validated whenever they are read, because they may have been edited by hand. Forge refuses (rather than repairs) malformed, unsupported-version, or relocated metadata. Older state is migrated step by step on load (v1 → v2 → v3). Version 2 placeholder tasks, which no Forge command ever created, are refused rather than guessed at.
 
 ## Claude Code worker
 
@@ -164,13 +186,95 @@ Forge never uses `--dangerously-skip-permissions` or `bypassPermissions`, and ne
 - Runs are read-only unless you pass `--allow-edits`.
 - If a task needs something the policy denies, the run still finishes, and Forge reports the denied tool requests.
 
+## Milestones and tasks
+
+**AI workers execute work. Forge owns workflow state.** Workers never set task or milestone status, resolve dependencies, count attempts, or decide what runs next. They return a structured result, and Forge's deterministic state machine (`src/tasks/transitions.ts`) decides the transition. Worker prose such as "tests passed" is never trusted.
+
+```sh
+forge milestone add --title "Foundation"
+forge task add --milestone 1 --title "Config loader" --instruction "Implement the configuration loader..."
+forge task add --milestone 1 --title "Loader tests" --instruction "Add tests..." --depends-on 1.1
+forge task ready                        # only 1.1 is runnable
+forge task run 1.1 --allow-edits        # runs ONE attempt of ONE task, then stops
+forge task accept 1.1                   # or: forge task reject 1.1 --reason "..."
+forge task ready                        # now 1.2 is runnable; nothing started it
+```
+
+**References.** A task can be referred to by its key (`1.2` means milestone 1, task 2), its full ID, or a unique ID prefix of at least 4 characters. A milestone can be referred to by its number, full ID, or prefix. An ambiguous prefix fails and lists the candidates; Forge never guesses.
+
+**Stored statuses and transitions.** Anything not listed below is rejected.
+
+| Task | Allowed next |
+| --- | --- |
+| `pending` | `running`, `cancelled` |
+| `running` | `awaiting-validation` (worker succeeded), `failed` (any other worker outcome, or recovery) |
+| `awaiting-validation` | `succeeded` (accepted), `failed` (rejected) |
+| `failed` | `running` (explicit retry, while attempts remain), `cancelled` |
+| `succeeded`, `cancelled` | — (terminal) |
+
+| Milestone | Allowed next |
+| --- | --- |
+| `pending` | `active` (its first task starts), `cancelled` |
+| `active` | `completed` (only if every task is succeeded or cancelled and at least one succeeded), `cancelled` |
+| `completed`, `cancelled` | — (terminal) |
+
+**Derived conditions.** These are shown by `task list`, `task ready`, and `project status`, and are computed from state, never stored:
+
+| Condition | Meaning |
+| --- | --- |
+| `ready` | Pending, and every dependency succeeded |
+| `waiting` | Pending, and some dependency hasn't succeeded yet |
+| `blocked` | Pending, and some dependency can never succeed (cancelled, out of attempts, or itself blocked) |
+| `retryable` / `exhausted` | Failed, with attempts left / with none left |
+| `interrupted` | Recorded as running, but its Forge process is gone |
+
+Tasks are always listed in milestone order, then task order.
+
+**Dependencies.** A dependency must be an existing, non-cancelled task, listed at most once. A task can't depend on itself, and cycles are rejected. The whole graph is re-validated every time state is loaded or written. A dependency is satisfied only when that task has `succeeded`, meaning it was accepted. A task that is merely `awaiting-validation` does not satisfy its dependents.
+
+**Execution** (`forge task run`). Forge performs these steps in order:
+1. Checks that the task is runnable and has attempts left.
+2. Runs the worker's health check. If the worker is unavailable, the command fails before any attempt is recorded.
+3. Records the new attempt and its worker run in a single state write, and moves the task to `running`.
+4. Invokes the worker with the task's instruction and context, which are sent as data, never as shell text.
+5. Records Forge's verdict and stops.
+
+Result mapping:
+- Worker `success` → task `awaiting-validation`. The run completed, but that is not proof the work is correct.
+- `failed`, `timeout`, `cancelled` (Ctrl+C), `unavailable`, and `invalid-output` → task `failed`.
+- `integrity-violation` → task `failed`. A retry then requires `--acknowledge-integrity-violation`.
+
+Forge never starts another task and never retries on its own.
+
+**Attempts and retries.**
+- Every started execution consumes one attempt. The default budget is 3; set it with `--max-attempts` (1–10).
+- After a failure or rejection, the task is `retryable` while attempts remain, but it is only re-run by another explicit `forge task run`. When the budget is used up, the task is `exhausted`.
+- Each attempt links to exactly one worker run (`workerRuns` in `state.json`). Worker runs made for tasks are kept for as long as their task exists; manual `forge worker run` history is capped at 100.
+
+**Validation, for now.** `awaiting-validation` is where Milestone 5's deterministic validator will plug in. Until then, `forge task accept` and `forge task reject --reason` are the manual stand-ins. Only a task awaiting validation can be accepted.
+
+**Crash recovery.**
+- Before invoking the worker, Forge records which Forge process (process ID and host) is executing the attempt.
+- If that process disappears, for example after a crash or a closed terminal, the task shows as `interrupted`. It is never re-run automatically, and success is never inferred from files on disk.
+- `forge task recover <task>` marks the attempt `interrupted`, which moves the task to `failed`. You then decide whether to run it again, if attempts remain, or cancel it.
+- `--force` exists for executions Forge can't check, such as one recorded on another machine.
+- An edit run that crashed may also leave `.forge/state.lock` behind. Delete it once no Forge process is running.
+
+**Concurrency.** There is exactly one lock: the project's state lock.
+- Every workflow change re-checks its rules against the latest state while holding the lock, so two Forge processes can't both start the same task.
+- A read-only task run takes the lock briefly at start and at finish.
+- An edit-enabled run holds it for the whole run, as required by the Milestone 3 integrity lease. Other Forge commands that write state wait up to 5 seconds and then fail with a lock conflict, instead of interleaving.
+- No operation waits for the lock while already holding it, so these cannot deadlock.
+
 ## Current limitations
 
 - **Control-state guard is detective, not preventive:** Claude's file tools are not blocked from `.forge/`, because Forge doesn't rely on unverified path-rule syntax. Instead, the guard described below detects any change. It does not prevent the change or undo it.
 - **Long edit runs block other writers:** while an edit-enabled run is in progress, other Forge processes cannot update that project's state; they fail with a lock conflict after 5 seconds.
 - **Prompt rules are advisory:** the rules Forge sends ("stay in scope, don't commit") are instructions to the model. What is actually enforced is the tool and permission set above, together with the working-directory confinement Claude applies.
 - **Worker environment:** the worker inherits Forge's environment variables. It has no tool that could read them.
-- **Interrupted runs:** a run interrupted by a crash (not by Ctrl+C) stays recorded as `running`.
+- **Interrupted manual runs:** a `forge worker run` interrupted by a crash (not by Ctrl+C) stays recorded as `running`. Task executions are detected as `interrupted` and recovered with `forge task recover`.
+- **Interruption detection is local:** Forge checks whether the recorded process ID is still alive on the same host. An executor on another host can't be checked (use `--force`), and a reused process ID could make a dead execution look alive.
+- **No task editing:** tasks can't be edited or re-parented after creation, and dependencies can't be changed. Cancel a task and add a new one instead.
 - **Windows launchers:** only npm "cmd-shim" launchers are unwrapped. Any other `.cmd`/`.bat` (including npm's own `npm.cmd`) is refused; point Forge at the underlying executable instead.
 
 Carried over from Milestone 2:

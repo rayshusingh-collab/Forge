@@ -7,6 +7,7 @@ import { after, describe, it } from 'node:test';
 import { runCli } from '../src/cli/run-cli.ts';
 import type { CliContext } from '../src/cli/types.ts';
 import { discoverProject, openStateStore } from '../src/projects/index.ts';
+import type { TaskRecord } from '../src/state/index.ts';
 import { silentLogger } from '../src/logging/index.ts';
 import { CapturingWriter } from './helpers.ts';
 import { TempDirs, initGitRepo, testRunner } from './fixtures.ts';
@@ -117,9 +118,10 @@ describe('forge project show / status', () => {
 
     assert.equal(run.exitCode, 0, run.stderr);
     assert.match(run.stdout, /Phase:\s+idle/);
-    assert.match(run.stdout, /Milestones:\s+0 total, 0 completed/);
+    assert.match(run.stdout, /Milestones:\s+0\n/);
     assert.match(run.stdout, /Tasks:\s+0\n/);
-    assert.match(run.stdout, /Decisions:\s+none pending/);
+    assert.match(run.stdout, /Runnable:\s+0\n/);
+    assert.match(run.stdout, /Attention:\s+none/);
     assert.match(run.stdout, /Revision:\s+1/);
   });
 
@@ -131,21 +133,53 @@ describe('forge project show / status', () => {
     const store = openStateStore(loaded);
     const state = await store.load();
     const at = state.createdAt;
-    const task = (id: string, status: 'pending' | 'completed') => ({
+    const task = (id: string, order: number, dependsOn: string[]): TaskRecord => ({
       id,
       milestoneId: 'm1',
+      order,
       title: id,
-      description: null,
-      status,
+      instruction: `do ${id}`,
+      context: null,
+      status: 'pending',
+      dependsOn,
+      maxAttempts: 3,
       attempts: [],
+      cancelReason: null,
       createdAt: at,
       updatedAt: at,
     });
+    const executor = { pid: 1, host: 'h' };
     await store.save({
       ...state,
       phase: 'blocked',
-      milestones: [{ id: 'm1', title: 'M1', description: null, status: 'in-progress', createdAt: at, updatedAt: at }],
-      tasks: [task('t1', 'completed'), task('t2', 'pending'), task('t3', 'pending')],
+      milestones: [{ id: 'm1', order: 1, title: 'M1', description: null, status: 'active', createdAt: at, updatedAt: at }],
+      tasks: [
+        {
+          ...task('t1', 1, []),
+          status: 'succeeded',
+          attempts: [{ number: 1, runId: 'r1', outcome: 'accepted', executor, startedAt: at, finishedAt: at, note: null, validation: null }],
+        },
+        task('t2', 2, ['t1']),
+        task('t3', 3, ['t2']),
+      ],
+      workerRuns: [
+        {
+          id: 'r1',
+          worker: 'fake',
+          trigger: 'task',
+          access: 'edit',
+          taskId: 't1',
+          attempt: 1,
+          task: 'do t1',
+          workingDirectory: '.',
+          status: 'success',
+          startedAt: at,
+          finishedAt: at,
+          durationMs: 5,
+          summary: null,
+          diagnostic: null,
+        },
+      ],
       decisions: [
         { id: 'd1', taskId: 't2', question: 'OK?', status: 'pending', resolution: null, createdAt: at, resolvedAt: null },
       ],
@@ -155,9 +189,10 @@ describe('forge project show / status', () => {
 
     assert.equal(run.exitCode, 0, run.stderr);
     assert.match(run.stdout, /Phase:\s+blocked/);
-    assert.match(run.stdout, /Milestones:\s+1 total, 0 completed/);
-    assert.match(run.stdout, /Tasks:\s+3 \(pending 2, completed 1\)/);
-    assert.match(run.stdout, /Decisions:\s+1 pending — human input required/);
+    assert.match(run.stdout, /Milestones:\s+1 \(active 1\)/);
+    assert.match(run.stdout, /Tasks:\s+3 \(ready 1, waiting 1, succeeded 1\)/);
+    assert.match(run.stdout, /Runnable:\s+1 \(1\.2\)/);
+    assert.match(run.stdout, /Attention:\s+1 decision\(s\) pending/);
     assert.match(run.stdout, /Revision:\s+2/);
   });
 

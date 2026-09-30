@@ -154,6 +154,11 @@ export class ObjectReader {
     return value === null ? null : decodeTimestamp(value, this.at(key));
   }
 
+  /** A required field decoded by `decode` (e.g. a nested object). */
+  field<T>(key: string, decode: Decoder<T>): T {
+    return decode(this.required(key), this.at(key));
+  }
+
   nullable<T>(key: string, decode: Decoder<T>): T | null {
     const value = this.required(key);
     return value === null ? null : decode(value, this.at(key));

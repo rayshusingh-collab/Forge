@@ -2,8 +2,11 @@ import { parseArgs } from 'node:util';
 
 import { discoverProject, openStateStore, registerProject } from '../../projects/index.ts';
 import type { LoadedProject, ProjectRecord } from '../../projects/index.ts';
-import { TASK_STATUSES } from '../../state/index.ts';
+import { MILESTONE_STATUSES } from '../../state/index.ts';
 import type { ProjectState } from '../../state/index.ts';
+import { deriveWorkflow } from '../../tasks/index.ts';
+import type { ExecutorLiveness, TaskCondition } from '../../tasks/index.ts';
+import { countConditions } from '../workflow-format.ts';
 import { createRunner, requireConfig } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
@@ -150,20 +153,40 @@ export function formatProject(project: ProjectRecord, forgeDir: string): string 
   ]);
 }
 
-export function formatStatus(project: ProjectRecord, state: ProjectState): string {
+export function formatStatus(project: ProjectRecord, state: ProjectState, liveness?: ExecutorLiveness): string {
+  const view = deriveWorkflow(state, liveness);
   const pendingDecisions = state.decisions.filter((decision) => decision.status === 'pending').length;
-  const milestonesDone = state.milestones.filter((milestone) => milestone.status === 'completed').length;
+  const count = (condition: TaskCondition): number => view.tasks.filter((task) => task.condition === condition).length;
+  const attention = [
+    count('awaiting-validation') > 0 ? `${count('awaiting-validation')} awaiting validation` : undefined,
+    count('interrupted') > 0 ? `${count('interrupted')} interrupted (recovery required)` : undefined,
+    count('retryable') > 0 ? `${count('retryable')} failed but retryable` : undefined,
+    count('exhausted') > 0 ? `${count('exhausted')} failed with no attempts left` : undefined,
+    count('blocked') > 0 ? `${count('blocked')} blocked` : undefined,
+    pendingDecisions > 0 ? `${pendingDecisions} decision(s) pending` : undefined,
+  ].filter((item) => item !== undefined);
   return formatFields([
     ['Project', `${project.name} (${project.id})`],
     ['Status', project.status],
     ['Phase', state.phase],
-    ['Milestones', `${state.milestones.length} total, ${milestonesDone} completed`],
-    ['Tasks', formatTaskCounts(state)],
-    ['Decisions', pendingDecisions === 0 ? 'none pending' : `${pendingDecisions} pending — human input required`],
+    ['Milestones', formatMilestoneCounts(state)],
+    ['Tasks', countConditions(view.tasks)],
+    ['Runnable', view.runnable.length === 0 ? '0' : `${view.runnable.length} (${view.runnable.map((task) => task.key).join(', ')})`],
+    ['Attention', attention.length === 0 ? 'none' : attention.join('; ')],
     ['Worker runs', formatWorkerRuns(state)],
     ['Revision', String(state.revision)],
     ['Updated', state.updatedAt],
   ]);
+}
+
+function formatMilestoneCounts(state: ProjectState): string {
+  if (state.milestones.length === 0) {
+    return '0';
+  }
+  const parts = MILESTONE_STATUSES.map((status) => [status, state.milestones.filter((milestone) => milestone.status === status).length] as const)
+    .filter(([, count]) => count > 0)
+    .map(([status, count]) => `${status} ${count}`);
+  return `${state.milestones.length} (${parts.join(', ')})`;
 }
 
 function formatWorkerRuns(state: ProjectState): string {
@@ -172,16 +195,6 @@ function formatWorkerRuns(state: ProjectState): string {
     return '0';
   }
   return `${state.workerRuns.length} (last: ${last.worker} ${last.status} at ${last.startedAt})`;
-}
-
-function formatTaskCounts(state: ProjectState): string {
-  if (state.tasks.length === 0) {
-    return '0';
-  }
-  const counts = TASK_STATUSES.map((status) => [status, state.tasks.filter((task) => task.status === status).length] as const)
-    .filter(([, count]) => count > 0)
-    .map(([status, count]) => `${status} ${count}`);
-  return `${state.tasks.length} (${counts.join(', ')})`;
 }
 
 function formatFields(fields: readonly (readonly [string, string])[]): string {

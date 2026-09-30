@@ -116,6 +116,8 @@ describe('runRecordedWorker', () => {
       id: `old-${index}`,
       worker: 'fake',
       trigger: 'manual' as const,
+      taskId: null,
+      attempt: null,
       access: 'read-only' as const,
       task: 'old',
       workingDirectory: '.',

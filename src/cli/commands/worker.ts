@@ -9,7 +9,7 @@ import { requireConfig, resolveWorkers } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
 
-const MAX_TIMEOUT_SECONDS = WORKER_REQUEST_LIMITS.maxTimeoutMs / 1000;
+export const MAX_TIMEOUT_SECONDS = WORKER_REQUEST_LIMITS.maxTimeoutMs / 1000;
 
 const USAGE = [
   'forge worker <subcommand>',
@@ -157,7 +157,7 @@ async function runWorker(args: readonly string[], context: CliContext): Promise<
   return recorded.status === 'success' ? ExitCode.Success : ExitCode.Failure;
 }
 
-function formatIntegrityViolation(recorded: RecordedRun): string {
+export function formatIntegrityViolation(recorded: RecordedRun): string {
   const lines = [
     '',
     'SECURITY: Forge control state (.forge/) was modified during this worker run.',
@@ -171,7 +171,7 @@ function formatIntegrityViolation(recorded: RecordedRun): string {
   return `${lines.join('\n')}\n`;
 }
 
-function createWorker(name: string, context: CliContext): Worker | undefined {
+export function createWorker(name: string, context: CliContext): Worker | undefined {
   const registry = resolveWorkers(context, { lenient: true });
   const worker = registry.create(name);
   if (worker === undefined) {
@@ -181,7 +181,7 @@ function createWorker(name: string, context: CliContext): Worker | undefined {
   return worker;
 }
 
-function parseTimeoutSeconds(value: string | undefined): number | undefined | 'invalid' {
+export function parseTimeoutSeconds(value: string | undefined): number | undefined | 'invalid' {
   if (value === undefined) {
     return undefined;
   }

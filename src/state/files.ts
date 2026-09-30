@@ -82,10 +82,11 @@ export async function writeFileAtomic(target: string, content: string): Promise<
 /**
  * On Windows, rename can fail transiently with EPERM/EBUSY/EACCES while
  * another process (antivirus, indexer, a concurrent reader) has the target
- * open. Retry briefly before giving up.
+ * open, e.g. a concurrent `forge task list`. Retry with capped backoff for about
+ * five seconds before giving up.
  */
 async function renameWithRetry(from: string, to: string): Promise<void> {
-  const attempts = 10;
+  const attempts = 25;
   for (let attempt = 1; ; attempt++) {
     try {
       await rename(from, to);
@@ -95,7 +96,7 @@ async function renameWithRetry(from: string, to: string): Promise<void> {
       if (!transient || attempt >= attempts) {
         throw error;
       }
-      await delay(20 * attempt);
+      await delay(Math.min(20 * attempt, 300));
     }
   }
 }

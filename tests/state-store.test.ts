@@ -13,7 +13,7 @@ import {
   upgradeDocument,
   writeFileAtomic,
 } from '../src/state/index.ts';
-import type { ProjectState } from '../src/state/index.ts';
+import type { ProjectState, WorkerRunRecord } from '../src/state/index.ts';
 import { TempDirs, tryLinkFile } from './fixtures.ts';
 
 const PROJECT_ID = '11111111-2222-4333-8444-555555555555';
@@ -41,26 +41,51 @@ async function fixture(options: { lockTimeoutMs?: number } = {}): Promise<Fixtur
 /** A state exercising every record type. */
 function populatedState(): ProjectState {
   const at = T0.toISOString();
+  const run = (id: string, fields: Partial<WorkerRunRecord>): WorkerRunRecord => ({
+    id,
+    worker: 'claude-code',
+    trigger: 'task',
+    access: 'edit',
+    taskId: 't1',
+    attempt: 1,
+    task: 'Add runner',
+    workingDirectory: '.',
+    status: 'success',
+    startedAt: at,
+    finishedAt: at,
+    durationMs: 1000,
+    summary: 'done',
+    diagnostic: null,
+    ...fields,
+  });
+  const executor = { pid: 4242, host: 'build-box' };
   return {
     ...createInitialState(PROJECT_ID, T0),
     phase: 'executing',
     milestones: [
-      { id: 'm1', title: 'Foundation', description: null, status: 'in-progress', createdAt: at, updatedAt: at },
+      { id: 'm1', order: 1, title: 'Foundation', description: null, status: 'active', createdAt: at, updatedAt: at },
+      { id: 'm2', order: 2, title: 'Polish', description: 'Later work', status: 'pending', createdAt: at, updatedAt: at },
     ],
     tasks: [
       {
         id: 't1',
         milestoneId: 'm1',
+        order: 1,
         title: 'Add runner',
-        description: 'Controlled process runner',
-        status: 'retrying',
+        instruction: 'Implement a controlled process runner',
+        context: 'Use argument arrays',
+        status: 'running',
+        dependsOn: [],
+        maxAttempts: 3,
         attempts: [
           {
             number: 1,
-            status: 'failed',
-            worker: 'claude-code',
+            runId: 'r1',
+            outcome: 'rejected',
+            executor,
             startedAt: at,
             finishedAt: at,
+            note: 'tests missing',
             validation: {
               status: 'failed',
               checks: [
@@ -69,31 +94,33 @@ function populatedState(): ProjectState {
               ],
               completedAt: at,
             },
-            summary: '2 tests failed',
           },
-          {
-            number: 2,
-            status: 'running',
-            worker: 'claude-code',
-            startedAt: at,
-            finishedAt: null,
-            validation: null,
-            summary: null,
-          },
+          { number: 2, runId: 'r2', outcome: 'running', executor, startedAt: at, finishedAt: null, note: null, validation: null },
         ],
+        cancelReason: null,
         createdAt: at,
         updatedAt: at,
       },
       {
         id: 't2',
-        milestoneId: null,
-        title: 'Unassigned',
-        description: null,
+        milestoneId: 'm1',
+        order: 2,
+        title: 'Add tests',
+        instruction: 'Test the runner',
+        context: null,
         status: 'pending',
+        dependsOn: ['t1'],
+        maxAttempts: 3,
         attempts: [],
+        cancelReason: null,
         createdAt: at,
         updatedAt: at,
       },
+    ],
+    workerRuns: [
+      run('r0', { trigger: 'manual', taskId: null, attempt: null, access: 'read-only', task: 'Inspect' }),
+      run('r1', {}),
+      run('r2', { attempt: 2, status: 'running', finishedAt: null, durationMs: null, summary: null }),
     ],
     decisions: [
       {
@@ -223,19 +250,66 @@ describe('StateStore: rejecting bad data', () => {
     expectLoadError({ ...valid(), schemaVersion: STATE_SCHEMA_VERSION + 1 }, /newer than this Forge supports/));
 
   it('migrates version 1 state (without worker runs) and preserves its content', async () => {
-    const v1: Record<string, unknown> = { ...valid(), schemaVersion: 1 };
+    // Version 1 as Milestone 2 wrote it: no worker runs, no tasks were ever created.
+    const decisions = [{ ...populatedState().decisions[0]!, taskId: null }];
+    const v1: Record<string, unknown> = { ...valid(), schemaVersion: 1, milestones: [], tasks: [], decisions, phase: 'planning' };
     delete v1['workerRuns'];
     await writeRaw(f.stateFile, v1);
     const loaded = await f.store.load();
     assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
     assert.deepEqual(loaded.workerRuns, []);
-    assert.deepEqual(loaded.tasks, populatedState().tasks);
+    assert.equal(loaded.phase, 'planning');
+    assert.deepEqual(loaded.decisions, decisions);
 
-    const saved = await f.store.save({ ...loaded, phase: 'planning' });
+    const saved = await f.store.save({ ...loaded, phase: 'executing' });
     const onDisk = JSON.parse(await readFile(f.stateFile, 'utf8')) as Record<string, unknown>;
     assert.equal(onDisk['schemaVersion'], STATE_SCHEMA_VERSION);
     assert.equal(saved.revision, loaded.revision + 1);
   });
+
+  /** A version 2 document as Milestone 3 wrote it. */
+  const v2 = (overrides: Record<string, unknown> = {}): Record<string, unknown> => {
+    const doc: Record<string, unknown> = {
+      ...valid(),
+      schemaVersion: 2,
+      milestones: [],
+      tasks: [],
+      decisions: [],
+      workerRuns: [
+        {
+          id: 'manual-1',
+          worker: 'claude-code',
+          trigger: 'manual',
+          access: 'read-only',
+          task: 'Inspect',
+          workingDirectory: '.',
+          status: 'success',
+          startedAt: T0.toISOString(),
+          finishedAt: T0.toISOString(),
+          durationMs: 30_000,
+          summary: 'A small repo',
+          diagnostic: null,
+        },
+      ],
+      ...overrides,
+    };
+    return doc;
+  };
+
+  it('migrates version 2 state: worker runs gain task links, milestones gain order', async () => {
+    const milestone = { id: 'm9', title: 'Old', description: null, status: 'in-progress', createdAt: T0.toISOString(), updatedAt: T0.toISOString() };
+    await writeRaw(f.stateFile, v2({ milestones: [milestone] }));
+    const loaded = await f.store.load();
+
+    assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
+    assert.deepEqual(loaded.milestones, [{ ...milestone, order: 1, status: 'active' }]);
+    assert.equal(loaded.workerRuns[0]?.taskId, null);
+    assert.equal(loaded.workerRuns[0]?.attempt, null);
+    assert.equal(loaded.workerRuns[0]?.summary, 'A small repo');
+  });
+
+  it('refuses to guess a migration for version 2 placeholder tasks', () =>
+    expectLoadError(v2({ tasks: [{ id: 'x' }] }), /version 2 tasks, which cannot be migrated/));
 
   it('rejects version 1 state that already contains version 2 fields', () =>
     expectLoadError({ ...valid(), schemaVersion: 1 }, /workerRuns is not a recognised field in schema version 1/));
@@ -244,6 +318,82 @@ describe('StateStore: rejecting bad data', () => {
     const doc = valid();
     delete doc['schemaVersion'];
     await expectLoadError(doc, /schemaVersion must be an integer/);
+  });
+
+  describe('workflow invariants', () => {
+    const tasksOf = (doc: Record<string, unknown>) => doc['tasks'] as Record<string, unknown>[];
+    const withT2DependsOn = (dependsOn: string[]) => {
+      const doc = valid();
+      tasksOf(doc)[1]!['dependsOn'] = dependsOn;
+      return doc;
+    };
+
+    it('rejects a self-dependency', () => expectLoadError(withT2DependsOn(['t2']), /task "t2" depends on itself/));
+    it('rejects a duplicate dependency', () => expectLoadError(withT2DependsOn(['t1', 't1']), /lists dependency "t1" more than once/));
+    it('rejects a missing dependency', () => expectLoadError(withT2DependsOn(['ghost']), /depends on unknown task "ghost"/));
+
+    it('rejects a dependency cycle', async () => {
+      const doc = withT2DependsOn(['t1']);
+      tasksOf(doc)[0]!['dependsOn'] = ['t2'];
+      await expectLoadError(doc, /dependency cycle: t1 -> t2 -> t1/);
+    });
+
+    it('rejects a status inconsistent with the attempts', async () => {
+      const doc = valid();
+      tasksOf(doc)[0]!['status'] = 'succeeded';
+      await expectLoadError(doc, /"succeeded" is inconsistent with its attempts \(expected "running"\)/);
+    });
+
+    it('rejects an attempt linked to the wrong run', async () => {
+      const doc = valid();
+      const attempts = tasksOf(doc)[0]!['attempts'] as Record<string, unknown>[];
+      attempts[1]!['runId'] = 'r1';
+      await expectLoadError(doc, /different task or attempt/);
+    });
+
+    it('rejects an attempt whose outcome contradicts its run', async () => {
+      const doc = valid();
+      const runs = doc['workerRuns'] as Record<string, unknown>[];
+      runs[1]!['status'] = 'failed';
+      await expectLoadError(doc, /"rejected" is inconsistent with its run status "failed"/);
+    });
+
+    it('rejects a task run that no attempt refers to', async () => {
+      const doc = valid();
+      const runs = doc['workerRuns'] as Record<string, unknown>[];
+      runs.push({ ...runs[1]!, id: 'orphan', attempt: 3 });
+      await expectLoadError(doc, /task run that no task attempt refers to/);
+    });
+
+    it('rejects an executed task whose dependency has not succeeded', async () => {
+      const doc = withT2DependsOn([]);
+      tasksOf(doc)[0]!['dependsOn'] = ['t2'];
+      await expectLoadError(doc, /includes a task that has not succeeded, but this task has been executed/);
+    });
+
+    it('rejects a completed milestone with unfinished tasks', async () => {
+      const doc = valid();
+      (doc['milestones'] as Record<string, unknown>[])[0]!['status'] = 'completed';
+      await expectLoadError(doc, /cannot be completed unless all tasks are succeeded or cancelled/);
+    });
+
+    it('rejects a pending milestone with executed tasks', async () => {
+      const doc = valid();
+      (doc['milestones'] as Record<string, unknown>[])[0]!['status'] = 'pending';
+      await expectLoadError(doc, /cannot be pending while one of its tasks has been executed/);
+    });
+
+    it('rejects duplicate milestone order', async () => {
+      const doc = valid();
+      (doc['milestones'] as Record<string, unknown>[])[1]!['order'] = 1;
+      await expectLoadError(doc, /duplicate order 1/);
+    });
+
+    it('rejects more attempts than allowed', async () => {
+      const doc = valid();
+      tasksOf(doc)[0]!['maxAttempts'] = 1;
+      await expectLoadError(doc, /exceed maxAttempts/);
+    });
   });
 
   it('rejects state belonging to another project', () =>
