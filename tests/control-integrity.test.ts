@@ -237,6 +237,19 @@ describe('control-state guard: tampering', () => {
     assert.equal(run.status, 'integrity-violation');
     assert.equal(run.integrity.scope, 'metadata');
   });
+
+  it('protects the trusted validation profile during read-only runs too', async () => {
+    const s = await scenario();
+    const { run } = await editRun(
+      s,
+      async () => {
+        await writeFile(join(s.project.layout.forgeDir, 'validation.json'), '{"schemaVersion":1,"checks":[],"updatedAt":null}');
+      },
+      'read-only',
+    );
+    assert.equal(run.status, 'integrity-violation');
+    assert.deepEqual(run.integrity.changes.map((change) => `${change.change} ${change.path}`), ['added validation.json']);
+  });
 });
 
 describe('control-state guard: reporting', () => {

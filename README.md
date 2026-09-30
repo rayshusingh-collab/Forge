@@ -42,7 +42,16 @@ Early development. Implemented so far:
 - `awaiting-validation` after a successful worker run, with manual accept and reject
 - bounded retry accounting, explicit crash recovery, and state schema v3 (migrated from v2)
 
-AI planning, deterministic validation, review, automatic retries, and autonomous execution are **not** implemented yet. **AI workers execute work; Forge owns workflow state.** Nothing runs unless you explicitly ask for it, one task at a time.
+**Milestone 5 — Deterministic Validation & Git Safety**
+
+- a human-managed validation profile (`forge validation add|list|show|remove|run`), stored as protected Forge metadata
+- sequential, deterministic validation that decides task success; worker claims never count
+- a Git baseline before each edit-enabled task, with change attribution that keeps pre-existing user work separate
+- scope checks, plus a `.forge/` integrity re-check after validation
+- `forge task validate`, `forge task override --reason` (audited), and `forge task commit` (safe, local, attributed files only)
+- npm and npx launchers run without a shell; state schema v4 (migrated from v3)
+
+AI planning, AI review, automatic retries, and autonomous execution are **not** implemented yet. **Worker output is a claim; validator output is evidence; Forge's workflow state is the decision.** Nothing runs unless you explicitly ask for it, one task at a time.
 
 ## Prerequisites
 
@@ -118,8 +127,14 @@ forge task add --milestone <m> --title <text> --instruction <text>
 forge task list [--milestone <m>] | show <task> | ready
 forge task run <task> [--worker claude] [--timeout <seconds>] [--allow-edits]
       [--acknowledge-integrity-violation]
-forge task accept <task> [--note <text>]
+forge task validate <task>
+forge task override <task> --reason <text>
 forge task reject <task> --reason <text>
+forge task commit <task>
+
+forge validation add --name <id> --executable <program> [--cwd <dir>] [--timeout <seconds>]
+      [--optional] [-- <args>...]
+forge validation list | show <id> | remove <id> | run
 forge task cancel <task> [--reason <text>]
 forge task recover <task> [--force]
 ```
@@ -195,9 +210,10 @@ forge milestone add --title "Foundation"
 forge task add --milestone 1 --title "Config loader" --instruction "Implement the configuration loader..."
 forge task add --milestone 1 --title "Loader tests" --instruction "Add tests..." --depends-on 1.1
 forge task ready                        # only 1.1 is runnable
-forge task run 1.1 --allow-edits        # runs ONE attempt of ONE task, then stops
-forge task accept 1.1                   # or: forge task reject 1.1 --reason "..."
-forge task ready                        # now 1.2 is runnable; nothing started it
+forge validation add --name test --executable npm -- test
+forge task run 1.1 --allow-edits        # ONE attempt of ONE task: worker, then validation, then stop
+forge task ready                        # 1.2 is runnable only if 1.1's validation passed; nothing started it
+forge task commit 1.1                   # optional: commit exactly 1.1's own changes, locally
 ```
 
 **References.** A task can be referred to by its key (`1.2` means milestone 1, task 2), its full ID, or a unique ID prefix of at least 4 characters. A milestone can be referred to by its number, full ID, or prefix. An ambiguous prefix fails and lists the candidates; Forge never guesses.
@@ -207,8 +223,8 @@ forge task ready                        # now 1.2 is runnable; nothing started i
 | Task | Allowed next |
 | --- | --- |
 | `pending` | `running`, `cancelled` |
-| `running` | `awaiting-validation` (worker succeeded), `failed` (any other worker outcome, or recovery) |
-| `awaiting-validation` | `succeeded` (accepted), `failed` (rejected) |
+| `running` | `succeeded` (worker succeeded and required validation passed), `awaiting-validation` (validation not completed), `failed` |
+| `awaiting-validation` | `succeeded` (validation passed on re-run, or audited override), `failed` (validation failed on re-run, or rejected) |
 | `failed` | `running` (explicit retry, while attempts remain), `cancelled` |
 | `succeeded`, `cancelled` | — (terminal) |
 
@@ -230,19 +246,27 @@ forge task ready                        # now 1.2 is runnable; nothing started i
 
 Tasks are always listed in milestone order, then task order.
 
-**Dependencies.** A dependency must be an existing, non-cancelled task, listed at most once. A task can't depend on itself, and cycles are rejected. The whole graph is re-validated every time state is loaded or written. A dependency is satisfied only when that task has `succeeded`, meaning it was accepted. A task that is merely `awaiting-validation` does not satisfy its dependents.
+**Dependencies.** A dependency must be an existing, non-cancelled task, listed at most once. A task can't depend on itself, and cycles are rejected. The whole graph is re-validated every time state is loaded or written. A dependency is satisfied only when that task has `succeeded`, meaning it passed validation or was explicitly overridden. A task that is merely `awaiting-validation` does not satisfy its dependents.
 
 **Execution** (`forge task run`). Forge performs these steps in order:
 1. Checks that the task is runnable and has attempts left.
 2. Runs the worker's health check. If the worker is unavailable, the command fails before any attempt is recorded.
 3. Records the new attempt and its worker run in a single state write, and moves the task to `running`.
-4. Invokes the worker with the task's instruction and context, which are sent as data, never as shell text.
-5. Records Forge's verdict and stops.
+4. For edit-enabled runs, captures the Git baseline.
+5. Invokes the worker with the task's instruction and context, which are sent as data, never as shell text.
+6. For edit-enabled runs, captures the changes and runs deterministic validation (see below).
+7. Records Forge's decision in one atomic state write and stops.
 
 Result mapping:
-- Worker `success` → task `awaiting-validation`. The run completed, but that is not proof the work is correct.
-- `failed`, `timeout`, `cancelled` (Ctrl+C), `unavailable`, and `invalid-output` → task `failed`.
-- `integrity-violation` → task `failed`. A retry then requires `--acknowledge-integrity-violation`.
+- Worker `failed`, `timeout`, `cancelled` (Ctrl+C), `unavailable`, or `invalid-output` → `failed`. Validation does not run.
+- `.forge/` modified, whether by the worker or by a validation command → `failed` (`integrity-violation`), even if every check passed. A retry requires `--acknowledge-integrity-violation`.
+- HEAD or the branch moved, or changes appeared outside the task's working directory → `failed` (`scope-violation`). A retry requires the same acknowledgement.
+- Worker `success` and required validation passed → `succeeded` (`validated`).
+- Worker `success` and required validation failed or timed out → `failed` (`validation-failed`, retryable).
+- Worker `success` but validation couldn't finish (cancelled, a check misconfigured, or a program failed to start) → `awaiting-validation`.
+- Worker `success` with no required checks configured, or a read-only task → `awaiting-validation`.
+
+`forge task run` exits with 0 when the task ended `succeeded` or `awaiting-validation`, and 1 when it ended `failed`.
 
 Forge never starts another task and never retries on its own.
 
@@ -251,7 +275,11 @@ Forge never starts another task and never retries on its own.
 - After a failure or rejection, the task is `retryable` while attempts remain, but it is only re-run by another explicit `forge task run`. When the budget is used up, the task is `exhausted`.
 - Each attempt links to exactly one worker run (`workerRuns` in `state.json`). Worker runs made for tasks are kept for as long as their task exists; manual `forge worker run` history is capped at 100.
 
-**Validation, for now.** `awaiting-validation` is where Milestone 5's deterministic validator will plug in. Until then, `forge task accept` and `forge task reject --reason` are the manual stand-ins. Only a task awaiting validation can be accepted.
+**Leaving `awaiting-validation`.**
+- `forge task validate` re-runs the configured checks. It invokes no worker and consumes no attempt.
+- `forge task override --reason` marks the task succeeded without validation. This is an explicit human decision: the reason is recorded, and the task shows as `overridden`.
+- `forge task reject --reason` fails the task.
+- A task whose validation **failed** is `failed`, never awaiting validation, so it can't be overridden. The Milestone 4 `forge task accept` has been removed.
 
 **Crash recovery.**
 - Before invoking the worker, Forge records which Forge process (process ID and host) is executing the attempt.
@@ -266,6 +294,63 @@ Forge never starts another task and never retries on its own.
 - An edit-enabled run holds it for the whole run, as required by the Milestone 3 integrity lease. Other Forge commands that write state wait up to 5 seconds and then fail with a lock conflict, instead of interleaving.
 - No operation waits for the lock while already holding it, so these cannot deadlock.
 
+## Validation
+
+**Trust model.** Worker output is a claim; validator output is evidence; Forge's workflow state is the decision.
+- A task succeeds only when the required checks Forge runs pass, or when a human explicitly overrides it.
+- No AI model takes part in validation.
+- The checks are executable configuration, so only a human changes them, through `forge validation`.
+- They're stored as Forge control metadata in `.forge/validation.json`, which the integrity guard protects: every byte after an edit-enabled run, and this file after read-only runs. A worker that alters the checks fails its task with `integrity-violation`, and the altered checks are never run.
+- Task text and worker output never become commands.
+
+```sh
+forge validation add --name test --executable npm --timeout 300 -- test
+forge validation add --name typecheck --executable node_modules/.bin/tsc -- --noEmit
+forge validation add --name lint --executable npm --optional -- run lint
+forge validation run        # try the checks now; records nothing
+```
+
+**Checks.**
+- Each check is a program plus an argument array. There is no shell, and anything that looks like shell syntax (`&&`, `|`, quotes, `$`) is refused.
+- The program can be:
+  - a name on `PATH` (`npm`, `node`);
+  - an absolute path;
+  - a path inside the project (`node_modules/.bin/tsc`), checked against the project boundary, including link escapes.
+- On Windows, npm-generated `.cmd` launchers, including npm's own `npm.cmd` and `npx.cmd`, are unwrapped and run directly without `cmd.exe`. Any other `.cmd` or `.bat` is refused.
+- Every check has a timeout (default 10 minutes) and a working directory inside the project (default: the root).
+- Checks are required unless `--optional`. The program is resolved when you add the check, so typos fail immediately.
+
+**Running.**
+- Checks run one at a time, in the configured order, and all of them run even after a failure, so the evidence is complete.
+- Ctrl+C stops the running check and skips the rest.
+- The overall result comes from the required checks only, by priority: cancelled > configuration error > execution error > timed out > failed > passed. Optional failures are recorded but never fail a task.
+- Checks inherit Forge's environment, plus `CI=true`, `NO_COLOR=1` and `FORCE_COLOR=0`. Nothing from the environment is logged or stored.
+- For each non-passing check, only a 500-character tail of its output is stored.
+
+**No checks, no success.** If no required checks are configured, an edit-enabled task ends `awaiting-validation`. Forge never treats "nothing was checked" as "validated". Read-only tasks produce no code and always end `awaiting-validation`.
+
+## Git safety
+
+**Baseline and attribution.** Before an edit-enabled task, Forge records HEAD, the branch, and every path Git reports as modified, staged, deleted, renamed or untracked, with a SHA-256 fingerprint of each file's content. After the worker, it compares:
+- A path that was clean before and changed after is the task's.
+- A path that was dirty before and is unchanged is your pre-existing work. It is left alone and never attributed to the task.
+- A path that was dirty before and changed again is **mixed**. Forge knows it was touched, not whose lines are whose, and never pretends otherwise.
+- Retries keep attributing earlier attempts' edits to the task, because Forge never reverts a failed attempt. A file you edit between attempts becomes yours or mixed. If HEAD moved between attempts, Forge starts from a fresh baseline.
+- Forge never stashes, resets, cleans, or checks out over your changes.
+
+**Safe commit** (`forge task commit <task>`, never automatic).
+- Only for a task whose latest attempt passed validation; overridden tasks are excluded.
+- Before committing, Forge re-verifies:
+  - HEAD and the branch are unchanged;
+  - there are no merge conflicts;
+  - every attributed file still has exactly the validated content and isn't staged by someone else.
+- It stages only the task's new files, by literal path (never `git add .`), and runs `git commit --only -- <those paths>`. Changes you had staged, modified or left untracked stay exactly as they were.
+- The message is deterministic: `forge: complete task 1.2 - <task title>`, followed by `Forge-Task`, `Forge-Attempt` and `Forge-Validation` trailers. It never contains worker output.
+- `.forge/` and `.git/` are never committed.
+- It refuses when any file is mixed, when too many paths exist to attribute, when a rename was staged, or when anything drifted since validation. Commit those changes yourself.
+- Repository hooks run as for any commit.
+- Nothing is ever pushed. The Git layer has no push, reset, clean, checkout, stash, rebase, merge or amend operations at all.
+
 ## Current limitations
 
 - **Control-state guard is detective, not preventive:** Claude's file tools are not blocked from `.forge/`, because Forge doesn't rely on unverified path-rule syntax. Instead, the guard described below detects any change. It does not prevent the change or undo it.
@@ -274,6 +359,10 @@ Forge never starts another task and never retries on its own.
 - **Worker environment:** the worker inherits Forge's environment variables. It has no tool that could read them.
 - **Interrupted manual runs:** a `forge worker run` interrupted by a crash (not by Ctrl+C) stays recorded as `running`. Task executions are detected as `interrupted` and recovered with `forge task recover`.
 - **Interruption detection is local:** Forge checks whether the recorded process ID is still alive on the same host. An executor on another host can't be checked (use `--force`), and a reused process ID could make a dead execution look alive.
+- **Ignored files are invisible:** attribution and scope checks rely on `git status`, so a worker writing to a Git-ignored path (`dist/`, `.env`) isn't observed. Forge verifies what Git and the file system show inside the project, not the whole machine.
+- **Validation runs project code:** a check such as `npm test` executes code the worker may have changed. Forge protects the check definitions, not the code they run. V1 is not a sandbox.
+- **Concurrent profile edits:** changing validation checks while a read-only task is running is reported as an integrity violation.
+- **Interleaved edits:** edits you make in the same files while an edit-enabled task runs are attributed to the task. Forge can't tell who typed them.
 - **No task editing:** tasks can't be edited or re-parented after creation, and dependencies can't be changed. Cancel a task and add a new one instead.
 - **Windows launchers:** only npm "cmd-shim" launchers are unwrapped. Any other `.cmd`/`.bat` (including npm's own `npm.cmd`) is refused; point Forge at the underlying executable instead.
 

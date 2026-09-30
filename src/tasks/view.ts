@@ -60,7 +60,7 @@ export interface TaskView {
   readonly unmetDependencies: readonly string[];
   /** Dependencies that can never succeed, making this task blocked. */
   readonly blockingDependencies: readonly string[];
-  /** The last attempt ended in an integrity violation; a retry must be acknowledged explicitly. */
+  /** The last attempt ended in an integrity or scope violation; a retry must be acknowledged explicitly. */
   readonly requiresIntegrityAcknowledgement: boolean;
   readonly lastAttempt: TaskAttempt | undefined;
 }
@@ -140,7 +140,8 @@ export function deriveWorkflow(state: ProjectState, liveness: ExecutorLiveness =
         attemptsRemaining: Math.max(0, task.maxAttempts - task.attempts.length),
         unmetDependencies: dependencyConditions.filter(([, c]) => c !== 'succeeded').map(([id]) => id),
         blockingDependencies: dependencyConditions.filter(([, c]) => isPermanentlyUnsatisfied(c)).map(([id]) => id),
-        requiresIntegrityAcknowledgement: task.status === 'failed' && lastAttempt?.outcome === 'integrity-violation',
+        requiresIntegrityAcknowledgement:
+          task.status === 'failed' && (lastAttempt?.outcome === 'integrity-violation' || lastAttempt?.outcome === 'scope-violation'),
         lastAttempt,
       });
     }

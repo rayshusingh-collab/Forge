@@ -131,21 +131,26 @@ describe('forge task', () => {
     assert.match(run.stderr, /Task:\s+1\.1 Task A/);
     assert.match(run.stderr, /Attempt:\s+1 of 3/);
     assert.match(run.stderr, /read-only/);
-    assert.match(run.stdout, /Outcome:\s+success/);
-    assert.match(run.stdout, /Task 1\.1 is now awaiting-validation \(attempt 1 of 3\)/);
-    assert.match(run.stdout, /not proof the work is correct/);
-    assert.match(run.stdout, /Forge did not start any other task\./);
+    assert.match(run.stdout, /Worker:\s+claude-code — success/);
+    assert.match(run.stdout, /Worker's claim \(not evidence\): Implemented A\./);
+    // Read-only run and no checks configured: success is never assumed.
+    assert.match(run.stdout, /Forge decision: AWAITING VALIDATION/);
+    assert.match(run.stdout, /Attempt:\s+1\/3/);
+    assert.match(run.stdout, /Nothing else was started\./);
     assert.equal(worker.requests.length, 1);
     assert.equal(worker.requests[0]!.timeoutMs, 120_000);
     assert.equal(worker.requests[0]!.projectId, project.project.id);
   });
 
-  it('accepts a task and reports newly runnable tasks without starting them', async () => {
+  it('overrides a task awaiting validation and reports newly runnable tasks without starting them', async () => {
     const { worker, forge } = await projectWithTasks();
     await forge('task', 'run', '1.1');
-    const accept = await forge('task', 'accept', '1.1', '--note', 'reviewed');
-    assert.equal(accept.exitCode, 0);
-    assert.match(accept.stdout, /Task 1\.1 accepted \(succeeded\)\.\nRunnable now: 1\.2 \(nothing was started\)\./);
+    assert.equal((await forge('task', 'override', '1.1')).exitCode, 2, '--reason is required');
+    const override = await forge('task', 'override', '1.1', '--reason', 'reviewed by hand');
+    assert.equal(override.exitCode, 0);
+    assert.match(override.stdout, /Task 1\.1 marked succeeded by HUMAN OVERRIDE \(not validated\)/);
+    assert.match(override.stdout, /Runnable now: 1\.2 \(nothing was started\)\./);
+    assert.match((await forge('task', 'show', '1.1')).stdout, /#1 overridden[\s\S]*note: override: reviewed by hand/);
     assert.equal(worker.requests.length, 1);
   });
 
@@ -160,11 +165,14 @@ describe('forge task', () => {
     assert.match(show.stdout, /note: Missing tests/);
   });
 
-  it('refuses to accept a task that never ran', async () => {
+  it('no longer offers manual acceptance, and never overrides a task that did not run', async () => {
     const { forge } = await projectWithTasks();
-    const accept = await forge('task', 'accept', '1.2');
-    assert.equal(accept.exitCode, 1);
-    assert.match(accept.stderr, /only a task awaiting validation/);
+    const accept = await forge('task', 'accept', '1.1');
+    assert.equal(accept.exitCode, 2);
+    assert.match(accept.stderr, /removed — tasks now succeed only through deterministic validation/);
+    const override = await forge('task', 'override', '1.2', '--reason', 'x');
+    assert.equal(override.exitCode, 1);
+    assert.match(override.stderr, /only a task awaiting validation can be overridden/);
   });
 
   it('refuses to run a blocked task', async () => {
@@ -183,8 +191,10 @@ describe('forge task', () => {
     await forge('task', 'add', '--milestone', '1', '--title', 'T', '--instruction', 'x', '--max-attempts', '1');
     const run = await forge('task', 'run', '1.1');
     assert.equal(run.exitCode, 1);
-    assert.match(run.stdout, /Outcome:\s+failed/);
-    assert.match(run.stdout, /now exhausted \(attempt 1 of 1\)/);
+    assert.match(run.stdout, /Worker:\s+claude-code — failed/);
+    assert.match(run.stdout, /Forge decision: FAILED \(failed\)/);
+    assert.match(run.stdout, /Attempt:\s+1\/1/);
+    assert.doesNotMatch(run.stdout, /Retry available/);
   });
 
   it('cancels a task and blocks its dependents', async () => {
@@ -257,7 +267,7 @@ describe('persistence across Forge processes', () => {
   it('reads the workflow back in a fresh process', async () => {
     const { project, forge } = await projectWithTasks();
     await forge('task', 'run', '1.1');
-    await forge('task', 'accept', '1.1');
+    await forge('task', 'override', '1.1', '--reason', 'reviewed');
 
     const entry = fileURLToPath(new URL('../src/index.ts', import.meta.url));
     const result = await testRunner.run({ command: process.execPath, args: [entry, 'task', 'ready'], cwd: project.layout.root });

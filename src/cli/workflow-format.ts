@@ -1,5 +1,6 @@
-import type { ProjectState, WorkerRunRecord } from '../state/index.ts';
-import { TASK_CONDITIONS, shortId } from '../tasks/index.ts';
+import type { ChangeSummary, ProjectState, WorkerRunRecord } from '../state/index.ts';
+import { TASK_CONDITIONS, commitEligibility, shortId } from '../tasks/index.ts';
+import { formatValidation } from './commands/validation.ts';
 import type { MilestoneView, TaskCondition, TaskView, WorkflowView } from '../tasks/index.ts';
 
 /** Deterministic, concise text rendering of workflow views. */
@@ -73,6 +74,23 @@ export function formatTask(task: TaskView, view: WorkflowView, state: ProjectSta
   if (task.task.context !== null) {
     lines.push('  Context:', indent(excerptBlock(task.task.context, 1_000)));
   }
+  const last = task.lastAttempt;
+  if (last?.changes !== null && last?.changes !== undefined) {
+    lines.push(indent(formatChanges(last.changes).trimEnd()));
+  }
+  if (last?.validation !== null && last?.validation !== undefined) {
+    lines.push(`  Validation (${last.validation.status}, ${last.validation.finishedAt}):`, formatValidation(last.validation).trimEnd());
+  }
+  if (task.task.status === 'succeeded') {
+    const eligibility = commitEligibility(last);
+    lines.push(
+      last?.commit !== null && last?.commit !== undefined
+        ? `  Commit:      ${last.commit.sha} (${last.commit.paths} file(s))`
+        : eligibility.ok
+          ? `  Commit:      not committed; eligible — forge task commit ${task.key}`
+          : `  Commit:      not committed; ${eligibility.reason}`,
+    );
+  }
   if (task.task.attempts.length > 0) {
     lines.push('  History:');
     for (const attempt of task.task.attempts) {
@@ -86,6 +104,29 @@ export function formatTask(task: TaskView, view: WorkflowView, state: ProjectSta
         lines.push(`       ${oneLine(detail, 200)}`);
       }
     }
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/** `Changes:  2 modified, 1 added (…)` plus notes for anything Forge treats cautiously. */
+export function formatChanges(changes: ChangeSummary): string {
+  const count = (kind: string): number => changes.files.filter((file) => file.change === kind).length;
+  const lines = [
+    `Changes:  ${count('modified')} modified, ${count('added')} added, ${count('deleted')} deleted` +
+      (count('renamed') > 0 ? `, ${count('renamed')} renamed` : '') +
+      (changes.preexistingUntouched > 0 ? `  (${changes.preexistingUntouched} pre-existing change(s) left untouched)` : ''),
+  ];
+  for (const file of changes.files.slice(0, 20)) {
+    lines.push(`  ${file.change.padEnd(8)} ${file.path}${file.attribution === 'mixed' ? '  [already had uncommitted changes before the task]' : ''}`);
+  }
+  if (changes.files.length > 20) {
+    lines.push(`  … ${changes.files.length - 20} more`);
+  }
+  if (changes.outOfScope.length > 0) {
+    lines.push(`  OUT OF SCOPE: ${changes.outOfScope.join(', ')}`);
+  }
+  if (changes.indexChanged.length > 0) {
+    lines.push(`  Staged during the task: ${changes.indexChanged.join(', ')}`);
   }
   return `${lines.join('\n')}\n`;
 }

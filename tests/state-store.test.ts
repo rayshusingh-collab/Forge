@@ -86,16 +86,20 @@ function populatedState(): ProjectState {
             startedAt: at,
             finishedAt: at,
             note: 'tests missing',
+            changes: null,
             validation: {
               status: 'failed',
+              profileHash: 'a'.repeat(64),
+              startedAt: at,
+              finishedAt: at,
               checks: [
-                { name: 'typecheck', status: 'passed' },
-                { name: 'test', status: 'failed' },
+                { id: 'typecheck', required: true, status: 'passed', exitCode: 0, durationMs: 10, executable: '/bin/tsc', stdout: null, stderr: null, outputTruncated: false, diagnostic: null },
+                { id: 'test', required: true, status: 'failed', exitCode: 1, durationMs: 20, executable: '/bin/node', stdout: '1 failing', stderr: null, outputTruncated: false, diagnostic: 'exited with code 1' },
               ],
-              completedAt: at,
             },
+            commit: null,
           },
-          { number: 2, runId: 'r2', outcome: 'running', executor, startedAt: at, finishedAt: null, note: null, validation: null },
+          { number: 2, runId: 'r2', outcome: 'running', executor, startedAt: at, finishedAt: null, note: null, changes: null, validation: null, commit: null },
         ],
         cancelReason: null,
         createdAt: at,
@@ -310,6 +314,44 @@ describe('StateStore: rejecting bad data', () => {
 
   it('refuses to guess a migration for version 2 placeholder tasks', () =>
     expectLoadError(v2({ tasks: [{ id: 'x' }] }), /version 2 tasks, which cannot be migrated/));
+
+  /** A version 3 document as Milestone 4 wrote it: attempts without changes/commit. */
+  const v3 = (validation: unknown = null): Record<string, unknown> => {
+    const doc = valid();
+    doc['schemaVersion'] = 3;
+    for (const task of doc['tasks'] as Record<string, unknown>[]) {
+      task['attempts'] = (task['attempts'] as Record<string, unknown>[]).map((attempt) => {
+        const { changes: _c, commit: _m, ...rest } = attempt;
+        return { ...rest, validation };
+      });
+    }
+    return doc;
+  };
+
+  it('migrates version 3 state: attempts gain empty changes, validation, and commit', async () => {
+    await writeRaw(f.stateFile, v3());
+    const loaded = await f.store.load();
+    assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
+    const attempts = loaded.tasks[0]!.attempts;
+    assert.equal(attempts.length, 2);
+    for (const attempt of attempts) {
+      assert.deepEqual([attempt.changes, attempt.validation, attempt.commit], [null, null, null]);
+    }
+    assert.equal(attempts[0]!.outcome, 'rejected');
+    assert.equal(attempts[0]!.note, 'tests missing');
+  });
+
+  it('refuses version 3 validation data it cannot map', () =>
+    expectLoadError(v3({ status: 'passed', checks: [], completedAt: T0.toISOString() }), /validation data that schema version 3 never recorded/));
+
+  it('still chains every migration from version 1', async () => {
+    const v1: Record<string, unknown> = { ...valid(), schemaVersion: 1, milestones: [], tasks: [], decisions: [] };
+    delete v1['workerRuns'];
+    await writeRaw(f.stateFile, v1);
+    const loaded = await f.store.load();
+    assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
+    assert.deepEqual([loaded.tasks, loaded.workerRuns], [[], []]);
+  });
 
   it('rejects version 1 state that already contains version 2 fields', () =>
     expectLoadError({ ...valid(), schemaVersion: 1 }, /workerRuns is not a recognised field in schema version 1/));

@@ -4,7 +4,6 @@ export { MIN_PREFIX_LENGTH, SHORT_ID_LENGTH, resolveMilestoneReference, resolveT
 export {
   MILESTONE_TRANSITIONS,
   TASK_TRANSITIONS,
-  acceptTask,
   addMilestone,
   addTask,
   assertMilestoneTransition,
@@ -15,6 +14,9 @@ export {
   cancelTask,
   completeMilestone,
   finishAttempt,
+  overrideTask,
+  recordCommit,
+  recordValidation,
   recoverTask,
   rejectTask,
   startAttempt,
@@ -23,3 +25,7 @@ export {
 export type { NewMilestone, NewTask, StartAttemptInput } from './transitions.ts';
 export { TASK_CONDITIONS, deriveWorkflow, processLiveness } from './view.ts';
 export type { ExecutorLiveness, MilestoneView, TaskCondition, TaskView, WorkflowView } from './view.ts';
+export { commitEligibility, decideBeforeValidation, decideFromValidation, scopeProblem } from './decision.ts';
+export type { PostDecision, PostExecution } from './decision.ts';
+export { commitMessage } from './engine.ts';
+export type { CommitOutcome, ValidateTaskOutcome } from './engine.ts';

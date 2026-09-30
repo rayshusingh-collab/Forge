@@ -446,6 +446,10 @@ Worker statements are not substitutes for validation.
 
 
 
+Implemented (Milestone 5, `src/validation/`): worker output is a claim, validator output is evidence, and Forge's workflow state is the decision. Checks are human-managed executable configuration (program plus argument array, no shell), stored as protected control metadata in `.forge/validation.json`. They run sequentially in a deterministic order, and the overall status is decided by the required checks only. Inside one `task run`, under the integrity lease: the worker runs, `.forge/` is verified, the changeset and scope are checked, validation runs, `.forge/` is verified again, and then a single state write records the decision (`validated` → succeeded, `validation-failed` → failed; incomplete validation or no required checks → awaiting validation). Only an explicit, audited human override can succeed a task without passing validation.
+
+
+
 \---
 
 
@@ -541,6 +545,10 @@ Eventually responsible for:
 
 
 Dangerous operations must not occur automatically.
+
+
+
+Implemented (Milestone 5, `src/git/`): `GitClient` is the only way Forge runs Git. It uses a resolved absolute executable, argument arrays, literal pathspecs, porcelain v2 `-z` output and bounded output. It deliberately exposes no push, reset, clean, checkout, stash, rebase, merge or amend. Before an edit-enabled task, a baseline records HEAD, the branch, and a fingerprint of every dirty path. Afterwards the delta attributes each change as `task` (clean before) or `mixed` (already dirty); retries carry the task's baseline forward. `forge task commit` commits only a validated task's `task`-attributed paths with `git commit --only`, after re-verifying them against the live repository, and refuses anything ambiguous.
 
 
 

@@ -2,7 +2,8 @@
 // subset of behavior Forge relies on, records how it was invoked, and never
 // contacts any service. Behavior is read from `fake-claude.config.json`
 // beside this file.
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const here = new URL('.', import.meta.url);
 const config = JSON.parse(readFileSync(new URL('fake-claude.config.json', here), 'utf8'));
@@ -69,6 +70,15 @@ function result(fields) {
 function respond() {
   switch (config.mode ?? 'success') {
     case 'success':
+      process.stdout.write(`${result({})}\n`);
+      process.exit(0);
+      break;
+    case 'write':
+      // Controlled "worker": writes the configured files relative to its working directory.
+      for (const [path, content] of Object.entries(config.writes ?? {})) {
+        mkdirSync(dirname(join(process.cwd(), path)), { recursive: true });
+        writeFileSync(join(process.cwd(), path), content);
+      }
       process.stdout.write(`${result({})}\n`);
       process.exit(0);
       break;

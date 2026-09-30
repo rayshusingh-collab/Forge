@@ -14,8 +14,11 @@
  * 3 — Milestone 4: task & milestone engine — ordered milestones, tasks with
  *     instructions/dependencies/attempt budgets, attempts linked to worker
  *     runs (migrated from 2; see STATE_MIGRATIONS).
+ * 4 — Milestone 5: deterministic validation & Git safety — attempts carry
+ *     the Git baseline/changeset, validation evidence, and commit record;
+ *     new attempt outcomes (migrated from 3).
  */
-export const STATE_SCHEMA_VERSION = 3;
+export const STATE_SCHEMA_VERSION = 4;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -36,10 +39,11 @@ export type MilestoneStatus = (typeof MILESTONE_STATUSES)[number];
  * Stored task status. Readiness, blocking, retry eligibility, and
  * interruption are derived (never stored) so they cannot go stale.
  *   pending             -> running | cancelled
- *   running             -> awaiting-validation   (worker invocation succeeded)
- *   running             -> failed                (any other worker outcome, or recovery)
- *   awaiting-validation -> succeeded             (accepted)
- *   awaiting-validation -> failed                (rejected)
+ *   running             -> succeeded             (worker succeeded and required validation passed)
+ *   running             -> awaiting-validation   (worker succeeded; validation not completed)
+ *   running             -> failed                (worker failed, validation failed, violation, or recovery)
+ *   awaiting-validation -> succeeded             (validation passed on re-run, or audited human override)
+ *   awaiting-validation -> failed                (validation failed on re-run, or rejected)
  *   failed              -> running               (retry, while attempts remain)
  *   failed              -> cancelled
  * `succeeded` and `cancelled` are terminal.
@@ -51,8 +55,14 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
  * Outcome of one task attempt, from the task engine's point of view.
  * Worker-level details live in the linked worker run.
  * - `running`: in progress (or interrupted — see recovery)
- * - `awaiting-validation`: the worker invocation succeeded; not yet validated
- * - `accepted` / `rejected`: validation verdict after a successful invocation
+ * - `awaiting-validation`: the worker invocation succeeded; deterministic
+ *   validation has not (yet) produced a verdict
+ * - `validated`: required deterministic validation passed (Forge's evidence)
+ * - `validation-failed`: required validation failed or timed out
+ * - `overridden`: a human explicitly accepted it without passing validation (audited)
+ * - `accepted`: Milestone 4 manual acceptance (kept for existing state only)
+ * - `rejected`: a human rejected it
+ * - `scope-violation`: changes appeared outside the permitted scope
  * - `failed`, `timeout`, `cancelled`, `unavailable`, `invalid-output`,
  *   `integrity-violation`: the invocation did not succeed (same as the run status)
  * - `interrupted`: Forge stopped before recording an outcome; set by recovery
@@ -69,11 +79,53 @@ export const ATTEMPT_OUTCOMES = [
   'invalid-output',
   'integrity-violation',
   'interrupted',
+  'validated',
+  'validation-failed',
+  'overridden',
+  'scope-violation',
 ] as const;
 export type AttemptOutcome = (typeof ATTEMPT_OUTCOMES)[number];
 
-export const VALIDATION_STATUSES = ['passed', 'failed'] as const;
+/**
+ * Overall result of a validation run, over the REQUIRED checks, by priority:
+ * cancelled > configuration-error > execution-error > timed-out > failed > passed.
+ * Optional checks never change it.
+ */
+export const VALIDATION_STATUSES = [
+  'passed',
+  'failed',
+  'timed-out',
+  'cancelled',
+  'configuration-error',
+  'execution-error',
+] as const;
 export type ValidationStatus = (typeof VALIDATION_STATUSES)[number];
+
+/** Result of one check. `skipped` checks were not run because validation was cancelled. */
+export const CHECK_STATUSES = [...VALIDATION_STATUSES, 'skipped'] as const;
+export type CheckStatus = (typeof CHECK_STATUSES)[number];
+
+export const FILE_CHANGE_KINDS = ['added', 'modified', 'deleted', 'renamed'] as const;
+export type FileChangeKind = (typeof FILE_CHANGE_KINDS)[number];
+
+/**
+ * `task`: the path was clean before the task, so the whole change is the task's.
+ * `mixed`: the path already had uncommitted changes and changed again; Forge
+ * cannot tell which part is whose.
+ */
+export const CHANGE_ATTRIBUTIONS = ['task', 'mixed'] as const;
+export type ChangeAttribution = (typeof CHANGE_ATTRIBUTIONS)[number];
+
+/** Bounds on stored Git and validation evidence. */
+export const EVIDENCE_LIMITS = {
+  baselineEntries: 500,
+  changedFiles: 500,
+  pathList: 50,
+  path: 1_000,
+  checks: 20,
+  outputExcerpt: 500,
+  diagnostic: 500,
+} as const;
 
 export const DECISION_STATUSES = ['pending', 'approved', 'rejected'] as const;
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
@@ -157,17 +209,85 @@ export interface WorkerRunRecord {
   readonly diagnostic: string | null;
 }
 
-export interface ValidationCheckSummary {
-  /** e.g. `typecheck`, `test`. */
-  readonly name: string;
-  readonly status: ValidationStatus;
+/** A path that had uncommitted changes before the task started. */
+export interface BaselineEntry {
+  readonly path: string;
+  /** Index / worktree status letters from `git status`. */
+  readonly index: string;
+  readonly worktree: string;
+  readonly indexHash: string | null;
+  /** `sha256:<hex>`, `link:<hex>`, `dir`, or `missing`. */
+  readonly fingerprint: string;
 }
 
-/** Outcome of validating one attempt. Holds verdicts only, never raw output. Filled by Milestone 5. */
-export interface ValidationSummary {
+/** Repository state captured before an edit-enabled task ran. */
+export interface GitBaseline {
+  /** null in a repository without commits. */
+  readonly head: string | null;
+  /** null when HEAD is detached. */
+  readonly branch: string | null;
+  readonly entries: readonly BaselineEntry[];
+  /** More dirty paths existed than could be stored; later attribution is unreliable. */
+  readonly truncated: boolean;
+  readonly capturedAt: string;
+}
+
+export interface FileChange {
+  readonly path: string;
+  readonly change: FileChangeKind;
+  /** Original path of a staged rename. */
+  readonly from: string | null;
+  readonly attribution: ChangeAttribution;
+  /** Working tree fingerprint when the changeset was captured. */
+  readonly fingerprint: string;
+}
+
+/** What changed during a task, relative to its baseline. */
+export interface ChangeSummary {
+  readonly baseline: GitBaseline;
+  readonly head: string | null;
+  readonly branch: string | null;
+  readonly files: readonly FileChange[];
+  readonly truncated: boolean;
+  /** Pre-existing dirty paths the task left untouched. */
+  readonly preexistingUntouched: number;
+  /** Paths whose staged (index) state changed during the task. */
+  readonly indexChanged: readonly string[];
+  /** Changed paths outside the permitted scope (working directory, or protected paths). */
+  readonly outOfScope: readonly string[];
+  readonly capturedAt: string;
+}
+
+export interface CheckResultRecord {
+  readonly id: string;
+  readonly required: boolean;
+  readonly status: CheckStatus;
+  readonly exitCode: number | null;
+  readonly durationMs: number | null;
+  /** Resolved program that ran. */
+  readonly executable: string | null;
+  /** Tail excerpts, stored only for checks that did not pass. */
+  readonly stdout: string | null;
+  readonly stderr: string | null;
+  readonly outputTruncated: boolean;
+  readonly diagnostic: string | null;
+}
+
+/** Evidence from one deterministic validation run. Excerpts only; never full output. */
+export interface ValidationRecord {
   readonly status: ValidationStatus;
-  readonly checks: readonly ValidationCheckSummary[];
-  readonly completedAt: string;
+  /** SHA-256 of the validation profile that was used. */
+  readonly profileHash: string;
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly checks: readonly CheckResultRecord[];
+}
+
+/** A local commit Forge created for the attempt's attributed changes. */
+export interface CommitRecord {
+  readonly sha: string;
+  readonly paths: number;
+  readonly committedAt: string;
 }
 
 /** The Forge process executing an attempt; used to detect interrupted executions. */
@@ -187,7 +307,11 @@ export interface TaskAttempt {
   readonly finishedAt: string | null;
   /** Rejection reason, recovery note, or similar (bounded). */
   readonly note: string | null;
-  readonly validation: ValidationSummary | null;
+  /** Git baseline and changeset for edit-enabled attempts. */
+  readonly changes: ChangeSummary | null;
+  /** Latest deterministic validation evidence for this attempt. */
+  readonly validation: ValidationRecord | null;
+  readonly commit: CommitRecord | null;
 }
 
 export interface TaskRecord {

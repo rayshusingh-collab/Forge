@@ -157,7 +157,7 @@ async function runWorker(args: readonly string[], context: CliContext): Promise<
   return recorded.status === 'success' ? ExitCode.Success : ExitCode.Failure;
 }
 
-export function formatIntegrityViolation(recorded: RecordedRun): string {
+export function formatIntegrityViolation(recorded: RecordedRun<unknown>): string {
   const lines = [
     '',
     'SECURITY: Forge control state (.forge/) was modified during this worker run.',

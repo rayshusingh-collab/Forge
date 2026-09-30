@@ -79,6 +79,15 @@ export async function resolveExecutable(
       return invalid(`Executable path must be absolute: ${nameOrPath}`);
     }
     const path = normalize(nameOrPath);
+    // On Windows an extensionless explicit path (e.g. node_modules/.bin/tsc,
+    // which is a POSIX shell script) is tried with PATHEXT first, as Windows would.
+    if (platform === 'win32' && !WINDOWS_RUNNABLE_EXTENSIONS.includes(extname(path).toLowerCase())) {
+      for (const extension of pathExtensions(env)) {
+        if (await isRunnableFile(`${path}${extension}`, platform)) {
+          return classify(`${path}${extension}`, platform, nodeExecutable);
+        }
+      }
+    }
     if (!(await isRunnableFile(path, platform))) {
       return { ok: false, reason: 'not-found', message: `Executable not found: ${path}` };
     }
@@ -107,10 +116,7 @@ function candidatePaths(name: string, env: ResolveExecutableOptions['env'] & obj
     return directories.map((directory) => join(directory, name));
   }
 
-  const extensions = (env['PATHEXT'] ?? DEFAULT_PATHEXT)
-    .split(';')
-    .map((extension) => extension.trim().toLowerCase())
-    .filter((extension) => WINDOWS_RUNNABLE_EXTENSIONS.includes(extension));
+  const extensions = pathExtensions(env);
   const hasRunnableExtension = WINDOWS_RUNNABLE_EXTENSIONS.includes(extname(name).toLowerCase());
 
   const candidates: string[] = [];
@@ -123,6 +129,14 @@ function candidatePaths(name: string, env: ResolveExecutableOptions['env'] & obj
     }
   }
   return candidates;
+}
+
+/** PATHEXT extensions Forge can run without a shell, in PATHEXT order. */
+function pathExtensions(env: ResolveExecutableOptions['env'] & object): string[] {
+  return (env['PATHEXT'] ?? DEFAULT_PATHEXT)
+    .split(';')
+    .map((extension) => extension.trim().toLowerCase())
+    .filter((extension) => WINDOWS_RUNNABLE_EXTENSIONS.includes(extension));
 }
 
 async function isRunnableFile(path: string, platform: NodeJS.Platform): Promise<boolean> {
@@ -177,6 +191,12 @@ async function unwrapCmdShim(shimPath: string, nodeExecutable: string): Promise<
       targets.add(match[1]);
     }
   }
+  if (targets.size === 0) {
+    const npmLauncherTarget = findNpmLauncherTarget(content);
+    if (npmLauncherTarget !== undefined) {
+      targets.add(npmLauncherTarget);
+    }
+  }
   if (targets.size !== 1) {
     return unsupported(targets.size === 0 ? 'not an npm launcher' : 'ambiguous launcher target');
   }
@@ -200,6 +220,28 @@ async function unwrapCmdShim(shimPath: string, nodeExecutable: string): Promise<
   const bundledNode = join(shimDirectory, 'node.exe');
   const node = (await stat(bundledNode).then((info) => info.isFile()).catch(() => false)) ? bundledNode : nodeExecutable;
   return ok({ command: node, prefixArgs: [target], source: shimPath, kind: 'node-script' });
+}
+
+/**
+ * npm's own launchers (`npm.cmd`, `npx.cmd` in the Node.js directory) use a
+ * different, fixed structure:
+ *   SET "NODE_EXE=%~dp0\node.exe"
+ *   SET "NPM_CLI_JS=%~dp0\node_modules\npm\bin\npm-cli.js"
+ *   ...optional prefix override computed at run time...
+ *   "%NODE_EXE%" "%NPM_CLI_JS%" %*
+ * The script named in the final line is taken from its `%~dp0`-relative
+ * assignment. The run-time prefix override (a globally updated npm) is
+ * deliberately not evaluated: Forge runs the npm that ships beside this
+ * launcher, deterministically.
+ */
+function findNpmLauncherTarget(content: string): string | undefined {
+  const invocation = /^\s*"%NODE_EXE%"\s+"%([A-Z_]+)%"\s+%\*\s*$/im.exec(content);
+  if (invocation === null) {
+    return undefined;
+  }
+  const variable = invocation[1]!;
+  const assignment = new RegExp(`^\\s*SET\\s+"${variable}=%~dp0\\\\?([^"%\\r\\n]+\\.(?:js|cjs|mjs))"\\s*$`, 'im').exec(content);
+  return assignment?.[1];
 }
 
 function ok(executable: ResolvedExecutable): ExecutableResolution {

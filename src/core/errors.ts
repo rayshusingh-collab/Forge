@@ -17,7 +17,9 @@ export type ForgeErrorCode =
   | 'STATE_CONFLICT'
   | 'AUTHORIZATION_ERROR'
   | 'INTEGRITY_VIOLATION'
-  | 'WORKFLOW_ERROR';
+  | 'WORKFLOW_ERROR'
+  | 'GIT_ERROR'
+  | 'VALIDATION_CONFIG_ERROR';
 
 export type ErrorDetails = Readonly<Record<string, unknown>>;
 
@@ -111,6 +113,20 @@ export class IntegrityError extends ForgeError {
 export class WorkflowError extends ForgeError {
   constructor(message: string, options: ForgeErrorOptions = {}) {
     super('WORKFLOW_ERROR', message, options);
+  }
+}
+
+/** A Git operation failed or returned something Forge cannot interpret safely. */
+export class GitError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('GIT_ERROR', message, options);
+  }
+}
+
+/** The project's validation profile is invalid or cannot be used. */
+export class ValidationConfigError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('VALIDATION_CONFIG_ERROR', message, options);
   }
 }
 

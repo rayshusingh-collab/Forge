@@ -1,12 +1,13 @@
 import { TaskEngine, resolveTaskReference } from '../../tasks/index.ts';
-import type { TaskView } from '../../tasks/index.ts';
+import type { TaskRunOutcome, TaskView, WorkflowView } from '../../tasks/index.ts';
 import type { Worker } from '../../workers/index.ts';
 import { booleanOption, expectPositionals, listOption, parseCommandArgs, requireProject, stringOption } from '../args.ts';
-import { requireConfig } from '../runtime.ts';
+import { createRunner, lenientConfig, requireConfig } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
-import { formatReady, formatTask, formatTaskTable } from '../workflow-format.ts';
-import { MAX_TIMEOUT_SECONDS, createWorker, formatIntegrityViolation, formatResult, parseTimeoutSeconds } from './worker.ts';
+import { formatChanges, formatReady, formatTask, formatTaskTable } from '../workflow-format.ts';
+import { formatValidation } from './validation.ts';
+import { MAX_TIMEOUT_SECONDS, createWorker, formatIntegrityViolation, parseTimeoutSeconds } from './worker.ts';
 
 const USAGE = [
   'forge task <subcommand>',
@@ -20,19 +21,34 @@ const USAGE = [
   '  ready                           List tasks that can run now',
   '  run <task> [--worker <name>] [--timeout <seconds>] [--allow-edits]',
   '      [--acknowledge-integrity-violation]',
-  '                                  Execute ONE attempt of ONE task, then stop',
-  '  accept <task> [--note <text>]   Accept a task awaiting validation',
+  '                                  Execute ONE attempt of ONE task, validate it, then stop',
+  '  validate <task>                 Re-run deterministic validation for a task awaiting validation',
+  '  override <task> --reason <text> Accept a task awaiting validation WITHOUT validation (audited)',
   '  reject <task> --reason <text>   Reject a task awaiting validation',
+  '  commit <task>                   Commit a validated task\'s own changes locally (never pushes)',
   '  cancel <task> [--reason <text>] Cancel a pending or failed task',
   '  recover <task> [--force]        Mark an interrupted execution as failed',
   '',
   '<task> is its key (e.g. 1.2 = milestone 1, task 2), full ID, or a unique ID prefix.',
-  'Forge owns task status: workers report results, Forge decides transitions.',
+  'Worker output is a claim; validation is evidence; Forge decides the task status.',
 ].join('\n');
 
 type Subcommand = (args: readonly string[], context: CliContext, engine: TaskEngine, projectName: string) => Promise<ExitCodeValue>;
 
-const SUBCOMMANDS: Readonly<Record<string, Subcommand>> = { add, list, show, ready, run, accept, reject, cancel, recover };
+const SUBCOMMANDS: Readonly<Record<string, Subcommand>> = {
+  add,
+  list,
+  show,
+  ready,
+  run,
+  validate,
+  override,
+  accept,
+  reject,
+  commit,
+  cancel,
+  recover,
+};
 
 export const taskCommand: CliCommand = {
   name: 'task',
@@ -50,7 +66,8 @@ export const taskCommand: CliCommand = {
     if (typeof project === 'number') {
       return project;
     }
-    return subcommand(rest, context, new TaskEngine({ project }), project.project.name);
+    const engine = new TaskEngine({ project, runner: createRunner(context, lenientConfig(context)) });
+    return subcommand(rest, context, engine, project.project.name);
   },
 };
 
@@ -166,19 +183,75 @@ async function run(args: readonly string[], context: CliContext, engine: TaskEng
     ...(context.signal === undefined ? {} : { signal: context.signal }),
   });
 
-  context.stdout.write(formatResult(outcome.run.result, outcome.run.status));
   if (!outcome.run.integrity.ok) {
     context.stderr.write(formatIntegrityViolation(outcome.run));
   }
   if (outcome.run.persistenceError !== undefined) {
+    context.stdout.write(formatRunReport(outcome, before, await engine.view()));
     context.stderr.write(
       `forge task run: the outcome was NOT recorded: ${outcome.run.persistenceError.message}\n` +
         `The task stays recorded as running; once you have inspected the project, run: forge task recover ${before.key}\n`,
     );
     return ExitCode.Failure;
   }
-  context.stdout.write(`\n${formatAfterRun(outcome.task, before.key)}`);
-  return outcome.run.status === 'success' ? ExitCode.Success : ExitCode.Failure;
+  context.stdout.write(formatRunReport(outcome, before, await engine.view()));
+  // 0 when the task succeeded or is awaiting validation; 1 when it failed.
+  return outcome.task?.task.status === 'failed' ? ExitCode.Failure : ExitCode.Success;
+}
+
+async function validate(args: readonly string[], context: CliContext, engine: TaskEngine): Promise<ExitCodeValue> {
+  const reference = singleReference('task validate', args, context);
+  if (reference === undefined) {
+    return ExitCode.Usage;
+  }
+  const outcome = await engine.validateTask(reference, context.signal === undefined ? {} : { signal: context.signal });
+  const lines: string[] = [];
+  if (outcome.post.validation !== null) {
+    lines.push('Validation:', formatValidation(outcome.post.validation).trimEnd());
+  }
+  lines.push(`Forge decision: ${decisionLabel(outcome.task)}`);
+  if (outcome.post.note !== null) {
+    lines.push(`Reason: ${outcome.post.note}`);
+  }
+  lines.push(await newlyRunnable(engine));
+  context.stdout.write(`${lines.join('\n')}\n`);
+  return outcome.task?.task.status === 'failed' ? ExitCode.Failure : ExitCode.Success;
+}
+
+async function override(args: readonly string[], context: CliContext, engine: TaskEngine): Promise<ExitCodeValue> {
+  const parsed = parseCommandArgs('task override', args, context, { reason: { type: 'string' } });
+  const positionals = parsed === undefined ? undefined : expectPositionals('task override', parsed, ['task'], context);
+  if (parsed === undefined || positionals === undefined) {
+    return ExitCode.Usage;
+  }
+  const reason = stringOption(parsed, 'reason');
+  if (reason === undefined) {
+    context.stderr.write('forge task override: --reason <text> is required; overrides are recorded\n');
+    return ExitCode.Usage;
+  }
+  await engine.overrideTask(positionals[0]!, reason);
+  context.stdout.write(
+    `Task ${positionals[0]} marked succeeded by HUMAN OVERRIDE (not validated). The reason is recorded in its history.\n${await newlyRunnable(engine)}\n`,
+  );
+  return ExitCode.Success;
+}
+
+async function commit(args: readonly string[], context: CliContext, engine: TaskEngine): Promise<ExitCodeValue> {
+  const reference = singleReference('task commit', args, context);
+  if (reference === undefined) {
+    return ExitCode.Usage;
+  }
+  const outcome = await engine.commitTask(reference);
+  const subject = outcome.message.split('\n')[0];
+  context.stdout.write(
+    [
+      `Committed ${outcome.paths.length} file(s) as ${outcome.commit.sha.slice(0, 12)}: ${subject}`,
+      ...outcome.paths.map((path) => `  ${path}`),
+      'Only the task\'s own changes were committed; other changes were left as they were. Nothing was pushed.',
+      '',
+    ].join('\n'),
+  );
+  return ExitCode.Success;
 }
 
 async function accept(args: readonly string[], context: CliContext, engine: TaskEngine): Promise<ExitCodeValue> {
@@ -187,9 +260,13 @@ async function accept(args: readonly string[], context: CliContext, engine: Task
   if (parsed === undefined || positionals === undefined) {
     return ExitCode.Usage;
   }
-  await engine.acceptTask(positionals[0]!, stringOption(parsed, 'note') ?? null);
-  context.stdout.write(`Task ${positionals[0]} accepted (succeeded).\n${await newlyRunnable(engine)}`);
-  return ExitCode.Success;
+  void engine;
+  context.stderr.write(
+    'forge task accept: removed — tasks now succeed only through deterministic validation.\n' +
+      `Use: forge task validate ${positionals[0]}   (re-run the configured checks)\n` +
+      ` or:  forge task override ${positionals[0]} --reason "..."   (explicit, recorded human override)\n`,
+  );
+  return ExitCode.Usage;
 }
 
 async function reject(args: readonly string[], context: CliContext, engine: TaskEngine): Promise<ExitCodeValue> {
@@ -254,19 +331,62 @@ function formatTaskBanner(worker: Worker, task: TaskView, projectName: string, a
   ].join('\n');
 }
 
-function formatAfterRun(task: TaskView | undefined, key: string): string {
-  if (task === undefined) {
-    return `Task ${key}: final state could not be read back; check with: forge task show ${key}\n`;
+function formatRunReport(outcome: TaskRunOutcome, before: TaskView, view: WorkflowView): string {
+  const result = outcome.run.result;
+  const post = outcome.run.post;
+  const lines = [
+    `Task ${before.key}: ${before.task.title}`,
+    `Worker:   ${result.workerId} — ${result.outcome}, ${(result.durationMs / 1000).toFixed(1)} s`,
+  ];
+  for (const diagnostic of result.diagnostics) {
+    lines.push(`          ${diagnostic}`);
   }
-  const lines = [`Task ${task.key} is now ${task.condition} (attempt ${task.attemptsUsed} of ${task.task.maxAttempts}).`];
-  if (task.condition === 'awaiting-validation') {
-    lines.push('The worker reported success; that is not proof the work is correct.');
-    lines.push(`Review the changes, then: forge task accept ${task.key}   or   forge task reject ${task.key} --reason "..."`);
-  } else if (task.condition === 'retryable') {
-    lines.push(`Another attempt may be run explicitly with: forge task run ${task.key}`);
+  if (result.summary !== null) {
+    const summary = result.summary.trim().replace(/\s+/g, ' ');
+    lines.push(`Worker's claim (not evidence): ${summary.length <= 300 ? summary : `${summary.slice(0, 299)}…`}`);
   }
-  lines.push('Forge did not start any other task.');
+  if (post?.changes !== null && post?.changes !== undefined) {
+    lines.push(formatChanges(post.changes).trimEnd());
+  }
+  if (post?.validation !== null && post?.validation !== undefined) {
+    lines.push('Validation:', formatValidation(post.validation).trimEnd());
+  }
+  lines.push(`Forge decision: ${decisionLabel(outcome.task)}`);
+  const note = outcome.task?.lastAttempt?.note;
+  if (note !== null && note !== undefined) {
+    lines.push(`Reason:   ${note}`);
+  }
+  if (outcome.task !== undefined) {
+    lines.push(`Attempt:  ${outcome.task.attemptsUsed}/${outcome.task.task.maxAttempts}`);
+    if (outcome.task.condition === 'retryable') {
+      lines.push(`Retry available: forge task run ${outcome.task.key}${outcome.task.requiresIntegrityAcknowledgement ? ' --acknowledge-integrity-violation' : ''}`);
+    }
+    if (outcome.task.condition === 'awaiting-validation') {
+      lines.push(`Next: forge task validate ${outcome.task.key}   or   forge task override ${outcome.task.key} --reason "..."`);
+    }
+    if (outcome.task.task.status === 'succeeded') {
+      lines.push(`Commit: forge task commit ${outcome.task.key}   (optional; local only)`);
+    }
+  }
+  lines.push(view.runnable.length === 0 ? 'Next runnable: none' : `Next runnable: ${view.runnable.map((task) => task.key).join(', ')}`);
+  lines.push('Nothing else was started.');
   return `${lines.join('\n')}\n`;
+}
+
+function decisionLabel(task: TaskView | undefined): string {
+  if (task === undefined) {
+    return 'UNKNOWN (state could not be read back)';
+  }
+  switch (task.task.status) {
+    case 'succeeded':
+      return task.lastAttempt?.outcome === 'overridden' ? 'SUCCEEDED (human override)' : 'SUCCEEDED';
+    case 'awaiting-validation':
+      return 'AWAITING VALIDATION';
+    case 'failed':
+      return `FAILED (${task.lastAttempt?.outcome ?? 'failed'})`;
+    default:
+      return task.task.status.toUpperCase();
+  }
 }
 
 async function newlyRunnable(engine: TaskEngine): Promise<string> {

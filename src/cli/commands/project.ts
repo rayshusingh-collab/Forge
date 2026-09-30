@@ -4,8 +4,10 @@ import { discoverProject, openStateStore, registerProject } from '../../projects
 import type { LoadedProject, ProjectRecord } from '../../projects/index.ts';
 import { MILESTONE_STATUSES } from '../../state/index.ts';
 import type { ProjectState } from '../../state/index.ts';
-import { deriveWorkflow } from '../../tasks/index.ts';
-import type { ExecutorLiveness, TaskCondition } from '../../tasks/index.ts';
+import { commitEligibility, deriveWorkflow } from '../../tasks/index.ts';
+import type { ExecutorLiveness, TaskCondition, WorkflowView } from '../../tasks/index.ts';
+import { ValidationProfileStore } from '../../validation/index.ts';
+import type { ValidationProfile } from '../../validation/index.ts';
 import { countConditions } from '../workflow-format.ts';
 import { createRunner, requireConfig } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
@@ -92,7 +94,8 @@ async function runStatus(args: readonly string[], context: CliContext): Promise<
     return loaded;
   }
   const state = await openStateStore(loaded).load();
-  context.stdout.write(formatStatus(loaded.project, state));
+  const validation = await new ValidationProfileStore(loaded.layout).load().catch(() => undefined);
+  context.stdout.write(formatStatus(loaded.project, state, undefined, validation));
   return ExitCode.Success;
 }
 
@@ -153,7 +156,12 @@ export function formatProject(project: ProjectRecord, forgeDir: string): string 
   ]);
 }
 
-export function formatStatus(project: ProjectRecord, state: ProjectState, liveness?: ExecutorLiveness): string {
+export function formatStatus(
+  project: ProjectRecord,
+  state: ProjectState,
+  liveness?: ExecutorLiveness,
+  validation?: ValidationProfile,
+): string {
   const view = deriveWorkflow(state, liveness);
   const pendingDecisions = state.decisions.filter((decision) => decision.status === 'pending').length;
   const count = (condition: TaskCondition): number => view.tasks.filter((task) => task.condition === condition).length;
@@ -173,10 +181,36 @@ export function formatStatus(project: ProjectRecord, state: ProjectState, livene
     ['Tasks', countConditions(view.tasks)],
     ['Runnable', view.runnable.length === 0 ? '0' : `${view.runnable.length} (${view.runnable.map((task) => task.key).join(', ')})`],
     ['Attention', attention.length === 0 ? 'none' : attention.join('; ')],
+    ['Validation', formatValidationSummary(validation)],
+    ['Uncommitted', formatUncommitted(view)],
     ['Worker runs', formatWorkerRuns(state)],
     ['Revision', String(state.revision)],
     ['Updated', state.updatedAt],
   ]);
+}
+
+function formatValidationSummary(profile: ValidationProfile | undefined): string {
+  if (profile === undefined) {
+    return 'unknown';
+  }
+  const required = profile.checks.filter((check) => check.required).length;
+  return profile.checks.length === 0
+    ? 'no checks configured (tasks will wait for validation)'
+    : `${profile.checks.length} check(s), ${required} required (${profile.checks.map((check) => check.id).join(', ')})`;
+}
+
+/** Succeeded tasks whose attributed changes Forge has not committed. */
+function formatUncommitted(view: WorkflowView): string {
+  const pending = view.tasks.filter((task) => task.task.status === 'succeeded' && task.lastAttempt?.changes != null && task.lastAttempt.commit === null && task.lastAttempt.changes.files.length > 0);
+  if (pending.length === 0) {
+    return 'none';
+  }
+  return pending
+    .map((task) => {
+      const eligibility = commitEligibility(task.lastAttempt);
+      return `${task.key} (${eligibility.ok ? 'committable' : 'commit refused'})`;
+    })
+    .join(', ');
 }
 
 function formatMilestoneCounts(state: ProjectState): string {

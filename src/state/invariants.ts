@@ -18,7 +18,12 @@ export const FAILED_ATTEMPT_OUTCOMES: readonly AttemptOutcome[] = [
   'invalid-output',
   'integrity-violation',
   'interrupted',
+  'validation-failed',
+  'scope-violation',
 ];
+
+/** Attempt outcomes that make a task succeeded. `accepted` exists only in Milestone 4 state. */
+export const SUCCEEDED_ATTEMPT_OUTCOMES: readonly AttemptOutcome[] = ['validated', 'overridden', 'accepted'];
 
 /** The task status implied by its latest attempt (ignoring cancellation). */
 export function statusImpliedByAttempts(attempts: readonly TaskAttempt[]): TaskStatus {
@@ -32,6 +37,8 @@ export function statusImpliedByAttempts(attempts: readonly TaskAttempt[]): TaskS
     case 'awaiting-validation':
       return 'awaiting-validation';
     case 'accepted':
+    case 'validated':
+    case 'overridden':
       return 'succeeded';
     default:
       return 'failed';
@@ -44,6 +51,11 @@ export function runStatusForAttempt(outcome: AttemptOutcome): WorkerRunStatus {
     case 'awaiting-validation':
     case 'accepted':
     case 'rejected':
+    case 'validated':
+    case 'validation-failed':
+    case 'overridden':
+    case 'scope-violation':
+      // Validation and scope verdicts come after a worker invocation that succeeded.
       return 'success';
     default:
       return outcome;

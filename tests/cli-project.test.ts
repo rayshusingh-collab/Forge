@@ -157,7 +157,7 @@ describe('forge project show / status', () => {
         {
           ...task('t1', 1, []),
           status: 'succeeded',
-          attempts: [{ number: 1, runId: 'r1', outcome: 'accepted', executor, startedAt: at, finishedAt: at, note: null, validation: null }],
+          attempts: [{ number: 1, runId: 'r1', outcome: 'accepted', executor, startedAt: at, finishedAt: at, note: null, changes: null, validation: null, commit: null }],
         },
         task('t2', 2, ['t1']),
         task('t3', 3, ['t2']),

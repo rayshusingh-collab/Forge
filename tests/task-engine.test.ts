@@ -86,7 +86,7 @@ describe('milestones', () => {
 
     await engine.runTask('1.1', runOptions(worker()));
     assert.equal((await engine.view()).milestones[0]!.milestone.status, 'active');
-    await engine.acceptTask('1.1', null);
+    await engine.overrideTask('1.1', 'reviewed');
     await assert.rejects(engine.completeMilestone('1'), /1 task\(s\) are not finished \(1\.2 ready\)/);
 
     await engine.cancelTask(b.id, 'not needed');
@@ -208,7 +208,7 @@ describe('runnability', () => {
     await twoTasks(engine);
     await engine.runTask('1.1', runOptions(worker()));
     assert.equal(await condition(engine, '1.2'), 'waiting', 'awaiting validation is not success');
-    await engine.acceptTask('1.1', null);
+    await engine.overrideTask('1.1', 'reviewed');
     assert.equal(await condition(engine, '1.2'), 'ready');
   });
 
@@ -249,7 +249,7 @@ describe('runnability', () => {
   it('documents the legal task transitions', () => {
     assert.deepEqual(TASK_TRANSITIONS, {
       pending: ['running', 'cancelled'],
-      running: ['awaiting-validation', 'failed'],
+      running: ['succeeded', 'awaiting-validation', 'failed'],
       'awaiting-validation': ['succeeded', 'failed'],
       failed: ['running', 'cancelled'],
       succeeded: [],
@@ -436,11 +436,11 @@ describe('manual validation', () => {
     const { engine } = await setup();
     await twoTasks(engine);
     await engine.runTask('1.1', runOptions(worker()));
-    await engine.acceptTask('1.1', 'looks right');
+    await engine.overrideTask('1.1', 'looks right');
     const view = await engine.view();
     assert.equal(view.tasks[0]!.condition, 'succeeded');
-    assert.equal(view.tasks[0]!.lastAttempt?.outcome, 'accepted');
-    assert.equal(view.tasks[0]!.lastAttempt?.note, 'looks right');
+    assert.equal(view.tasks[0]!.lastAttempt?.outcome, 'overridden');
+    assert.equal(view.tasks[0]!.lastAttempt?.note, 'override: looks right');
     assert.deepEqual(view.runnable.map((t) => t.key), ['1.2']);
   });
 
@@ -458,9 +458,9 @@ describe('manual validation', () => {
   it('cannot accept a task that never ran successfully', async () => {
     const { engine } = await setup();
     await twoTasks(engine);
-    await assert.rejects(engine.acceptTask('1.1', null), /is pending; only a task awaiting validation/);
+    await assert.rejects(engine.overrideTask('1.1', 'reviewed'), /is pending; only a task awaiting validation/);
     await engine.runTask('1.1', runOptions(worker(async () => ({ outcome: 'failed', summary: null }))));
-    await assert.rejects(engine.acceptTask('1.1', null), /is failed; only a task awaiting validation/);
+    await assert.rejects(engine.overrideTask('1.1', 'reviewed'), /is failed; only a task awaiting validation/);
     await assert.rejects(engine.rejectTask('1.2', 'x'), /is pending/);
   });
 
@@ -475,12 +475,12 @@ describe('manual validation', () => {
     const { engine } = await setup();
     const { b } = await twoTasks(engine);
     await engine.runTask('1.1', runOptions(worker()));
-    await engine.acceptTask('1.1', null);
+    await engine.overrideTask('1.1', 'reviewed');
     await assert.rejects(engine.runTask('1.1', runOptions(worker())), /not runnable: it is succeeded/);
     await assert.rejects(engine.cancelTask('1.1', null), /succeeded -> cancelled/);
     await engine.cancelTask(b.id, null);
     await assert.rejects(engine.runTask(b.id, runOptions(worker())), /not runnable: it is cancelled/);
-    await assert.rejects(engine.acceptTask(b.id, null), /is cancelled/);
+    await assert.rejects(engine.overrideTask(b.id, 'reviewed'), /is cancelled/);
   });
 });
 
@@ -575,7 +575,7 @@ describe('state', () => {
     const { project, engine } = await setup();
     await twoTasks(engine);
     await engine.runTask('1.1', runOptions(worker()));
-    await engine.acceptTask('1.1', null);
+    await engine.overrideTask('1.1', 'reviewed');
 
     const restarted = new TaskEngine({ project });
     const view = await restarted.view();
@@ -599,7 +599,7 @@ describe('state', () => {
     const { engine, project } = await setup();
     await twoTasks(engine);
     const before = await openStateStore(project).load();
-    await assert.rejects(engine.acceptTask('1.2', null));
+    await assert.rejects(engine.overrideTask('1.2', 'reviewed'));
     assert.equal((await openStateStore(project).load()).revision, before.revision);
   });
 

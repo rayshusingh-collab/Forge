@@ -14,7 +14,7 @@ import type { ProjectState, StateStore, WorkerRunRecord, WorkerRunStatus, Worker
 import { excerpt, truncate } from './text.ts';
 import type { Worker, WorkerRequest, WorkerResult } from './types.ts';
 
-export interface RecordedRunOptions {
+export interface RecordedRunOptions<P = undefined> {
   readonly worker: Worker;
   readonly request: WorkerRequest;
   readonly project: LoadedProject;
@@ -24,16 +24,18 @@ export interface RecordedRunOptions {
   /** Required for `task` runs: the task and attempt this run executes. */
   readonly link?: { readonly taskId: string; readonly attempt: number };
   /** Task-engine transitions applied atomically with the run records. */
-  readonly hooks?: RunHooks;
+  readonly hooks?: RunHooks<P>;
   readonly signal?: AbortSignal;
   readonly clock?: () => Date;
   /** Where integrity evidence reports are written; never inside the project. Defaults to the OS temp directory. */
   readonly evidenceDirectory?: string;
 }
 
-export interface RecordedRun {
+export interface RecordedRun<P = undefined> {
   /** What the worker itself reported. */
   readonly result: WorkerResult;
+  /** What `afterWorker` produced (e.g. changes and validation), when it ran. */
+  readonly post: P | undefined;
   /**
    * Forge's final verdict: the worker outcome, or `integrity-violation` when
    * `.forge/` changed during the run. Only `success` means success.
@@ -52,7 +54,7 @@ export interface RecordedRun {
  * State changes that must happen in the same write as the run records, so
  * the run and the workflow never disagree on disk.
  */
-export interface RunHooks {
+export interface RunHooks<P = undefined> {
   /**
    * Applied together with the `running` record, under the same lock. May
    * throw to refuse the run (e.g. the task is no longer runnable); the worker
@@ -60,14 +62,44 @@ export interface RunHooks {
    */
   readonly onStart?: (state: ProjectState) => ProjectState;
   /**
+   * Runs after the `running` record is written and before the worker starts
+   * (inside the lease for edit runs), e.g. to capture a Git baseline. If it
+   * throws, the worker is NOT started and the run is recorded as
+   * `unavailable` with the reason.
+   */
+  readonly beforeWorker?: () => Promise<void>;
+  /**
+   * Runs after the worker whenever control state is intact (inside the lease
+   * for edit runs), for every outcome — e.g. to capture changes (a failed
+   * worker may still have edited files) and, after success, to validate.
+   * Control state is verified again afterwards, since this may run project
+   * code; a violation found then still overrides everything.
+   */
+  readonly afterWorker?: (result: WorkerResult) => Promise<P>;
+  /**
    * Applied together with the final record. Receives Forge's verdict. Not
    * called when Forge fails closed (state untrusted), in which case the
    * workflow stays as `onStart` left it and must be recovered explicitly.
    */
-  readonly onFinish?: (state: ProjectState, status: WorkerRunStatus, record: WorkerRunRecord) => ProjectState;
+  readonly onFinish?: (state: ProjectState, status: WorkerRunStatus, record: WorkerRunRecord, post: P | undefined) => ProjectState;
 }
 
 type Persist = (change: (state: ProjectState) => ProjectState) => Promise<ProjectState>;
+
+/** A result for a run whose worker never started because preparation failed. */
+function preparationFailure(options: RecordedRunOptions<unknown>, error: unknown, clock: () => Date): WorkerResult {
+  return {
+    workerId: options.worker.id,
+    requestId: options.request.id,
+    outcome: 'unavailable',
+    summary: null,
+    startedAt: clock().toISOString(),
+    durationMs: 0,
+    process: null,
+    provider: {},
+    diagnostics: [`Forge could not prepare the run, so the worker was not started: ${error instanceof Error ? error.message : String(error)}`],
+  };
+}
 
 /**
  * Runs a worker with bounded bookkeeping in project state, guarding Forge's
@@ -87,7 +119,7 @@ type Persist = (change: (state: ProjectState) => ProjectState) => Promise<Projec
  * `integrity-violation` only if `state.json`, the lock, and `.forge/` itself
  * are provably untouched; otherwise Forge fails closed and writes nothing.
  */
-export async function runRecordedWorker(options: RecordedRunOptions): Promise<RecordedRun> {
+export async function runRecordedWorker<P = undefined>(options: RecordedRunOptions<P>): Promise<RecordedRun<P>> {
   const store = options.store ?? openStateStore(options.project);
   const clock = options.clock ?? (() => new Date());
   const running = runningRecord(options, clock);
@@ -95,7 +127,7 @@ export async function runRecordedWorker(options: RecordedRunOptions): Promise<Re
   if (options.request.access !== 'edit') {
     await store.update((state) => started(options, withRun(state, running)));
     const snapshot = await snapshotControlState(options.project.layout, 'metadata');
-    const result = await execute(options);
+    const result = await prepareAndExecute(options, clock);
     return finish(options, clock, running, result, snapshot, (change) => store.update(change));
   }
 
@@ -104,7 +136,7 @@ export async function runRecordedWorker(options: RecordedRunOptions): Promise<Re
   try {
     await lease.update((state) => started(options, withRun(state, running)));
     const snapshot = await snapshotControlState(options.project.layout, 'full');
-    const result = await execute(options);
+    const result = await prepareAndExecute(options, clock);
     return await finish(options, clock, running, result, snapshot, (change) => lease.update(change));
   } finally {
     // Removes the lock only if it is still ours; a replaced lock is left as evidence.
@@ -112,15 +144,20 @@ export async function runRecordedWorker(options: RecordedRunOptions): Promise<Re
   }
 }
 
-async function finish(
-  options: RecordedRunOptions,
+async function finish<P>(
+  options: RecordedRunOptions<P>,
   clock: () => Date,
   running: WorkerRunRecord,
   result: WorkerResult,
   snapshot: ControlSnapshot,
   persist: Persist,
-): Promise<RecordedRun> {
-  const integrity = await verifyControlState(options.project, snapshot);
+): Promise<RecordedRun<P>> {
+  let integrity = await verifyControlState(options.project, snapshot);
+  let post: P | undefined;
+  if (integrity.ok && options.hooks?.afterWorker !== undefined) {
+    post = await options.hooks.afterWorker(result);
+    integrity = await verifyControlState(options.project, snapshot);
+  }
   const finished: WorkerRunRecord = {
     ...running,
     status: result.outcome,
@@ -131,7 +168,7 @@ async function finish(
   };
 
   if (integrity.ok) {
-    return save(options, result, result.outcome, integrity, undefined, finished, persist);
+    return save(options, result, post, result.outcome, integrity, undefined, finished, persist);
   }
 
   let evidencePath: string | undefined;
@@ -166,37 +203,45 @@ async function finish(
         'Nothing was restored or reset; inspect .forge/ and the evidence report.',
       { details: { runId: options.request.id, evidencePath } },
     );
-    return { result, status: 'integrity-violation', integrity, evidencePath, record: undefined, persistenceError: error };
+    return { result, post, status: 'integrity-violation', integrity, evidencePath, record: undefined, persistenceError: error };
   }
-  return save(options, result, 'integrity-violation', integrity, evidencePath, violation, persist);
+  return save(options, result, post, 'integrity-violation', integrity, evidencePath, violation, persist);
 }
 
-async function save(
-  options: RecordedRunOptions,
+async function save<P>(
+  options: RecordedRunOptions<P>,
   result: WorkerResult,
+  post: P | undefined,
   status: WorkerRunStatus,
   integrity: IntegrityReport,
   evidencePath: string | undefined,
   record: WorkerRunRecord,
   persist: Persist,
-): Promise<RecordedRun> {
+): Promise<RecordedRun<P>> {
   try {
     await persist((state) => {
       const next = withRun(state, record);
-      return options.hooks?.onFinish === undefined ? next : options.hooks.onFinish(next, status, record);
+      return options.hooks?.onFinish === undefined ? next : options.hooks.onFinish(next, status, record, post);
     });
-    return { result, status, integrity, evidencePath, record, persistenceError: undefined };
+    return { result, post, status, integrity, evidencePath, record, persistenceError: undefined };
   } catch (error) {
     const persistenceError = error instanceof Error ? error : new Error(String(error));
-    return { result, status, integrity, evidencePath, record: undefined, persistenceError };
+    return { result, post, status, integrity, evidencePath, record: undefined, persistenceError };
   }
 }
 
-function execute(options: RecordedRunOptions): Promise<WorkerResult> {
+async function prepareAndExecute<P>(options: RecordedRunOptions<P>, clock: () => Date): Promise<WorkerResult> {
+  if (options.hooks?.beforeWorker !== undefined) {
+    try {
+      await options.hooks.beforeWorker();
+    } catch (error) {
+      return preparationFailure(options as RecordedRunOptions<unknown>, error, clock);
+    }
+  }
   return options.worker.execute(options.request, options.signal === undefined ? {} : { signal: options.signal });
 }
 
-function runningRecord(options: RecordedRunOptions, clock: () => Date): WorkerRunRecord {
+function runningRecord<P>(options: RecordedRunOptions<P>, clock: () => Date): WorkerRunRecord {
   return {
     id: options.request.id,
     worker: options.worker.id,
@@ -215,7 +260,7 @@ function runningRecord(options: RecordedRunOptions, clock: () => Date): WorkerRu
   };
 }
 
-function started(options: RecordedRunOptions, state: ProjectState): ProjectState {
+function started<P>(options: RecordedRunOptions<P>, state: ProjectState): ProjectState {
   return options.hooks?.onStart === undefined ? state : options.hooks.onStart(state);
 }
 

@@ -2,7 +2,11 @@ import { ObjectReader, SchemaViolation, isPlainObject } from '../core/validation
 import { checkWorkflowInvariants } from './invariants.ts';
 import {
   ATTEMPT_OUTCOMES,
+  CHANGE_ATTRIBUTIONS,
+  CHECK_STATUSES,
   DECISION_STATUSES,
+  EVIDENCE_LIMITS,
+  FILE_CHANGE_KINDS,
   MILESTONE_STATUSES,
   PROJECT_PHASES,
   STATE_SCHEMA_VERSION,
@@ -20,9 +24,14 @@ import type {
   MilestoneRecord,
   ProjectState,
   TaskAttempt,
+  BaselineEntry,
+  ChangeSummary,
+  CheckResultRecord,
+  CommitRecord,
+  FileChange,
+  GitBaseline,
   TaskRecord,
-  ValidationCheckSummary,
-  ValidationSummary,
+  ValidationRecord,
   WorkerRunRecord,
 } from './model.ts';
 import type { Migration } from './versioning.ts';
@@ -76,6 +85,25 @@ export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
       }),
     };
   },
+  // 3 -> 4: deterministic validation. Attempts gain `changes` and `commit`
+  // (none existed before). Version 3's `validation` field was reserved and
+  // never written by Forge; a non-null value cannot be mapped and is refused.
+  3: (document) => ({
+    ...document,
+    schemaVersion: 4,
+    tasks: arrayOfObjects(document['tasks'], 'tasks').map((task, taskIndex) => ({
+      ...task,
+      attempts: arrayOfObjects(task['attempts'], `tasks[${taskIndex}].attempts`).map((attempt, attemptIndex) => {
+        if (attempt['validation'] !== null || Object.hasOwn(attempt, 'changes') || Object.hasOwn(attempt, 'commit')) {
+          throw new SchemaViolation(
+            `tasks[${taskIndex}].attempts[${attemptIndex}]`,
+            'contains validation data that schema version 3 never recorded; it cannot be migrated',
+          );
+        }
+        return { ...attempt, changes: null, validation: null, commit: null };
+      }),
+    })),
+  }),
 };
 
 function arrayOfObjects(value: unknown, path: string): Record<string, unknown>[] {
@@ -189,7 +217,9 @@ function decodeAttempt(value: unknown, path: string): TaskAttempt {
     'startedAt',
     'finishedAt',
     'note',
+    'changes',
     'validation',
+    'commit',
   ]);
   const attempt: TaskAttempt = {
     number: r.integer('number', { min: 1 }),
@@ -199,7 +229,9 @@ function decodeAttempt(value: unknown, path: string): TaskAttempt {
     startedAt: r.timestamp('startedAt'),
     finishedAt: r.nullableTimestamp('finishedAt'),
     note: r.nullableString('note', NOTE_RULES),
-    validation: r.nullable('validation', decodeValidationSummary),
+    changes: r.nullable('changes', decodeChangeSummary),
+    validation: r.nullable('validation', decodeValidationRecord),
+    commit: r.nullable('commit', decodeCommit),
   };
   if ((attempt.outcome === 'running') !== (attempt.finishedAt === null)) {
     throw new SchemaViolation(`${path}.finishedAt`, 'must be null exactly when the attempt is running');
@@ -212,18 +244,145 @@ function decodeExecutor(value: unknown, path: string): AttemptExecutor {
   return { pid: r.integer('pid', { min: 0 }), host: r.string('host', NAME_RULES) };
 }
 
-function decodeValidationSummary(value: unknown, path: string): ValidationSummary {
-  const r = new ObjectReader(value, path, ['status', 'checks', 'completedAt']);
+const PATH_RULES = { maxLength: EVIDENCE_LIMITS.path } as const;
+const HASH_PATTERN = { pattern: /^[0-9a-f]{40,64}$/, patternDescription: 'a hexadecimal object hash' } as const;
+const EXCERPT_RULES = { minLength: 0, maxLength: EVIDENCE_LIMITS.outputExcerpt } as const;
+
+function decodeValidationRecord(value: unknown, path: string): ValidationRecord {
+  const r = new ObjectReader(value, path, ['status', 'profileHash', 'startedAt', 'finishedAt', 'checks']);
   return {
     status: r.oneOf('status', VALIDATION_STATUSES),
-    checks: r.array('checks', decodeValidationCheck, 100),
-    completedAt: r.timestamp('completedAt'),
+    profileHash: r.string('profileHash', { pattern: /^[0-9a-f]{64}$/, patternDescription: 'a SHA-256 hash' }),
+    startedAt: r.timestamp('startedAt'),
+    finishedAt: r.timestamp('finishedAt'),
+    checks: r.array('checks', decodeCheckResult, EVIDENCE_LIMITS.checks),
   };
 }
 
-function decodeValidationCheck(value: unknown, path: string): ValidationCheckSummary {
-  const r = new ObjectReader(value, path, ['name', 'status']);
-  return { name: r.string('name', NAME_RULES), status: r.oneOf('status', VALIDATION_STATUSES) };
+function decodeCheckResult(value: unknown, path: string): CheckResultRecord {
+  const r = new ObjectReader(value, path, [
+    'id',
+    'required',
+    'status',
+    'exitCode',
+    'durationMs',
+    'executable',
+    'stdout',
+    'stderr',
+    'outputTruncated',
+    'diagnostic',
+  ]);
+  return {
+    id: r.string('id', NAME_RULES),
+    required: r.field('required', decodeBoolean),
+    status: r.oneOf('status', CHECK_STATUSES),
+    exitCode: r.nullable('exitCode', (item, itemPath) => decodeInteger(item, itemPath)),
+    durationMs: r.nullable('durationMs', (item, itemPath) => decodeNonNegativeInteger(item, itemPath)),
+    executable: r.nullableString('executable', PATH_RULES),
+    stdout: r.nullableString('stdout', EXCERPT_RULES),
+    stderr: r.nullableString('stderr', EXCERPT_RULES),
+    outputTruncated: r.field('outputTruncated', decodeBoolean),
+    diagnostic: r.nullableString('diagnostic', { maxLength: EVIDENCE_LIMITS.diagnostic }),
+  };
+}
+
+function decodeChangeSummary(value: unknown, path: string): ChangeSummary {
+  const r = new ObjectReader(value, path, [
+    'baseline',
+    'head',
+    'branch',
+    'files',
+    'truncated',
+    'preexistingUntouched',
+    'indexChanged',
+    'outOfScope',
+    'capturedAt',
+  ]);
+  return {
+    baseline: r.field('baseline', decodeBaseline),
+    head: r.nullableString('head', HASH_PATTERN),
+    branch: r.nullableString('branch', PATH_RULES),
+    files: r.array('files', decodeFileChange, EVIDENCE_LIMITS.changedFiles),
+    truncated: r.field('truncated', decodeBoolean),
+    preexistingUntouched: r.integer('preexistingUntouched', { min: 0 }),
+    indexChanged: r.array('indexChanged', decodeRepoPath, EVIDENCE_LIMITS.pathList),
+    outOfScope: r.array('outOfScope', decodeRepoPath, EVIDENCE_LIMITS.pathList),
+    capturedAt: r.timestamp('capturedAt'),
+  };
+}
+
+function decodeBaseline(value: unknown, path: string): GitBaseline {
+  const r = new ObjectReader(value, path, ['head', 'branch', 'entries', 'truncated', 'capturedAt']);
+  return {
+    head: r.nullableString('head', HASH_PATTERN),
+    branch: r.nullableString('branch', PATH_RULES),
+    entries: r.array('entries', decodeBaselineEntry, EVIDENCE_LIMITS.baselineEntries),
+    truncated: r.field('truncated', decodeBoolean),
+    capturedAt: r.timestamp('capturedAt'),
+  };
+}
+
+function decodeBaselineEntry(value: unknown, path: string): BaselineEntry {
+  const r = new ObjectReader(value, path, ['path', 'index', 'worktree', 'indexHash', 'fingerprint']);
+  return {
+    path: r.field('path', decodeRepoPath),
+    index: r.string('index', { maxLength: 1 }),
+    worktree: r.string('worktree', { maxLength: 1 }),
+    indexHash: r.nullableString('indexHash', HASH_PATTERN),
+    fingerprint: r.field('fingerprint', decodeFingerprint),
+  };
+}
+
+function decodeFileChange(value: unknown, path: string): FileChange {
+  const r = new ObjectReader(value, path, ['path', 'change', 'from', 'attribution', 'fingerprint']);
+  return {
+    path: r.field('path', decodeRepoPath),
+    change: r.oneOf('change', FILE_CHANGE_KINDS),
+    from: r.nullable('from', decodeRepoPath),
+    attribution: r.oneOf('attribution', CHANGE_ATTRIBUTIONS),
+    fingerprint: r.field('fingerprint', decodeFingerprint),
+  };
+}
+
+function decodeCommit(value: unknown, path: string): CommitRecord {
+  const r = new ObjectReader(value, path, ['sha', 'paths', 'committedAt']);
+  return {
+    sha: r.string('sha', HASH_PATTERN),
+    paths: r.integer('paths', { min: 1 }),
+    committedAt: r.timestamp('committedAt'),
+  };
+}
+
+/** Repository-relative, "/"-separated, never absolute or escaping. */
+function decodeRepoPath(value: unknown, path: string): string {
+  if (typeof value !== 'string' || value === '' || value.length > EVIDENCE_LIMITS.path || value.includes('\0')) {
+    throw new SchemaViolation(path, 'must be a repository-relative path');
+  }
+  if (/^[\\/]/.test(value) || /^[A-Za-z]:/.test(value) || value.split('/').includes('..')) {
+    throw new SchemaViolation(path, 'must be a repository-relative path');
+  }
+  return value;
+}
+
+function decodeFingerprint(value: unknown, path: string): string {
+  if (typeof value !== 'string' || !/^(sha256:[0-9a-f]{64}|link:[0-9a-f]{64}|dir|missing)$/.test(value)) {
+    throw new SchemaViolation(path, 'must be a content fingerprint');
+  }
+  return value;
+}
+
+function decodeBoolean(value: unknown, path: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new SchemaViolation(path, 'must be true or false');
+  }
+  return value;
+}
+
+function decodeInteger(value: unknown, path: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new SchemaViolation(path, 'must be an integer');
+  }
+  return value;
 }
 
 function decodeDecision(value: unknown, path: string): DecisionRecord {

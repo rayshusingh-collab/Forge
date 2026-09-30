@@ -3,6 +3,7 @@ import { TASK_LIMITS, describeDependencyProblem, findDependencyProblem } from '.
 import type {
   AttemptExecutor,
   AttemptOutcome,
+  CommitRecord,
   MilestoneRecord,
   MilestoneStatus,
   ProjectState,
@@ -12,6 +13,7 @@ import type {
   WorkerRunRecord,
   WorkerRunStatus,
 } from '../state/index.ts';
+import type { PostExecution } from './decision.ts';
 import { deriveWorkflow } from './view.ts';
 import type { ExecutorLiveness, TaskView } from './view.ts';
 
@@ -28,7 +30,7 @@ import type { ExecutorLiveness, TaskView } from './view.ts';
 /** Legal stored task transitions. Anything not listed is rejected. */
 export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   pending: ['running', 'cancelled'],
-  running: ['awaiting-validation', 'failed'],
+  running: ['succeeded', 'awaiting-validation', 'failed'],
   'awaiting-validation': ['succeeded', 'failed'],
   failed: ['running', 'cancelled'],
   succeeded: [],
@@ -44,9 +46,10 @@ export const MILESTONE_TRANSITIONS: Readonly<Record<MilestoneStatus, readonly Mi
 };
 
 /**
- * Worker verdict -> attempt outcome. A worker `success` only means the
- * invocation completed; the task waits for validation before it can
- * succeed. Every other verdict fails the attempt (and still consumes it).
+ * Worker verdict -> attempt outcome, before Forge's own checks. A worker
+ * `success` only means the invocation completed; what happens next is
+ * decided from Forge-collected evidence (see `decision.ts`). Every other
+ * verdict fails the attempt (and still consumes it).
  */
 export function attemptOutcomeForRun(status: WorkerRunStatus): AttemptOutcome {
   switch (status) {
@@ -60,7 +63,16 @@ export function attemptOutcomeForRun(status: WorkerRunStatus): AttemptOutcome {
 }
 
 export function taskStatusForOutcome(outcome: AttemptOutcome): TaskStatus {
-  return outcome === 'awaiting-validation' ? 'awaiting-validation' : 'failed';
+  switch (outcome) {
+    case 'awaiting-validation':
+      return 'awaiting-validation';
+    case 'validated':
+    case 'overridden':
+    case 'accepted':
+      return 'succeeded';
+    default:
+      return 'failed';
+  }
 }
 
 // ---------------------------------------------------------------- milestones
@@ -208,7 +220,7 @@ export function assertTaskCanStart(
   }
   if (view.requiresIntegrityAcknowledgement && !options.acknowledgeIntegrityViolation) {
     throw new WorkflowError(
-      `Task ${view.key}'s last attempt ended in an integrity violation (.forge/ was modified). ` +
+      `Task ${view.key}'s last attempt ended in a ${view.lastAttempt?.outcome} (${view.lastAttempt?.note ?? 'protected state or scope was violated'}). ` +
         'Inspect the project, then retry with --acknowledge-integrity-violation.',
     );
   }
@@ -230,7 +242,9 @@ export function startAttempt(state: ProjectState, input: StartAttemptInput, now:
     startedAt: now.toISOString(),
     finishedAt: null,
     note: null,
+    changes: null,
     validation: null,
+    commit: null,
   };
   let next = replaceTask(state, withStatus(task, 'running', now, { attempts: [...task.attempts, attempt] }));
   const milestone = findMilestone(next, task.milestoneId);
@@ -240,26 +254,78 @@ export function startAttempt(state: ProjectState, input: StartAttemptInput, now:
   return next;
 }
 
-/** running -> awaiting-validation | failed, from Forge's verdict on the worker run. */
-export function finishAttempt(state: ProjectState, taskId: string, runId: string, status: WorkerRunStatus, now: Date): ProjectState {
+/**
+ * running -> succeeded | awaiting-validation | failed, from Forge's verdict
+ * on the worker run plus, when the worker succeeded, Forge's own evidence
+ * (changeset and validation).
+ */
+export function finishAttempt(
+  state: ProjectState,
+  taskId: string,
+  runId: string,
+  status: WorkerRunStatus,
+  now: Date,
+  post?: PostExecution,
+): ProjectState {
   const task = findTask(state, taskId);
   const last = task.attempts.at(-1);
   if (task.status !== 'running' || last === undefined || last.runId !== runId || last.outcome !== 'running') {
     throw new WorkflowError(`Task "${task.title}" is no longer running this attempt (it was changed by another Forge process)`);
   }
-  const outcome = attemptOutcomeForRun(status);
-  return replaceTask(state, finishLastAttempt(task, outcome, null, now, taskStatusForOutcome(outcome)));
+  const workerOutcome = attemptOutcomeForRun(status);
+  if (workerOutcome !== 'awaiting-validation' || post === undefined) {
+    const finished = finishLastAttempt(task, workerOutcome, null, now, taskStatusForOutcome(workerOutcome));
+    // A failed worker may still have changed files; keep that evidence (never validated).
+    return replaceTask(state, post?.changes == null ? finished : withLastAttempt(finished, { changes: post.changes }));
+  }
+  const outcome: AttemptOutcome = post.decision;
+  const finished = finishLastAttempt(task, outcome, bounded(post.note), now, taskStatusForOutcome(outcome));
+  return replaceTask(state, withLastAttempt(finished, { changes: post.changes, validation: post.validation }));
 }
 
-/** awaiting-validation -> succeeded. Only a successfully executed task can be accepted. */
-export function acceptTask(state: ProjectState, taskId: string, note: string | null, now: Date): ProjectState {
+/**
+ * Records a re-run of validation for a task awaiting validation:
+ * awaiting-validation -> succeeded | failed, or stays awaiting validation
+ * (with fresh evidence) when validation did not complete.
+ */
+export function recordValidation(state: ProjectState, taskId: string, attemptNumber: number, post: PostExecution, now: Date): ProjectState {
+  const task = findTask(state, taskId);
+  const last = task.attempts.at(-1);
+  if (task.status !== 'awaiting-validation' || last === undefined || last.number !== attemptNumber) {
+    throw new WorkflowError(`Task "${task.title}" is no longer awaiting validation of attempt ${attemptNumber}`);
+  }
+  const evidence = { changes: post.changes ?? last.changes, validation: post.validation ?? last.validation, note: bounded(post.note) };
+  if (post.decision === 'awaiting-validation') {
+    return replaceTask(state, { ...withLastAttempt(task, evidence), updatedAt: now.toISOString() });
+  }
+  const resolved = withLastAttempt(task, { ...evidence, outcome: post.decision });
+  return replaceTask(state, withStatus(resolved, taskStatusForOutcome(post.decision), now));
+}
+
+/**
+ * awaiting-validation -> succeeded WITHOUT passing validation. An explicit,
+ * audited human decision (the reason is stored); never available for a task
+ * whose validation failed, which is `failed`, not awaiting validation.
+ */
+export function overrideTask(state: ProjectState, taskId: string, reason: string, now: Date): ProjectState {
   const task = findTask(state, taskId);
   if (task.status !== 'awaiting-validation') {
     throw new WorkflowError(
-      `Task "${task.title}" is ${task.status}; only a task awaiting validation (after a successful worker run) can be accepted`,
+      `Task "${task.title}" is ${task.status}; only a task awaiting validation can be overridden (failed validation cannot be overridden)`,
     );
   }
-  return replaceTask(state, resolveLastAttempt(task, 'accepted', optionalText(note, 'Note', TASK_LIMITS.note), now, 'succeeded'));
+  const note = requireText(reason, 'Override reason', TASK_LIMITS.note);
+  return replaceTask(state, resolveLastAttempt(task, 'overridden', `override: ${note}`, now, 'succeeded'));
+}
+
+/** Records the local commit Forge created for a validated task. */
+export function recordCommit(state: ProjectState, taskId: string, attemptNumber: number, commit: CommitRecord, now: Date): ProjectState {
+  const task = findTask(state, taskId);
+  const last = task.attempts.at(-1);
+  if (task.status !== 'succeeded' || last === undefined || last.number !== attemptNumber || last.outcome !== 'validated' || last.commit !== null) {
+    throw new WorkflowError(`Task "${task.title}" changed before its commit could be recorded`);
+  }
+  return replaceTask(state, { ...withLastAttempt(task, { commit }), updatedAt: now.toISOString() });
 }
 
 /** awaiting-validation -> failed. The attempt stays consumed; a retry must be requested explicitly. */
@@ -354,11 +420,20 @@ function finishLastAttempt(task: TaskRecord, outcome: AttemptOutcome, note: stri
 }
 
 /** Records the validation verdict on the last (already finished) attempt. */
-function resolveLastAttempt(task: TaskRecord, outcome: 'accepted' | 'rejected', note: string | null, now: Date, to: TaskStatus): TaskRecord {
+function resolveLastAttempt(task: TaskRecord, outcome: 'overridden' | 'rejected', note: string | null, now: Date, to: TaskStatus): TaskRecord {
   const attempts = task.attempts.map((attempt, index) =>
     index === task.attempts.length - 1 ? { ...attempt, outcome, note } : attempt,
   );
   return withStatus(task, to, now, { attempts });
+}
+
+function withLastAttempt(task: TaskRecord, changes: Partial<TaskAttempt>): TaskRecord {
+  const attempts = task.attempts.map((attempt, index) => (index === task.attempts.length - 1 ? { ...attempt, ...changes } : attempt));
+  return { ...task, attempts };
+}
+
+function bounded(note: string | null): string | null {
+  return note === null ? null : note.length <= TASK_LIMITS.note ? note : `${note.slice(0, TASK_LIMITS.note - 1)}…`;
 }
 
 function replaceTask(state: ProjectState, task: TaskRecord): ProjectState {

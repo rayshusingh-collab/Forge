@@ -18,7 +18,7 @@ import type { ForgeLayout } from './layout.ts';
  *   no legitimate Forge write can happen in between: any difference was made
  *   by something other than Forge.
  * - `metadata` scope (read-only runs): only files that never change during a
- *   run (`project.json`, `.gitignore`) are compared; state may legitimately
+ *   run (`project.json`, `.gitignore`, `validation.json`) are compared; state may legitimately
  *   be updated by other Forge processes meanwhile.
  *
  * Verification never repairs anything: changed files are left exactly as
@@ -69,7 +69,9 @@ const PROJECT_FILE = 'project.json';
 const STATE_FILE = 'state.json';
 const LOCK_FILE = 'state.lock';
 const GITIGNORE_FILE = '.gitignore';
-const METADATA_SCOPE_FILES = [PROJECT_FILE, GITIGNORE_FILE];
+/** The validation profile is executable configuration, so read-only runs verify it too. */
+const VALIDATION_FILE = 'validation.json';
+const METADATA_SCOPE_FILES = [PROJECT_FILE, GITIGNORE_FILE, VALIDATION_FILE];
 
 /** Bounds on what a snapshot walks and keeps. */
 const MAX_ENTRIES = 1_000;

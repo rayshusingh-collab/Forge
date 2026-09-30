@@ -10,6 +10,15 @@ export function requireConfig(context: CliContext): ForgeConfig {
   return loadConfig(context.env);
 }
 
+/** Configuration, falling back to defaults when invalid (for commands that must still work). */
+export function lenientConfig(context: CliContext): ForgeConfig {
+  try {
+    return loadConfig(context.env);
+  } catch {
+    return DEFAULT_CONFIG;
+  }
+}
+
 export function createRunner(context: CliContext, config: ForgeConfig): ProcessRunner {
   return new ProcessRunner({ defaultTimeoutMs: config.processTimeoutMs, logger: context.logger });
 }
