@@ -15,6 +15,8 @@ export interface ForgeLayout {
   readonly projectFile: string;
   readonly stateFile: string;
   readonly lockFile: string;
+  /** Held by the one orchestration run (`forge run`) allowed per project. */
+  readonly orchestrationLockFile: string;
   readonly gitignoreFile: string;
 }
 
@@ -26,6 +28,7 @@ export function forgeLayout(root: string): ForgeLayout {
     projectFile: join(forgeDir, 'project.json'),
     stateFile: join(forgeDir, 'state.json'),
     lockFile: join(forgeDir, 'state.lock'),
+    orchestrationLockFile: join(forgeDir, 'orchestration.lock'),
     gitignoreFile: join(forgeDir, '.gitignore'),
   };
 }

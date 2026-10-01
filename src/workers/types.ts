@@ -48,6 +48,11 @@ export interface WorkerRequest {
   readonly task: string;
   /** Optional supporting information, kept separate from the task. */
   readonly context: string | null;
+  /**
+   * Forge-built evidence for a repair attempt (why the previous attempt was
+   * not acceptable), or null. Delivered to the worker as fenced data.
+   */
+  readonly repairEvidence: string | null;
   readonly access: WorkerAccessMode;
   readonly timeoutMs: number;
 }

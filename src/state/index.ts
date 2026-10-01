@@ -1,11 +1,21 @@
-export { MAX_DOCUMENT_BYTES, acquireFileLock, readJsonDocument, serializeJson, withFileLock, writeFileAtomic } from './files.ts';
+export { MAX_DOCUMENT_BYTES, acquireFileLock, isErrorCode, readJsonDocument, serializeJson, withFileLock, writeFileAtomic } from './files.ts';
 export type { HeldFileLock } from './files.ts';
 export { describeDependencyProblem, findCycle, findDependencyProblem } from './graph.ts';
 export type { DependencyNode, DependencyProblem } from './graph.ts';
 export { FAILED_ATTEMPT_OUTCOMES, checkWorkflowInvariants, runStatusForAttempt, statusImpliedByAttempts } from './invariants.ts';
+export { decodeOrchestrationPolicy } from './orchestration-schema.ts';
 export { decodePlanDocument } from './plan-schema.ts';
 export {
   AI_LIMITS,
+  ORCHESTRATION_ACTIONS,
+  ORCHESTRATION_LIMITS,
+  ORCHESTRATION_RUN_MODES,
+  ORCHESTRATION_RUN_STATUSES,
+  REPAIR_TRIGGERS,
+  REVIEW_CONCERN_POLICIES,
+  REVIEW_DECIDERS,
+  REVIEW_FAILURE_POLICIES,
+  STOP_REASONS,
   FINDING_SEVERITIES,
   PLAN_STATUSES,
   REVIEW_CONFIDENCE,
@@ -32,6 +42,21 @@ export {
 } from './model.ts';
 export type {
   AiCallMetadata,
+  AttemptOrigin,
+  OrchestrationAction,
+  OrchestrationCounters,
+  OrchestrationEvent,
+  OrchestrationPolicy,
+  OrchestrationRun,
+  OrchestrationRunMode,
+  OrchestrationRunStatus,
+  OrchestrationStop,
+  RepairRecord,
+  RepairTrigger,
+  ReviewConcernPolicy,
+  ReviewDecider,
+  ReviewFailurePolicy,
+  StopReason,
   ContextSummary,
   FindingSeverity,
   PlanDocument,

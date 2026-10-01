@@ -1,6 +1,6 @@
 import { WorkflowError } from '../core/errors.ts';
 import { AI_LIMITS } from '../state/index.ts';
-import type { ProjectState, ReviewDecisionKind, TaskReview } from '../state/index.ts';
+import type { ProjectState, ReviewDecider, ReviewDecisionKind, TaskReview } from '../state/index.ts';
 import { reopenForRemediation } from '../tasks/index.ts';
 
 /**
@@ -24,11 +24,19 @@ export function recordReview(state: ProjectState, review: TaskReview): ProjectSt
 }
 
 /**
- * Records a human decision on the latest completed review of the task's
+ * Records a decision (a human's, or Forge applying an explicit orchestration
+ * policy — never the reviewer's) on the latest completed review of the task's
  * latest attempt. `remediation-required` also reopens the task (its
  * validation evidence is kept); `accepted` changes nothing else.
  */
-export function decideReview(state: ProjectState, taskId: string, kind: ReviewDecisionKind, reason: string, now: Date): ProjectState {
+export function decideReview(
+  state: ProjectState,
+  taskId: string,
+  kind: ReviewDecisionKind,
+  reason: string,
+  now: Date,
+  by: ReviewDecider = 'human',
+): ProjectState {
   const text = reason.trim();
   if (text === '' || text.length > AI_LIMITS.reason) {
     throw new WorkflowError(`A reason of 1-${AI_LIMITS.reason} characters is required`);
@@ -47,7 +55,7 @@ export function decideReview(state: ProjectState, taskId: string, kind: ReviewDe
   if (review.decision !== null) {
     throw new WorkflowError(`The latest review was already decided (${review.decision.kind})`);
   }
-  const decided: TaskReview = { ...review, decision: { kind, reason: text, decidedAt: now.toISOString() } };
+  const decided: TaskReview = { ...review, decision: { kind, reason: text, decidedAt: now.toISOString(), by } };
   const next = { ...state, taskReviews: state.taskReviews.map((candidate) => (candidate.id === review.id ? decided : candidate)) };
   return kind === 'remediation-required' ? reopenForRemediation(next, taskId, attempt.number, text, now) : next;
 }

@@ -125,6 +125,53 @@ export function checkWorkflowInvariants(state: ProjectState): void {
 
   checkPlanProposals(state, milestoneIds, taskIds);
   checkTaskReviews(state);
+  checkRepairs(state);
+  checkOrchestrationRuns(state);
+}
+
+/**
+ * A repair attempt must follow directly from the attempt whose evidence
+ * triggered it: failed validation, or a review-driven remediation decision
+ * on a recorded review. Repair numbers count up by one per task.
+ */
+function checkRepairs(state: ProjectState): void {
+  const reviews = new Map(state.taskReviews.map((review) => [review.id, review]));
+  for (const [taskIndex, task] of state.tasks.entries()) {
+    let repairs = 0;
+    for (const [index, attempt] of task.attempts.entries()) {
+      const repair = attempt.origin?.repair ?? null;
+      if (repair === null) {
+        continue;
+      }
+      const path = `tasks[${taskIndex}].attempts[${index}].origin.repair`;
+      repairs += 1;
+      if (repair.number !== repairs) {
+        throw new SchemaViolation(`${path}.number`, `must be ${repairs} (repairs are counted per task)`);
+      }
+      const source = task.attempts[repair.fromAttempt - 1];
+      if (repair.fromAttempt !== attempt.number - 1 || source === undefined) {
+        throw new SchemaViolation(`${path}.fromAttempt`, 'must be the previous attempt');
+      }
+      const expected = repair.trigger === 'validation' ? 'validation-failed' : 'review-rejected';
+      if (source.outcome !== expected) {
+        throw new SchemaViolation(`${path}.trigger`, `"${repair.trigger}" requires the previous attempt to be ${expected}`);
+      }
+      if (repair.reviewId !== null) {
+        const review = reviews.get(repair.reviewId);
+        if (review !== undefined && (review.taskId !== task.id || review.attempt !== repair.fromAttempt)) {
+          throw new SchemaViolation(`${path}.reviewId`, 'refers to a review of a different task or attempt');
+        }
+      }
+    }
+  }
+}
+
+/** Run IDs are unique and, thanks to the orchestration lease, at most one run is in progress. */
+function checkOrchestrationRuns(state: ProjectState): void {
+  uniqueIds(state.orchestrationRuns, 'orchestrationRuns');
+  if (state.orchestrationRuns.filter((run) => run.status === 'running').length > 1) {
+    throw new SchemaViolation('orchestrationRuns', 'contain more than one running orchestration run');
+  }
 }
 
 /** Proposal status must match its decision fields; applied mappings must point at real work. */

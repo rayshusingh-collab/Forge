@@ -98,8 +98,9 @@ function populatedState(): ProjectState {
               ],
             },
             commit: null,
+            origin: null,
           },
-          { number: 2, runId: 'r2', outcome: 'running', executor, startedAt: at, finishedAt: null, note: null, changes: null, validation: null, commit: null },
+          { number: 2, runId: 'r2', outcome: 'running', executor, startedAt: at, finishedAt: null, note: null, changes: null, validation: null, commit: null, origin: null },
         ],
         cancelReason: null,
         createdAt: at,
@@ -140,8 +141,25 @@ function populatedState(): ProjectState {
   };
 }
 
-/** Removes fields introduced in schema version 5, for documents of older versions. */
+/** Removes fields introduced in schema version 6, for documents of older versions. */
+function stripV6(doc: Record<string, unknown>): Record<string, unknown> {
+  delete doc['orchestrationRuns'];
+  for (const task of (doc['tasks'] as Record<string, unknown>[] | undefined) ?? []) {
+    for (const attempt of (task['attempts'] as Record<string, unknown>[] | undefined) ?? []) {
+      delete attempt['origin'];
+    }
+  }
+  for (const review of (doc['taskReviews'] as Record<string, unknown>[] | undefined) ?? []) {
+    if (review['decision'] !== null && typeof review['decision'] === 'object') {
+      delete (review['decision'] as Record<string, unknown>)['by'];
+    }
+  }
+  return doc;
+}
+
+/** Removes fields introduced in schema versions 5 and 6, for documents of older versions. */
 function stripV5(doc: Record<string, unknown>): Record<string, unknown> {
+  stripV6(doc);
   delete doc['planProposals'];
   delete doc['taskReviews'];
   return doc;
@@ -365,6 +383,102 @@ describe('StateStore: rejecting bad data', () => {
   it('refuses version 4 state that already contains version 5 fields', () =>
     expectLoadError({ ...valid(), schemaVersion: 4 }, /planProposals is not a recognised field in schema version 4/));
 
+  it('migrates version 5 state: manual attempts, human review decisions, empty run history', async () => {
+    const v5 = stripV6(valid());
+    v5['schemaVersion'] = 5;
+    v5['taskReviews'] = [
+      {
+        id: 'rv1',
+        taskId: 't1',
+        attempt: 1,
+        status: 'concerns',
+        recommendation: 'revise',
+        confidence: 'low',
+        summary: 's',
+        findings: [],
+        call: { provider: 'fake', model: null, durationMs: 1, costUsd: null, inputTokens: null, outputTokens: null },
+        context: { files: 1, bytes: 1, truncated: false },
+        diagnostic: null,
+        createdAt: T0.toISOString(),
+        decision: { kind: 'accepted', reason: 'fine', decidedAt: T0.toISOString() },
+      },
+    ];
+    await writeRaw(f.stateFile, v5);
+    const loaded = await f.store.load();
+    assert.equal(loaded.schemaVersion, 6);
+    assert.deepEqual(loaded.orchestrationRuns, []);
+    assert.ok(loaded.tasks.every((task) => task.attempts.every((attempt) => attempt.origin === null)));
+    assert.equal(loaded.taskReviews[0]!.decision?.by, 'human');
+    assert.deepEqual(loaded.tasks, populatedState().tasks, 'everything else is preserved');
+  });
+
+  it('refuses version 5 state that already contains version 6 fields', async () => {
+    await expectLoadError({ ...valid(), schemaVersion: 5 }, /orchestrationRuns is not a recognised field in schema version 5/);
+    const withOrigin = stripV6(valid());
+    withOrigin['schemaVersion'] = 5;
+    ((withOrigin['tasks'] as Record<string, unknown>[])[0]!['attempts'] as Record<string, unknown>[])[0]!['origin'] = null;
+    await expectLoadError(withOrigin, /origin is not a recognised field in schema version 5/);
+  });
+
+  describe('orchestration record invariants', () => {
+    const policy = {
+      maxTasks: 5,
+      maxSteps: 30,
+      access: 'edit',
+      worker: 'claude',
+      workerTimeoutMs: 600_000,
+      repair: { onValidationFailure: false, onBlockingReview: false, maxPerTask: 2 },
+      review: { enabled: false, reviewer: null, timeoutMs: 600_000, onConcerns: 'stop', onFailure: 'stop' },
+      autoCommit: false,
+    };
+    const run = (fields: Record<string, unknown>) => ({
+      id: 'run1',
+      mode: 'run',
+      status: 'stopped',
+      owner: { pid: 1, host: 'h' },
+      startedAt: T0.toISOString(),
+      finishedAt: T0.toISOString(),
+      policy,
+      policyHash: 'a'.repeat(64),
+      counters: { steps: 0, tasks: 0, repairs: 0, reviews: 0, commits: 0, milestones: 0 },
+      events: [],
+      eventsDropped: 0,
+      stop: { reason: 'complete', detail: null, taskId: null },
+      ...fields,
+    });
+
+    it('accepts a valid run record', async () => {
+      await writeRaw(f.stateFile, { ...valid(), orchestrationRuns: [run({})] });
+      assert.equal((await f.store.load()).orchestrationRuns.length, 1);
+    });
+
+    it('rejects a stored policy beyond the hard limits (no unlimited values)', async () => {
+      await expectLoadError({ ...valid(), orchestrationRuns: [run({ policy: { ...policy, maxTasks: 51 } })] }, /maxTasks must be <= 50/);
+      await expectLoadError({ ...valid(), orchestrationRuns: [run({ policy: { ...policy, maxSteps: 0 } })] }, /maxSteps must be >= 1/);
+      await expectLoadError(
+        { ...valid(), orchestrationRuns: [run({ policy: { ...policy, repair: { ...policy.repair, maxPerTask: 6 } } })] },
+        /maxPerTask must be <= 5/,
+      );
+    });
+
+    it('rejects two running runs and inconsistent stop records', async () => {
+      await expectLoadError(
+        { ...valid(), orchestrationRuns: [run({ id: 'a', status: 'running', finishedAt: null, stop: null }), run({ id: 'b', status: 'running', finishedAt: null, stop: null })] },
+        /more than one running orchestration run/,
+      );
+      await expectLoadError({ ...valid(), orchestrationRuns: [run({ stop: null })] }, /stop must be recorded exactly when the run stopped/);
+    });
+
+    it('rejects a repair attempt that does not follow a failed validation', async () => {
+      const doc = valid();
+      const attempts = (doc['tasks'] as Record<string, unknown>[])[0]!['attempts'] as Record<string, unknown>[];
+      attempts[1]!['origin'] = { runId: 'run1', repair: { number: 1, trigger: 'validation', fromAttempt: 1, reviewId: null, evidence: 'x' } };
+      await expectLoadError(doc, /"validation" requires the previous attempt to be validation-failed/);
+      attempts[1]!['origin'] = { runId: 'run1', repair: { number: 2, trigger: 'validation', fromAttempt: 1, reviewId: null, evidence: 'x' } };
+      await expectLoadError(doc, /must be 1 \(repairs are counted per task\)/);
+    });
+  });
+
   describe('AI record invariants', () => {
     const call = { provider: 'fake', model: null, durationMs: 1, costUsd: null, inputTokens: null, outputTokens: null };
     const review = (fields: Record<string, unknown>) => ({
@@ -396,13 +510,13 @@ describe('StateStore: rejecting bad data', () => {
 
     it('rejects a decision on a review that did not complete', () =>
       expectLoadError(
-        { ...valid(), taskReviews: [review({ status: 'invalid-output', decision: { kind: 'accepted', reason: 'x', decidedAt: T0.toISOString() } })] },
+        { ...valid(), taskReviews: [review({ status: 'invalid-output', decision: { kind: 'accepted', reason: 'x', decidedAt: T0.toISOString(), by: 'human' } })] },
         /only allowed on a completed review/,
       ));
 
     it('rejects a remediation decision whose attempt was not reopened', () =>
       expectLoadError(
-        { ...valid(), taskReviews: [review({ decision: { kind: 'remediation-required', reason: 'x', decidedAt: T0.toISOString() } })] },
+        { ...valid(), taskReviews: [review({ decision: { kind: 'remediation-required', reason: 'x', decidedAt: T0.toISOString(), by: 'human' } })] },
         /requires remediation, but the attempt was not reopened/,
       ));
 

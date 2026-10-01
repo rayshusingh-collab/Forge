@@ -2,7 +2,9 @@ import { WorkflowError } from '../core/errors.ts';
 import { TASK_LIMITS, describeDependencyProblem, findDependencyProblem } from '../state/index.ts';
 import type {
   AttemptExecutor,
+  AttemptOrigin,
   AttemptOutcome,
+  RepairRecord,
   CommitRecord,
   MilestoneRecord,
   MilestoneStatus,
@@ -203,6 +205,8 @@ export interface StartAttemptInput {
   readonly executor: AttemptExecutor;
   readonly acknowledgeIntegrityViolation: boolean;
   readonly liveness: ExecutorLiveness;
+  /** Set by the orchestrator; null/absent for a manual `forge task run`. */
+  readonly origin?: AttemptOrigin | null;
 }
 
 /**
@@ -235,6 +239,10 @@ export function startAttempt(state: ProjectState, input: StartAttemptInput, now:
   if (task.attempts.length + 1 !== input.attemptNumber) {
     throw new WorkflowError(`Task ${view.key} was started by another Forge process; reload and check its status`);
   }
+  const origin = input.origin ?? null;
+  if (origin?.repair != null) {
+    assertRepairMatches(task, origin.repair);
+  }
   const attempt: TaskAttempt = {
     number: input.attemptNumber,
     runId: input.runId,
@@ -246,6 +254,7 @@ export function startAttempt(state: ProjectState, input: StartAttemptInput, now:
     changes: null,
     validation: null,
     commit: null,
+    origin,
   };
   let next = replaceTask(state, withStatus(task, 'running', now, { attempts: [...task.attempts, attempt] }));
   const milestone = findMilestone(next, task.milestoneId);
@@ -412,6 +421,26 @@ export function recoverTask(
       : run,
   );
   return { ...next, workerRuns: runs };
+}
+
+/** Number of repair attempts already made for the task (the per-task repair budget is counted across runs). */
+export function repairsUsed(task: TaskRecord): number {
+  return task.attempts.filter((attempt) => attempt.origin?.repair != null).length;
+}
+
+/**
+ * A repair must follow directly from the failed attempt whose evidence
+ * triggered it; anything else would misattribute the repair.
+ */
+function assertRepairMatches(task: TaskRecord, repair: RepairRecord): void {
+  const last = task.attempts.at(-1);
+  const expected = repair.trigger === 'validation' ? 'validation-failed' : 'review-rejected';
+  if (task.status !== 'failed' || last === undefined || last.number !== repair.fromAttempt || last.outcome !== expected) {
+    throw new WorkflowError(`Task "${task.title}" changed: its latest attempt is no longer the ${expected} attempt ${repair.fromAttempt} being repaired`);
+  }
+  if (repair.number !== repairsUsed(task) + 1) {
+    throw new WorkflowError(`Task "${task.title}" changed: repair ${repair.number} does not follow its ${repairsUsed(task)} earlier repair(s)`);
+  }
 }
 
 // ------------------------------------------------------------------- helpers

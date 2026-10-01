@@ -59,9 +59,16 @@ Early development. Implemented so far:
 - bounded, Git-aware project context: ignored files (such as `.env`) are never read, and secret-like paths are withheld
 - planning and review are read-only: no tools, verified afterwards; state schema v5 (migrated from v4)
 
-Automatic retries, autonomous remediation, and autonomous execution are **not** implemented yet. Nothing runs unless you explicitly ask for it, one task at a time.
+**Milestone 7 — Autonomous Orchestration Loop**
 
-> **Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Forge controls state. Human approves consequential AI decisions.**
+- `forge run`: a bounded loop that selects the next runnable task, runs the implementer, validates deterministically, optionally reviews, repairs within an explicit budget, commits locally when allowed, completes milestones, and stops with a typed reason
+- `forge run step` (exactly one workflow step), `forge run --dry-run` (changes nothing), `forge run status`
+- explicit orchestration policy with conservative defaults and hard maximums (refused, never clamped)
+- one orchestration run per project (lease), bounded run history, state schema v6 (migrated from v5)
+
+Nothing autonomous happens unless you run `forge run`, and it does only what its printed policy allows. It never pushes.
+
+> **Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Orchestrator coordinates. Forge state machine decides. Human approves consequential exceptions.**
 
 ## Prerequisites
 
@@ -156,6 +163,15 @@ forge task review-accept <task> --reason <text>
 forge task review-reject <task> --reason <text>
 forge task cancel <task> [--reason <text>]
 forge task recover <task> [--force]
+
+forge run [--allow-edits] [--worker <name>] [--timeout <seconds>]
+          [--max-tasks <n>] [--max-steps <n>]
+          [--repair] [--repair-review] [--max-repairs <n>]
+          [--review] [--reviewer <name>] [--review-timeout <seconds>]
+          [--continue-on-concerns] [--continue-without-review]
+          [--auto-commit] [--dry-run]
+forge run step [same options]
+forge run status
 ```
 
 Exit codes: `0` success, `1` failure, `2` usage error.
@@ -182,8 +198,9 @@ Registration only creates `<project-root>/.forge/`. It does not initialize or co
 | `state.json`   | Orchestration state: lifecycle phase, milestones, tasks, attempts, decisions, validation summaries, and a `revision` counter |
 | `.gitignore`   | Contains `*`, so Git ignores all Forge metadata without touching the project's own `.gitignore` |
 | `state.lock`   | Exists only briefly while state is being written                                             |
+| `orchestration.lock` | Exists only while a `forge run` controls the project (see Autonomous orchestration)   |
 
-`.forge/` holds **Forge metadata only — never credentials**, and no logs or raw worker output. Both documents carry a `schemaVersion`. They are validated whenever they are read, because they may have been edited by hand. Forge refuses (rather than repairs) malformed, unsupported-version, or relocated metadata. Older state is migrated step by step on load (v1 → v2 → v3). Version 2 placeholder tasks, which no Forge command ever created, are refused rather than guessed at.
+`.forge/` holds **Forge metadata only — never credentials**, and no logs or raw worker output. Both documents carry a `schemaVersion`. They are validated whenever they are read, because they may have been edited by hand. Forge refuses (rather than repairs) malformed, unsupported-version, or relocated metadata. Older state is migrated step by step on load (v1 → v2 → … → v6). Version 2 placeholder tasks, which no Forge command ever created, are refused rather than guessed at.
 
 ## Claude Code worker
 
@@ -425,6 +442,56 @@ forge validation run        # try the checks now; records nothing
   - It's refused if a dependent task has already run on top of it, or its milestone is completed; add a follow-up task instead.
   - Nothing starts; re-run the task explicitly.
 
+## Autonomous orchestration
+
+`forge run` turns the manual commands into a bounded loop. **Forge owns the loop, not an AI provider.** Each iteration loads the persisted state, decides the ONE next action with a pure function of that state and the policy, performs it through the existing services, records it, and decides again:
+
+1. stop if anything needs a human or is unsafe (see below);
+2. follow up on work this orchestration produced: AI review (if enabled), then local commit (if enabled);
+3. complete a milestone once the existing completion rule holds;
+4. take the first runnable task in milestone/task order: execute it, or repair it if policy allows;
+5. otherwise say exactly why nothing can run.
+
+The trust model is unchanged: **worker output is a claim, validator output is evidence, a review is an opinion, and Forge's state machine decides.** Worker summaries, review text, validation output and repository content are data; none of them can change the policy, start an action, or become a command.
+
+**Commands.**
+- `forge run` loops until the workflow is complete, a stop condition is hit, or a limit is reached.
+- `forge run step` performs at most one workflow step (execute or repair one task, review one task, commit one task, or complete one milestone).
+- `forge run --dry-run` prints the effective policy, the next runnable task, the expected next action and pipeline, and the reasons Forge would stop. It performs zero worker/reviewer calls, file changes, commits, or transitions.
+- `forge run status` shows whether a run is active, the last run, its stop reason, counters and recent events, the next runnable task, blockers, and the default policy.
+
+**Policy and budgets.** Every automatic behavior comes from an explicit policy printed before the run and recorded (with a SHA-256 hash) in the run history. Defaults are conservative:
+
+| Option | Default | Hard maximum |
+| --- | --- | --- |
+| `--allow-edits` (implementer may modify files) | read-only (tasks then stop for manual validation) | — |
+| `--max-tasks <n>` distinct tasks per run | 5 | 50 |
+| `--max-steps <n>` workflow steps per run | 30 | 200 |
+| `--repair` / `--repair-review` | off | — |
+| `--max-repairs <n>` repairs per task, across runs | 2 | 5 (and the task's own attempt budget) |
+| `--review` / `--reviewer <name>` | off | — |
+| `--continue-on-concerns` | off: review warnings stop for a human | — |
+| `--continue-without-review` | off: an unavailable reviewer stops the run | — |
+| `--auto-commit` | off | — |
+
+Values outside the limits are **refused, never clamped**; there is no "0 means unlimited". Existing bounds still apply: worker attempt budgets, worker and validation timeouts, and AI output limits.
+
+**Repair.** When validation fails and `--repair` is set, Forge re-runs the **same implementer** through the normal task engine with a Forge-built `<forge-repair-evidence>` block: failed check IDs, statuses, exit codes, the stored output excerpts, and the files the attempt changed. With `--repair-review`, blocking review findings trigger a repair the same way: Forge records a remediation decision marked `by: policy` (never by the reviewer), then repairs, re-validates and re-reviews. The task instruction itself is unchanged. The evidence is fenced data, and the rules state it is not instructions; check command lines are never included. Each repair consumes an attempt, is recorded on the attempt (trigger, source attempt, review ID, short evidence summary), and counts against the per-task budget. When the budget is spent, Forge stops.
+
+**AI review in the loop.** Review runs only after deterministic validation passed and never changes task status. `clear` continues; `concerns` stop for a human unless `--continue-on-concerns`; `blocking-concerns` stop unless `--repair-review`. An unavailable, timed-out, cancelled or invalid review is never treated as clear: the run stops (a later run retries the review) unless `--continue-without-review`. A human `review-accept` lets the next run continue.
+
+**Automatic local commits.** With `--auto-commit`, a task validated in this run is committed with exactly the M5 `forge task commit` rules: only task-attributed paths, re-verified against the working tree, `git commit --only`. Your other dirty or staged files stay as they are. Mixed attribution, drift, renames or staged changes during the task make Forge **stop**; it never forces, stashes, resets, amends, or pushes. To continue after such a stop, commit the changes yourself and run `forge run` without `--auto-commit`.
+
+**Always stops for** (whatever the policy): integrity or scope violations (never acknowledged automatically), interrupted or concurrently running tasks, tasks awaiting manual validation (validation is never overridden), failed worker invocations (not a validation failure, so not repaired), exhausted repair budgets or attempts, unresolved merge conflicts, commit refusals, an implementer that is unavailable, blocked dependencies, milestones that cannot complete, limits, and Ctrl+C. `COMPLETE` means every milestone is completed or cancelled and every task succeeded or was cancelled. It is reported separately from `BLOCKED`, `NO RUNNABLE TASK`, `RETRY EXHAUSTED`, `LIMIT REACHED` and the rest.
+
+**Interruption and recovery.** Ctrl+C cancels the active worker or reviewer through the normal cancellation path. The attempt is recorded truthfully (`cancelled`), the loop stops, and nothing else starts. A cancelled or crashed attempt is never re-run or committed automatically: the next `forge run` stops with `WORKER FAILED` or `INTERRUPTED TASK` (`forge task recover`). A run record left `running` by a dead process is marked `interrupted` by the next run.
+
+**One run at a time.** A run holds `.forge/orchestration.lock` (run ID, process, host, random token). A second `forge run` is refused. A lock whose owner is gone is reported as probably stale, but **never taken over**: delete it yourself. Forge checks before every step that the lock is still its own; if it was removed or replaced, the run stops and leaves it alone. The lock is separate from the state lock, which the task engine keeps using per operation, so the two cannot deadlock.
+
+**History.** `state.json` keeps the last 50 runs, each with at most 200 events (action, task, attempt, outcome code, a detail of at most 300 characters), counters, the policy and its hash, and the stop reason. Prompts, diffs, validation output, worker claims and provider text are never stored there.
+
+**Manual vs autonomous.** Every manual command (`forge task run|validate|review|review-accept|review-reject|commit`, `forge plan …`, `forge validation …`) works exactly as before. Manually started attempts carry no orchestration origin, so `forge run` never auto-reviews or auto-commits them. It does include them in selection and repair decisions based on their recorded outcome.
+
 ## Current limitations
 
 - **Control-state guard is detective, not preventive:** Claude's file tools are not blocked from `.forge/`, because Forge doesn't rely on unverified path-rule syntax. Instead, the guard described below detects any change. It does not prevent the change or undo it.
@@ -436,6 +503,9 @@ forge validation run        # try the checks now; records nothing
 - **AI context is best-effort about secrets:** ignored files and secret-like paths are excluded, but a secret inside ordinary tracked source would be included.
 - **Concurrent edits during AI calls:** planning and review can't tell your concurrent edits from AI changes, so editing files during a call discards its result.
 - **No model identifier:** the Claude CLI's JSON output doesn't reliably report the model used, so none is recorded.
+- **Orchestration is sequential and local:** one task at a time, one implementer, one project per run. There are no worktrees, no parallelism, no background service, and no push.
+- **Manual commands during a run:** a manual `forge task …` command in another terminal is serialized by the state lock, not refused. The orchestrator re-reads state before every step and stops if it finds a task running elsewhere.
+- **Auto-commit refusals need you:** after a commit refusal, commit the changes yourself and continue without `--auto-commit`. Forge cannot tell that you committed them.
 - **Ignored files are invisible:** attribution and scope checks rely on `git status`, so a worker writing to a Git-ignored path (`dist/`, `.env`) isn't observed. Forge verifies what Git and the file system show inside the project, not the whole machine.
 - **Validation runs project code:** a check such as `npm test` executes code the worker may have changed. Forge protects the check definitions, not the code they run. V1 is not a sandbox.
 - **Concurrent profile edits:** changing validation checks while a read-only task is running is reported as an integrity violation.

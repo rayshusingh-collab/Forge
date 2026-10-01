@@ -14,13 +14,16 @@
  * 3 — Milestone 4: task & milestone engine — ordered milestones, tasks with
  *     instructions/dependencies/attempt budgets, attempts linked to worker
  *     runs (migrated from 2; see STATE_MIGRATIONS).
- * 5 — Milestone 6: AI planning & review — plan proposals and task reviews
- *     (migrated from 4 as empty lists); `review-rejected` attempt outcome.
  * 4 — Milestone 5: deterministic validation & Git safety — attempts carry
  *     the Git baseline/changeset, validation evidence, and commit record;
  *     new attempt outcomes (migrated from 3).
+ * 5 — Milestone 6: AI planning & review — plan proposals and task reviews
+ *     (migrated from 4 as empty lists); `review-rejected` attempt outcome.
+ * 6 — Milestone 7: autonomous orchestration — attempts record their
+ *     orchestration origin and repair trigger, review decisions record who
+ *     decided, and bounded orchestration run history (migrated from 5).
  */
-export const STATE_SCHEMA_VERSION = 5;
+export const STATE_SCHEMA_VERSION = 6;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -301,6 +304,32 @@ export interface AttemptExecutor {
   readonly host: string;
 }
 
+/** What caused Forge to run a repair attempt. */
+export const REPAIR_TRIGGERS = ['validation', 'review'] as const;
+export type RepairTrigger = (typeof REPAIR_TRIGGERS)[number];
+
+/**
+ * A repair attempt: Forge re-ran the task's implementer with bounded
+ * evidence of why the previous attempt was not acceptable.
+ */
+export interface RepairRecord {
+  /** 1-based count of repairs of this task (the repair budget is per task). */
+  readonly number: number;
+  readonly trigger: RepairTrigger;
+  /** The attempt whose evidence triggered the repair (always the previous one). */
+  readonly fromAttempt: number;
+  /** The review that triggered a review repair. */
+  readonly reviewId: string | null;
+  /** Bounded summary of the triggering evidence (not the full output). */
+  readonly evidence: string;
+}
+
+/** Set when an orchestration run (`forge run`) started the attempt; null for manual runs. */
+export interface AttemptOrigin {
+  readonly runId: string;
+  readonly repair: RepairRecord | null;
+}
+
 export interface TaskAttempt {
   /** 1-based and sequential within its task; every attempt counts toward the budget. */
   readonly number: number;
@@ -317,6 +346,7 @@ export interface TaskAttempt {
   /** Latest deterministic validation evidence for this attempt. */
   readonly validation: ValidationRecord | null;
   readonly commit: CommitRecord | null;
+  readonly origin: AttemptOrigin | null;
 }
 
 export interface TaskRecord {
@@ -504,10 +534,19 @@ export interface ReviewFinding {
 export const REVIEW_DECISIONS = ['accepted', 'remediation-required'] as const;
 export type ReviewDecisionKind = (typeof REVIEW_DECISIONS)[number];
 
+/**
+ * Who decided: a human (`forge task review-accept|review-reject`), or
+ * Forge applying an explicit, human-configured orchestration policy
+ * (review-driven repair). Never the reviewer itself.
+ */
+export const REVIEW_DECIDERS = ['human', 'policy'] as const;
+export type ReviewDecider = (typeof REVIEW_DECIDERS)[number];
+
 export interface ReviewDecision {
   readonly kind: ReviewDecisionKind;
   readonly reason: string;
   readonly decidedAt: string;
+  readonly by: ReviewDecider;
 }
 
 /** An advisory AI review of one validated task attempt. Never a validation result. */
@@ -528,6 +567,158 @@ export interface TaskReview {
   readonly decision: ReviewDecision | null;
 }
 
+/**
+ * Hard bounds on orchestration. Policy values above these are refused (never
+ * clamped silently); there is no "unlimited".
+ */
+export const ORCHESTRATION_LIMITS = {
+  maxTasks: 50,
+  maxSteps: 200,
+  maxRepairsPerTask: 5,
+  retainedRuns: 50,
+  eventsPerRun: 200,
+  eventDetail: 300,
+  stopDetail: 1_000,
+  repairEvidenceSummary: 500,
+  providerName: 100,
+} as const;
+
+/** Behavior when an AI review did not produce a usable result (unavailable, timeout, invalid output…). */
+export const REVIEW_FAILURE_POLICIES = ['stop', 'continue'] as const;
+export type ReviewFailurePolicy = (typeof REVIEW_FAILURE_POLICIES)[number];
+
+/** Behavior when a completed review has warnings (`concerns`). */
+export const REVIEW_CONCERN_POLICIES = ['stop', 'continue'] as const;
+export type ReviewConcernPolicy = (typeof REVIEW_CONCERN_POLICIES)[number];
+
+/**
+ * Everything `forge run` may do automatically. Built only from Forge
+ * defaults and explicit human input (CLI options); never from AI output,
+ * repository content, or validation output.
+ */
+export interface OrchestrationPolicy {
+  /** Distinct tasks a run may execute (initial attempts and repairs of new tasks). */
+  readonly maxTasks: number;
+  /** Workflow steps a run may perform. */
+  readonly maxSteps: number;
+  /** Worker access for task attempts. `read-only` tasks always stop for manual validation. */
+  readonly access: WorkerAccessMode;
+  readonly worker: string;
+  readonly workerTimeoutMs: number;
+  readonly repair: {
+    /** Repair automatically after required deterministic validation failed. */
+    readonly onValidationFailure: boolean;
+    /** Repair automatically after an AI review reported blocking concerns (or a human required remediation). */
+    readonly onBlockingReview: boolean;
+    /** Repairs per task, across runs; also bounded by the task's own attempt budget. */
+    readonly maxPerTask: number;
+  };
+  readonly review: {
+    readonly enabled: boolean;
+    /** Provider ID for the reviewer role, when enabled. */
+    readonly reviewer: string | null;
+    readonly timeoutMs: number;
+    readonly onConcerns: ReviewConcernPolicy;
+    readonly onFailure: ReviewFailurePolicy;
+  };
+  /** Create local commits of validated tasks' own changes (M5 safe-commit rules). Never pushes. */
+  readonly autoCommit: boolean;
+}
+
+export const ORCHESTRATION_RUN_MODES = ['run', 'step'] as const;
+export type OrchestrationRunMode = (typeof ORCHESTRATION_RUN_MODES)[number];
+
+/**
+ * `running` while its Forge process owns the orchestration lease;
+ * `stopped` once it recorded a stop reason; `interrupted` when a later run
+ * found it running without a live owner (it never recorded how it ended).
+ */
+export const ORCHESTRATION_RUN_STATUSES = ['running', 'stopped', 'interrupted'] as const;
+export type OrchestrationRunStatus = (typeof ORCHESTRATION_RUN_STATUSES)[number];
+
+export const ORCHESTRATION_ACTIONS = ['execute', 'repair', 'review', 'commit', 'complete-milestone', 'stop'] as const;
+export type OrchestrationAction = (typeof ORCHESTRATION_ACTIONS)[number];
+
+/** Why an orchestration run stopped. Labels, categories and guidance live in `src/orchestration/stop-reason.ts`. */
+export const STOP_REASONS = [
+  'complete',
+  'no-work',
+  'step-done',
+  'limit-steps',
+  'limit-tasks',
+  'cancelled',
+  'interrupted-task',
+  'task-running',
+  'manual-validation-required',
+  'integrity-acknowledgement-required',
+  'scope-acknowledgement-required',
+  'repair-not-permitted',
+  'repair-budget-exhausted',
+  'retry-exhausted',
+  'worker-failed',
+  'review-decision-required',
+  'review-remediation-required',
+  'reviewer-unavailable',
+  'commit-refused',
+  'unsafe-git-state',
+  'provider-unavailable',
+  'blocked',
+  'milestone-incomplete',
+  'no-runnable-task',
+  'integrity-violation',
+  'state-not-recorded',
+  'lease-lost',
+  'step-refused',
+  'error',
+] as const;
+export type StopReason = (typeof STOP_REASONS)[number];
+
+export interface OrchestrationEvent {
+  readonly at: string;
+  /** 1-based step number within the run. */
+  readonly step: number;
+  readonly action: OrchestrationAction;
+  readonly taskId: string | null;
+  readonly milestoneId: string | null;
+  readonly attempt: number | null;
+  /** Short machine-readable outcome, e.g. `validated`, `validation-failed`, `clear`, `committed`. */
+  readonly outcome: string;
+  readonly detail: string | null;
+}
+
+export interface OrchestrationCounters {
+  readonly steps: number;
+  readonly tasks: number;
+  readonly repairs: number;
+  readonly reviews: number;
+  readonly commits: number;
+  readonly milestones: number;
+}
+
+export interface OrchestrationStop {
+  readonly reason: StopReason;
+  readonly detail: string | null;
+  readonly taskId: string | null;
+}
+
+/** Bounded record of one `forge run` / `forge run step` invocation. Never prompts, diffs, or outputs. */
+export interface OrchestrationRun {
+  readonly id: string;
+  readonly mode: OrchestrationRunMode;
+  readonly status: OrchestrationRunStatus;
+  readonly owner: AttemptExecutor;
+  readonly startedAt: string;
+  readonly finishedAt: string | null;
+  readonly policy: OrchestrationPolicy;
+  /** SHA-256 of the canonical policy JSON. */
+  readonly policyHash: string;
+  readonly counters: OrchestrationCounters;
+  /** Most recent events (older ones are dropped beyond the bound). */
+  readonly events: readonly OrchestrationEvent[];
+  readonly eventsDropped: number;
+  readonly stop: OrchestrationStop | null;
+}
+
 export interface ProjectState {
   readonly schemaVersion: typeof STATE_SCHEMA_VERSION;
   readonly projectId: string;
@@ -543,6 +734,8 @@ export interface ProjectState {
   readonly planProposals: readonly PlanProposal[];
   /** Advisory AI reviews of validated task attempts. */
   readonly taskReviews: readonly TaskReview[];
+  /** Orchestration runs, oldest first (bounded). */
+  readonly orchestrationRuns: readonly OrchestrationRun[];
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -561,6 +754,7 @@ export function createInitialState(projectId: string, now: Date): ProjectState {
     workerRuns: [],
     planProposals: [],
     taskReviews: [],
+    orchestrationRuns: [],
     createdAt: timestamp,
     updatedAt: timestamp,
   };

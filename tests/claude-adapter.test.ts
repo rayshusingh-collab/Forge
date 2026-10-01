@@ -68,6 +68,7 @@ function sampleRequest(overrides: Partial<WorkerRequest> = {}): WorkerRequest {
     projectRoot: root,
     workingDirectory: root as AuthorizedDirectory,
     relativeWorkingDirectory: '.',
+    repairEvidence: null,
     task: 'Summarize the repository.',
     context: null,
     access: 'read-only',

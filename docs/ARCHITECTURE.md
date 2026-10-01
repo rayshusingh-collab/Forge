@@ -140,6 +140,30 @@ User Goal
 
 
 
+\## Orchestration Engine
+
+
+
+Implemented (Milestone 7, `src/orchestration/`). Roles:
+
+- **Planner proposes.**
+- **Worker implements.**
+- **Validator proves deterministic checks.**
+- **Reviewer critiques.**
+- **Orchestrator coordinates.**
+- **Forge state machine decides.**
+- **Human approves consequential exceptions.**
+
+The orchestrator owns the loop, not an AI provider. It coordinates the existing services (task engine, validator, reviewer, safe commit, milestone transitions) and adds no new way to change a project:
+
+- `decision.ts`: `decideNext(state, view, policy, run)` is a pure function of persisted state and explicit policy. It returns exactly one next action (execute, repair, review, commit, complete-milestone) or a typed stop reason. Precedence: unsafe or human-owned conditions, then follow-up of orchestrated work (review, then commit), then milestone completion, then the first runnable task, then an explanation of why nothing can run. `COMPLETE` is a distinct, explicit condition, not "no runnable task". Dry-run and status use the same function, so they cannot disagree with a real run.
+- `orchestrator.ts`: one step performs at most one workflow unit; `run()` repeats steps until a stop reason, the step or task budget, Ctrl+C, or a lost lease. Every step is recorded as a bounded event before the next decision.
+- `policy.ts`: the only source of automatic behavior. It comes from conservative defaults plus explicit CLI options, and hard maximums are refused, never clamped. AI output, repository content and validation output cannot change it.
+- `lease.ts`: `.forge/orchestration.lock` allows one controller per project. It has a random ownership token, is never stolen, and replacement or deletion is detected before every step. It is separate from the state lock and taken without waiting, so there is no nested-lock deadlock.
+- `history.ts`: bounded run records (runs, events, counters, policy hash, stop reason) in state schema v6. They never contain prompts, diffs or provider output.
+
+
+
 \## CLI
 
 
@@ -468,7 +492,7 @@ Evaluates whether implementation satisfies the task.
 
 Implemented (Milestone 6, `src/review/`): the AI reviewer critiques an attempt that already passed deterministic validation, using a bounded packet: the task, validation results, the worker's claim labeled as such, and task-attributed diffs with mixed files labeled. Its output is **advisory evidence**, kept separate from validation everywhere. Forge derives the review status from finding severities, and a review never changes task status. Only a recorded human decision has consequences: `review-accept` records it; `review-reject` reopens the task (the attempt becomes `review-rejected` with its validation evidence kept) and starts nothing.
 
-Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Forge controls state. Human approves consequential AI decisions.
+Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Orchestrator coordinates. Forge state machine decides. Human approves consequential exceptions.
 
 
 
@@ -519,6 +543,10 @@ Retries must be bounded.
 
 
 Diagnostics from failed validation/review should be supplied to the next attempt.
+
+
+
+Implemented (Milestone 7, `src/orchestration/repair.ts`): a repair is an ordinary attempt made through the task engine with the same implementer, plus a Forge-built, fenced `<forge-repair-evidence>` block (failed checks and their stored excerpts, changed files, blocking review findings). It is permitted only by explicit policy (`--repair`, `--repair-review`), and bounded per task (default 2, hard maximum 5) and by the task's own attempt budget. It is recorded on the attempt (`origin.repair`: trigger, source attempt, review, evidence summary), and invariants tie it to the failed attempt that caused it. When the budget is spent, the run stops; there is no other retry path.
 
 
 
@@ -588,6 +616,10 @@ Examples:
 
 
 
+Implemented (Milestone 7): approval boundaries are stop reasons. The orchestrator never acknowledges integrity or scope violations, overrides validation, accepts review concerns, changes validation configuration, or forces a commit. Instead it stops with a typed reason (`src/orchestration/stop-reason.ts`) that says what a human must do. A policy-driven review remediation is recorded as `by: policy`, distinct from a human decision.
+
+
+
 \---
 
 
@@ -631,6 +663,8 @@ src/
 &#x20; planning/
 
 &#x20; tasks/
+
+&#x20; orchestration/
 
 &#x20; workers/
 
@@ -713,6 +747,10 @@ Forge is not an AI model.
 
 
 Forge is the control system around AI models and coding agents.
+
+
+
+Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Orchestrator coordinates. Forge state machine decides. Human approves consequential exceptions.
 
 
 

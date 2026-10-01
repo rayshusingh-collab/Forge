@@ -9,6 +9,7 @@ import { describeIntegrityChanges, openStateStore, snapshotControlState, verifyC
 import type { LoadedProject } from '../projects/index.ts';
 import { TASK_LIMITS } from '../state/index.ts';
 import type {
+  AttemptOrigin,
   ChangeSummary,
   CommitRecord,
   GitBaseline,
@@ -58,6 +59,10 @@ export interface RunTaskOptions {
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
   readonly acknowledgeIntegrityViolation?: boolean;
+  /** Set by the orchestrator (`forge run`); absent for a manual `forge task run`. */
+  readonly origin?: AttemptOrigin;
+  /** Forge-built evidence for a repair attempt; requires `origin.repair`. */
+  readonly repairEvidence?: string;
 }
 
 export interface TaskRunOutcome {
@@ -225,6 +230,9 @@ export class TaskEngine {
     const state = await this.store.load();
     const taskId = resolveTaskReference(state, reference);
     const view = transitions.assertTaskCanStart(state, taskId, { acknowledgeIntegrityViolation, liveness: this.liveness });
+    if ((options.repairEvidence !== undefined) !== (options.origin?.repair != null)) {
+      throw new WorkflowError('Repair evidence and a repair record must be supplied together');
+    }
 
     // Everything that can be checked without side effects is checked before
     // an attempt is recorded, so these problems never consume the budget.
@@ -240,6 +248,7 @@ export class TaskEngine {
       project: this.project,
       task: view.task.instruction,
       context: view.task.context,
+      repairEvidence: options.repairEvidence ?? null,
       access: options.access,
       timeoutMs: options.timeoutMs,
       id: this.generateId(),
@@ -264,6 +273,7 @@ export class TaskEngine {
               executor: { pid: process.pid, host: hostname() },
               acknowledgeIntegrityViolation,
               liveness: this.liveness,
+              origin: options.origin ?? null,
             },
             this.clock(),
           ),

@@ -1,8 +1,11 @@
 import { ObjectReader, SchemaViolation, isPlainObject } from '../core/validation.ts';
 import { checkWorkflowInvariants } from './invariants.ts';
+import { decodeAttemptOrigin, decodeOrchestrationRun } from './orchestration-schema.ts';
 import { decodePlanDocument } from './plan-schema.ts';
 import {
   AI_LIMITS,
+  ORCHESTRATION_LIMITS,
+  REVIEW_DECIDERS,
   ATTEMPT_OUTCOMES,
   FINDING_SEVERITIES,
   PLAN_STATUSES,
@@ -126,6 +129,38 @@ export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
     }
     return { ...document, schemaVersion: 5, planProposals: [], taskReviews: [] };
   },
+  // 5 -> 6: autonomous orchestration. No orchestration existed before, so
+  // every attempt was started manually (origin null), every review decision
+  // was a human's, and there is no run history.
+  5: (document) => {
+    if (Object.hasOwn(document, 'orchestrationRuns')) {
+      throw new SchemaViolation('orchestrationRuns', 'is not a recognised field in schema version 5');
+    }
+    return {
+      ...document,
+      schemaVersion: 6,
+      orchestrationRuns: [],
+      tasks: arrayOfObjects(document['tasks'], 'tasks').map((task, taskIndex) => ({
+        ...task,
+        attempts: arrayOfObjects(task['attempts'], `tasks[${taskIndex}].attempts`).map((attempt, attemptIndex) => {
+          if (Object.hasOwn(attempt, 'origin')) {
+            throw new SchemaViolation(`tasks[${taskIndex}].attempts[${attemptIndex}].origin`, 'is not a recognised field in schema version 5');
+          }
+          return { ...attempt, origin: null };
+        }),
+      })),
+      taskReviews: arrayOfObjects(document['taskReviews'], 'taskReviews').map((review, index) => {
+        const decision = review['decision'];
+        if (decision === null || decision === undefined) {
+          return review;
+        }
+        if (typeof decision !== 'object' || Array.isArray(decision) || Object.hasOwn(decision, 'by')) {
+          throw new SchemaViolation(`taskReviews[${index}].decision`, 'is not a schema version 5 review decision');
+        }
+        return { ...review, decision: { ...decision, by: 'human' } };
+      }),
+    };
+  },
 };
 
 function arrayOfObjects(value: unknown, path: string): Record<string, unknown>[] {
@@ -157,6 +192,7 @@ export function decodeProjectState(raw: unknown): ProjectState {
     'workerRuns',
     'planProposals',
     'taskReviews',
+    'orchestrationRuns',
     'createdAt',
     'updatedAt',
   ]);
@@ -174,6 +210,7 @@ export function decodeProjectState(raw: unknown): ProjectState {
     workerRuns: r.array('workerRuns', decodeWorkerRun, 20_000),
     planProposals: r.array('planProposals', decodePlanProposal, AI_LIMITS.proposals),
     taskReviews: r.array('taskReviews', decodeTaskReview, 20_000),
+    orchestrationRuns: r.array('orchestrationRuns', decodeOrchestrationRun, ORCHESTRATION_LIMITS.retainedRuns),
     createdAt: r.timestamp('createdAt'),
     updatedAt: r.timestamp('updatedAt'),
   };
@@ -246,6 +283,7 @@ function decodeAttempt(value: unknown, path: string): TaskAttempt {
     'changes',
     'validation',
     'commit',
+    'origin',
   ]);
   const attempt: TaskAttempt = {
     number: r.integer('number', { min: 1 }),
@@ -258,6 +296,7 @@ function decodeAttempt(value: unknown, path: string): TaskAttempt {
     changes: r.nullable('changes', decodeChangeSummary),
     validation: r.nullable('validation', decodeValidationRecord),
     commit: r.nullable('commit', decodeCommit),
+    origin: r.nullable('origin', decodeAttemptOrigin),
   };
   if ((attempt.outcome === 'running') !== (attempt.finishedAt === null)) {
     throw new SchemaViolation(`${path}.finishedAt`, 'must be null exactly when the attempt is running');
@@ -537,11 +576,12 @@ export function decodeFinding(value: unknown, path: string): ReviewFinding {
 }
 
 function decodeReviewDecision(value: unknown, path: string): ReviewDecision {
-  const r = new ObjectReader(value, path, ['kind', 'reason', 'decidedAt']);
+  const r = new ObjectReader(value, path, ['kind', 'reason', 'decidedAt', 'by']);
   return {
     kind: r.oneOf('kind', REVIEW_DECISIONS),
     reason: r.string('reason', { maxLength: AI_LIMITS.reason }),
     decidedAt: r.timestamp('decidedAt'),
+    by: r.oneOf('by', REVIEW_DECIDERS),
   };
 }
 

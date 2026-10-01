@@ -11,6 +11,7 @@ import type { AuthorizedDirectory, WorkerRequest } from './types.ts';
 export const WORKER_REQUEST_LIMITS = {
   taskCharacters: 20_000,
   contextCharacters: 50_000,
+  repairEvidenceCharacters: 12_000,
   /** 24 hours; matches the configuration ceiling. */
   maxTimeoutMs: 86_400_000,
 } as const;
@@ -19,6 +20,8 @@ export interface PrepareWorkerRequestInput {
   readonly project: LoadedProject;
   readonly task: string;
   readonly context?: string | null;
+  /** Forge-built repair evidence (never raw worker or reviewer text alone). */
+  readonly repairEvidence?: string | null;
   /**
    * Directory to run in: absolute, or relative to the project root.
    * Defaults to the project root.
@@ -47,6 +50,11 @@ export async function prepareWorkerRequest(input: PrepareWorkerRequestInput): Pr
     input.context === undefined || input.context === null
       ? null
       : validateText(input.context, 'Context', WORKER_REQUEST_LIMITS.contextCharacters);
+
+  const repairEvidence =
+    input.repairEvidence === undefined || input.repairEvidence === null
+      ? null
+      : validateText(input.repairEvidence, 'Repair evidence', WORKER_REQUEST_LIMITS.repairEvidenceCharacters);
 
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0 || input.timeoutMs > WORKER_REQUEST_LIMITS.maxTimeoutMs) {
     throw new ValidationError(`Worker timeout must be an integer between 1 and ${WORKER_REQUEST_LIMITS.maxTimeoutMs} ms`, {
@@ -84,6 +92,7 @@ export async function prepareWorkerRequest(input: PrepareWorkerRequestInput): Pr
     relativeWorkingDirectory: segments.length === 0 ? '.' : segments.join('/'),
     task,
     context,
+    repairEvidence,
     access: input.access,
     timeoutMs: input.timeoutMs,
   };
