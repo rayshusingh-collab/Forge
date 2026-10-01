@@ -139,7 +139,7 @@ describe('control-state guard: tampering', () => {
     assert.equal(run.persistenceError, undefined);
     const stored = (await openStateStore(s.project).load()).workerRuns.find((record) => record.id === request.id);
     assert.equal(stored?.status, 'integrity-violation');
-    assert.match(stored?.diagnostic ?? '', /control state changed during the run: modified project\.json/);
+    assert.match(stored?.diagnostic ?? '', /control state changed during the run: modified \.forge\/project\.json/);
 
     const evidence = await evidenceOf(run.evidencePath);
     assert.equal(evidence['runId'], request.id);

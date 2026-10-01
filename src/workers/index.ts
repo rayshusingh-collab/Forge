@@ -20,7 +20,7 @@ export {
 } from './claude-code/worker.ts';
 export type { ClaudeCodeWorkerOptions } from './claude-code/worker.ts';
 export { buildPromptEnvelope } from './prompt-envelope.ts';
-export type { PromptEnvelope } from './prompt-envelope.ts';
+export type { PromptEnvelope, PromptEnvelopeOptions } from './prompt-envelope.ts';
 export { createWorkerRegistry } from './registry.ts';
 export type { WorkerDescriptor, WorkerRegistry, WorkerRegistryDependencies } from './registry.ts';
 export { WORKER_REQUEST_LIMITS, prepareWorkerRequest } from './request.ts';
@@ -51,7 +51,9 @@ export {
   parseCodexLoginStatus,
   parseCodexVersion,
 } from './codex/command.ts';
-export type { CodexInvocation } from './codex/command.ts';
+export type { CodexInvocation, CodexScratch } from './codex/command.ts';
+export { WORKER_SCRATCH_PREFIX, createWorkerScratch } from './codex/scratch.ts';
+export type { CreateWorkerScratchOptions, WorkerScratch } from './codex/scratch.ts';
 export { parseCodexEvents } from './codex/output.ts';
 export type { CodexOutputParse, CodexRunReport } from './codex/output.ts';
 export { CODEX_EXECUTABLE_NAME, CODEX_MAX_OUTPUT_BYTES, CODEX_WORKER_ID, CodexWorker, checkCodexCapabilities, interpretCodexRun } from './codex/worker.ts';

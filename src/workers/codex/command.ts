@@ -1,3 +1,6 @@
+import { isAbsolute } from 'node:path';
+
+import { isWithin } from '../../projects/index.ts';
 import type { WorkerAccessMode } from '../../state/index.ts';
 
 /**
@@ -14,9 +17,14 @@ import type { WorkerAccessMode } from '../../state/index.ts';
  *   for edit runs, with network access disabled and the temp directories
  *   removed from the writable roots, so writes outside the working directory
  *   are refused by Codex itself (Forge's own checks only see the project).
+ *   The one exception is the run's scratch directory (see `scratch.ts`): a
+ *   fresh directory Forge created outside the project, added as the only
+ *   extra writable root so tool caches and temp files never land in the
+ *   project or in `.forge/`.
  * - `approval_policy=never`: Codex never escalates out of the sandbox; a
  *   command the sandbox refuses simply fails and is reported to the model.
- * - Model-run shell commands get a minimal environment (`inherit=core`).
+ * - Model-run shell commands get a minimal environment (`inherit=core`),
+ *   plus the scratch variables (TMP/TEMP, package-manager caches) on edit runs.
  * - High-risk Codex features (apps, plugins, browser and computer use,
  *   multi-agent, hooks, worktrees, …) are disabled per invocation.
  * - AI roles (planner, reviewer) additionally disable command execution, so
@@ -72,13 +80,23 @@ export const REQUIRED_CODEX_EXEC_OPTIONS = [
   '--cd',
 ] as const;
 
+/** Forge-created scratch space for an edit run (see `scratch.ts`). */
+export interface CodexScratch {
+  readonly directory: string;
+  readonly env: Readonly<Record<string, string>>;
+}
+
 export type CodexInvocation =
-  | { readonly kind: 'worker'; readonly access: WorkerAccessMode; readonly workingDirectory: string }
+  | { readonly kind: 'worker'; readonly access: WorkerAccessMode; readonly workingDirectory: string; readonly scratch?: CodexScratch }
   | { readonly kind: 'role'; readonly workingDirectory: string };
 
 /** Arguments after the executable. The prompt is always sent on stdin (`-`), never as an argument. */
 export function buildCodexExecArgs(invocation: CodexInvocation): string[] {
   const edit = invocation.kind === 'worker' && invocation.access === 'edit';
+  const scratch = invocation.kind === 'worker' ? invocation.scratch : undefined;
+  if (scratch !== undefined) {
+    assertSafeScratch(scratch, invocation.workingDirectory, edit);
+  }
   const disabled = invocation.kind === 'role' ? [...CODEX_DISABLED_FEATURES, ...CODEX_ROLE_DISABLED_FEATURES] : [...CODEX_DISABLED_FEATURES];
   const args = [
     'exec',
@@ -104,6 +122,16 @@ export function buildCodexExecArgs(invocation: CodexInvocation): string[] {
     'sandbox_workspace_write.exclude_slash_tmp=true',
     '--config',
     'shell_environment_policy.inherit=core',
+    ...(scratch === undefined
+      ? []
+      : [
+          '--config',
+          `sandbox_workspace_write.writable_roots=[${tomlLiteral(scratch.directory)}]`,
+          '--config',
+          `shell_environment_policy.set={ ${Object.entries(scratch.env)
+            .map(([name, value]) => `${name} = ${tomlLiteral(value)}`)
+            .join(', ')} }`,
+        ]),
     ...disabled.flatMap((feature) => ['--disable', feature]),
     '--cd',
     invocation.workingDirectory,
@@ -111,6 +139,40 @@ export function buildCodexExecArgs(invocation: CodexInvocation): string[] {
   ];
   assertNoForbiddenCodexOptions(args);
   return args;
+}
+
+/**
+ * The scratch directory becomes a writable root, so it must be an absolute
+ * path outside the working directory (and must not contain it), used only
+ * for edit runs. Every variable must point inside it or be a plain setting.
+ */
+function assertSafeScratch(scratch: CodexScratch, workingDirectory: string, edit: boolean): void {
+  if (!edit) {
+    throw new Error('Refusing to build a Codex invocation: scratch space is only for edit runs');
+  }
+  const { directory } = scratch;
+  if (!isAbsolute(directory) || isWithin(workingDirectory, directory) || isWithin(directory, workingDirectory)) {
+    throw new Error(`Refusing to build a Codex invocation: scratch directory ${directory} overlaps the working directory`);
+  }
+  for (const [name, value] of Object.entries(scratch.env)) {
+    if (!ENV_NAME.test(name)) {
+      throw new Error(`Refusing to build a Codex invocation: invalid scratch variable name ${name}`);
+    }
+    if (isAbsolute(value) ? !isWithin(directory, value) : !PLAIN_SETTING.test(value)) {
+      throw new Error(`Refusing to build a Codex invocation: scratch variable ${name} points outside the scratch directory`);
+    }
+  }
+}
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const PLAIN_SETTING = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/** A TOML literal string: no escapes exist inside one, so quotes and control characters are refused. */
+function tomlLiteral(value: string): string {
+  if (/['\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`Refusing to build a Codex invocation: unsupported character in ${JSON.stringify(value)}`);
+  }
+  return `'${value}'`;
 }
 
 function assertNoForbiddenCodexOptions(args: readonly string[]): void {

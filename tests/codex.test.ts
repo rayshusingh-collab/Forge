@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { access, readFile } from 'node:fs/promises';
+import { access, readFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 
 import { CodexAiProvider, createAiProviderRegistry } from '../src/ai/index.ts';
@@ -13,9 +13,11 @@ import {
   CODEX_DISABLED_FEATURES,
   CodexWorker,
   FORBIDDEN_CODEX_OPTIONS,
+  WORKER_SCRATCH_PREFIX,
   buildCodexExecArgs,
   buildClaudeArgs,
   createWorkerRegistry,
+  createWorkerScratch,
   parseCodexEvents,
   parseCodexLoginStatus,
   parseCodexVersion,
@@ -194,6 +196,124 @@ describe('CodexWorker with a fake CLI', () => {
     const req = await request();
     const outside = { ...req, workingDirectory: tmpdir() as WorkerRequest['workingDirectory'] };
     assert.equal((await worker().execute(outside)).outcome, 'unavailable');
+  });
+});
+
+/**
+ * Regression: in a real run, npm (run by Codex inside its sandbox) had no
+ * writable cache, so the model passed `--cache .forge/npm-cache` and the run
+ * stopped on an integrity violation. Edit runs now get a Forge-created
+ * scratch directory outside the project for temp files and tool caches.
+ */
+describe('Codex worker scratch space', () => {
+  const scratch = (directory: string, env: Record<string, string> = {}) => ({ directory, env });
+  const settingOf = (args: readonly string[], key: string) => args.find((arg) => arg.startsWith(`${key}=`));
+
+  it('adds exactly the scratch directory as a writable root and points caches into it', () => {
+    const args = buildCodexExecArgs({
+      kind: 'worker',
+      access: 'edit',
+      workingDirectory: 'C:\\p',
+      scratch: scratch('C:\\Temp\\forge-codex-scratch-1', { TMP: 'C:\\Temp\\forge-codex-scratch-1\\tmp', npm_config_cache: 'C:\\Temp\\forge-codex-scratch-1\\npm-cache', npm_config_update_notifier: 'false' }),
+    });
+    assert.equal(settingOf(args, 'sandbox_workspace_write.writable_roots'), "sandbox_workspace_write.writable_roots=['C:\\Temp\\forge-codex-scratch-1']");
+    assert.equal(
+      settingOf(args, 'shell_environment_policy.set'),
+      "shell_environment_policy.set={ TMP = 'C:\\Temp\\forge-codex-scratch-1\\tmp', npm_config_cache = 'C:\\Temp\\forge-codex-scratch-1\\npm-cache', npm_config_update_notifier = 'false' }",
+    );
+    // The protections that were already there are unchanged.
+    for (const setting of ['sandbox_workspace_write.network_access=false', 'sandbox_workspace_write.exclude_tmpdir_env_var=true', 'sandbox_workspace_write.exclude_slash_tmp=true', 'shell_environment_policy.inherit=core']) {
+      assert.ok(args.includes(setting), setting);
+    }
+    assert.equal(args[args.indexOf('--cd') + 1], 'C:\\p');
+    assert.equal(settingOf(buildCodexExecArgs({ kind: 'worker', access: 'edit', workingDirectory: 'C:\\p' }), 'sandbox_workspace_write.writable_roots'), undefined);
+  });
+
+  it('refuses scratch configuration that could escape its boundary', () => {
+    const edit = (value: ReturnType<typeof scratch>, access: 'edit' | 'read-only' = 'edit') => () =>
+      buildCodexExecArgs({ kind: 'worker', access, workingDirectory: 'C:\\p', scratch: value });
+    assert.throws(edit(scratch('C:\\s'), 'read-only'), /only for edit runs/);
+    assert.throws(edit(scratch('C:\\p\\.forge\\npm-cache')), /overlaps the working directory/, 'inside the project, e.g. .forge/');
+    assert.throws(edit(scratch('C:\\p')), /overlaps the working directory/);
+    assert.throws(edit(scratch('C:\\')), /overlaps the working directory/, 'a writable root containing the project');
+    assert.throws(edit(scratch('relative\\dir')), /overlaps the working directory/);
+    assert.throws(edit(scratch('C:\\s', { npm_config_cache: 'C:\\p\\.forge\\npm-cache' })), /points outside the scratch directory/);
+    assert.throws(edit(scratch('C:\\s', { npm_config_cache: 'C:\\s\\..\\p' })), /points outside the scratch directory/);
+    assert.throws(edit(scratch('C:\\s', { npm_config_cache: '..\\p' })), /points outside the scratch directory/);
+    assert.throws(edit(scratch('C:\\s', { 'BAD NAME': 'C:\\s\\x' })), /invalid scratch variable name/);
+    assert.throws(edit(scratch("C:\\s'], x=['C:\\")), /unsupported character/, 'no TOML injection through the path');
+    assert.throws(edit(scratch('C:\\s', { TMP: 'C:\\s\\a\nb' })), /unsupported character/);
+  });
+
+  it('creates a private directory outside the project with every variable inside it, and removes it', async () => {
+    const project = await createTestProject(temp);
+    const created = await createWorkerScratch({ projectRoot: project.layout.root });
+    assert.ok(!created.directory.toLowerCase().startsWith(project.layout.root.toLowerCase()));
+    assert.ok(created.directory.startsWith(tmpdir()) && created.directory.includes(WORKER_SCRATCH_PREFIX));
+    for (const name of ['TMP', 'TEMP', 'TMPDIR', 'npm_config_cache', 'YARN_CACHE_FOLDER', 'pnpm_config_store_dir', 'XDG_CACHE_HOME']) {
+      const value = created.env[name]!;
+      assert.ok(value.startsWith(`${created.directory}${sep}`), name);
+      await access(value);
+    }
+    assert.equal(created.env['npm_config_update_notifier'], 'false');
+    await created.dispose();
+    await assert.rejects(access(created.directory));
+  });
+
+  it('refuses to place scratch space inside the project, even through a link', async () => {
+    const project = await createTestProject(temp);
+    await assert.rejects(createWorkerScratch({ projectRoot: project.layout.root, parentDirectory: project.layout.forgeDir }), /inside the project/);
+    const link = join(await temp.make('forge-scratch-link-'), 'temp');
+    await symlink(project.layout.root, link, 'junction');
+    await assert.rejects(createWorkerScratch({ projectRoot: project.layout.root, parentDirectory: link }), /inside the project/);
+  });
+
+  describe('with a fake CLI', () => {
+    let fake: FakeCodex;
+    before(async () => {
+      fake = await installFakeCodex(temp);
+    });
+
+    it('npm-style cache writes land in the scratch directory, never in the project or .forge, and are cleaned up', async () => {
+      await fake.configure({ mode: 'success', npmCache: true, writes: { 'hello.txt': 'HI' } });
+      const project = await createTestProject(temp);
+      const req = await prepareWorkerRequest({ project, task: 'Create hello.txt', context: null, access: 'edit', timeoutMs: 60_000 });
+      const result = await new CodexWorker({ runner, resolve: (name) => fake.resolve(name) }).execute(req);
+      assert.equal(result.outcome, 'success');
+
+      const cache = (await fake.npmCacheLocation())!;
+      assert.ok(cache.includes(WORKER_SCRATCH_PREFIX), `cache went to ${cache}`);
+      assert.ok(!cache.toLowerCase().startsWith(project.layout.root.toLowerCase()));
+      await assert.rejects(access(cache), 'the scratch directory is removed after the run');
+      await assert.rejects(access(join(project.layout.forgeDir, 'npm-cache')));
+      await assert.rejects(access(join(project.layout.root, 'npm-cache')));
+
+      const invocation = await fake.lastInvocation('worker');
+      assert.match(invocation.stdin, /Never create, modify, or delete anything in the project's \.forge\/ directory/);
+      assert.ok(invocation.stdin.includes(`Temporary files and tool caches belong in the scratch directory: ${dirname(cache)}`));
+    });
+
+    it('read-only runs get no writable scratch space', async () => {
+      await fake.configure({ mode: 'success' });
+      const project = await createTestProject(temp);
+      const req = await prepareWorkerRequest({ project, task: 'Look around', context: null, access: 'read-only', timeoutMs: 60_000 });
+      assert.equal((await new CodexWorker({ runner, resolve: (name) => fake.resolve(name) }).execute(req)).outcome, 'success');
+      const invocation = await fake.lastInvocation('worker');
+      assert.equal(settingOf(invocation.argv, 'sandbox_workspace_write.writable_roots'), undefined);
+      assert.equal(settingOf(invocation.argv, 'shell_environment_policy.set'), undefined);
+      assert.ok(!invocation.stdin.includes('scratch directory'));
+    });
+
+    it('does not start Codex when safe scratch space cannot be prepared', async () => {
+      await fake.configure({ mode: 'success' });
+      const project = await createTestProject(temp);
+      const before = await fake.calls('worker');
+      const req = await prepareWorkerRequest({ project, task: 'Create hello.txt', context: null, access: 'edit', timeoutMs: 60_000 });
+      const result = await new CodexWorker({ runner, resolve: (name) => fake.resolve(name), scratchParent: project.layout.root }).execute(req);
+      assert.equal(result.outcome, 'unavailable');
+      assert.match(result.diagnostics[0]!, /Could not prepare scratch space for Codex: .*inside the project/);
+      assert.equal(await fake.calls('worker'), before);
+    });
   });
 });
 

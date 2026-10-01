@@ -22,6 +22,8 @@ export interface FakeCodexConfig {
   /** Message of the failed turn in `error` mode. */
   readonly failMessage?: string;
   readonly marker?: string;
+  /** The worker runs an npm-like command that needs a writable cache (see the fake). */
+  readonly npmCache?: boolean;
 }
 
 export interface Invocation {
@@ -38,6 +40,8 @@ export interface FakeCodex {
   resolve(name: string): Promise<ExecutableResolution>;
   lastInvocation(role?: Invocation['role']): Promise<Invocation>;
   calls(role: Invocation['role']): Promise<number>;
+  /** Where the last npm-like command put its cache, if one ran. */
+  npmCacheLocation(): Promise<string | undefined>;
 }
 
 /** Installs the fake Codex CLI like an npm global install on Windows: script plus cmd-shim launcher. */
@@ -77,5 +81,6 @@ export async function installFakeCodex(temp: TempDirs, config: FakeCodexConfig =
     lastInvocation: async (role) =>
       JSON.parse(await readFile(join(packageDir, role === undefined ? 'codex-invocation.json' : `codex-${role}-invocation.json`), 'utf8')) as Invocation,
     calls: async (role) => Number(await readFile(join(packageDir, `codex-${role}-calls.txt`), 'utf8').catch(() => '0')),
+    npmCacheLocation: async () => readFile(join(packageDir, 'codex-npm-cache.txt'), 'utf8').catch(() => undefined),
   };
 }

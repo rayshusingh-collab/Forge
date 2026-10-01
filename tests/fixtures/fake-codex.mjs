@@ -52,6 +52,26 @@ if (args[0] !== 'exec') {
 }
 
 const event = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+
+/**
+ * Mimics the model running npm inside the real sandbox (as seen in a real
+ * run): npm always writes a cache with `_logs/`. When Forge sanctioned a
+ * cache (`npm_config_cache` in `shell_environment_policy.set`, inside the
+ * extra writable root) it goes there. Otherwise the model improvised
+ * `npm --cache .forge/npm-cache`, a Git-ignored path in the working directory.
+ */
+function runNpmLikeCommand() {
+  const setting = args.find((arg) => arg.startsWith('shell_environment_policy.set='));
+  const roots = args.find((arg) => arg.startsWith('sandbox_workspace_write.writable_roots='));
+  const sanctioned = setting === undefined ? undefined : /npm_config_cache = '([^']*)'/.exec(setting)?.[1];
+  const root = roots === undefined ? undefined : /\['([^']*)'\]/.exec(roots)?.[1];
+  const cache = sanctioned !== undefined && root !== undefined && sanctioned.startsWith(root) ? sanctioned : join(process.cwd(), '.forge', 'npm-cache');
+  mkdirSync(join(cache, '_logs'), { recursive: true });
+  writeFileSync(join(cache, '_logs', '2026-10-01T12_04_04_062Z-debug-0.log'), 'verbose title npm install\n');
+  writeFileSync(join(cache, '_update-notifier-last-checked'), '');
+  writeFileSync(new URL('codex-npm-cache.txt', here), cache);
+}
+
 let stdin = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
@@ -79,6 +99,9 @@ process.stdin.on('end', () => {
   }
   switch (mode) {
     case 'success': {
+      if (role === 'worker' && config.npmCache === true) {
+        runNpmLikeCommand();
+      }
       for (const [path, content] of Object.entries(role === 'worker' ? (config.writes ?? {}) : {})) {
         mkdirSync(dirname(join(process.cwd(), path)), { recursive: true });
         writeFileSync(join(process.cwd(), path), content);

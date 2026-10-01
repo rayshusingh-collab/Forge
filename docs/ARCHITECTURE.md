@@ -455,6 +455,8 @@ Implemented (Milestone 9, `src/workers/codex/`, `src/ai/codex-provider.ts`): the
   - high-risk features disabled.
 
   AI roles also disable command execution and run in an empty scratch directory.
+
+  Edit runs get a fresh scratch directory outside the project (`scratch.ts`). It is the only extra writable root, TMP/TEMP and the npm/Yarn/pnpm/XDG cache variables point into it, and it is removed after the run. Without it, tools such as npm (which writes a cache and logs on every command) had nowhere writable. In a real run the model then improvised `npm --cache .forge/npm-cache`, which correctly stopped the run as an integrity violation. The `.forge/` integrity check is unchanged. Creating the scratch directory is refused if it would land inside the project, and the argument builder refuses a writable root or variable that overlaps the working directory.
 - **Output.** The JSONL event stream is normalized into the same `WorkerResult` / `AiResponse` shapes as Claude's JSON. Role answers then pass the same strict plan and review decoders.
 - **Health.** Health comes from `--version`, `exec --help` capability detection and `login status`, so Forge never handles credentials.
 - **No fallback.** An unknown name is refused by `forge config set`; an unavailable provider fails preflight and stops the run; no other provider is substituted.

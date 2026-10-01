@@ -136,9 +136,12 @@ export async function verifyControlState(project: LoadedProject, snapshot: Contr
   return { ok: changes.length === 0, ...report, problems };
 }
 
-/** One-line description of the changes, e.g. `modified state.json, removed project.json`. */
+/**
+ * One-line description of the changes, e.g. `modified .forge/state.json, removed .forge/project.json`.
+ * Paths are shown with their `.forge/` prefix: a bare `npm-cache` reads like a project-root path.
+ */
 export function describeIntegrityChanges(report: IntegrityReport): string {
-  return report.changes.map((change) => `${change.change} ${change.path === '.' ? '.forge/' : change.path}`).join(', ');
+  return report.changes.map((change) => `${change.change} ${change.path === '.' ? '.forge/' : `.forge/${change.path}`}`).join(', ');
 }
 
 /**
@@ -170,6 +173,8 @@ export async function writeIntegrityEvidence(options: {
     projectId: options.project.project.id,
     projectRoot: options.project.layout.root,
     controlDirectory: snapshot.forgeDir,
+    /** `changes[].path` and `originals` keys are relative to this directory, not to the project root. */
+    pathsRelativeTo: snapshot.forgeDir,
     snapshotTakenAt: snapshot.takenAt,
     detectedAt: new Date().toISOString(),
     scope: report.scope,

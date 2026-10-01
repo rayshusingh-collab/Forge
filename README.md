@@ -300,6 +300,7 @@ forge config set providers.implementer codex      # or providers.planner / provi
 | `approval_policy=never` | Codex never escalates out of the sandbox; refused actions just fail |
 | `windows.sandbox=unelevated` | Codex's Windows sandbox mode that needs no per-machine admin setup (without the user config, workspace writes would otherwise be impossible on Windows) |
 | `shell_environment_policy.inherit=core` | Commands the model runs get a minimal environment |
+| edit runs: `sandbox_workspace_write.writable_roots=['<scratch>']`, `shell_environment_policy.set={ TMP, TEMP, TMPDIR, npm_config_cache, YARN_CACHE_FOLDER, pnpm_config_store_dir, XDG_CACHE_HOME → <scratch>\…, npm_config_update_notifier=false }` | A fresh per-run scratch directory **outside the project** (in the OS temp directory) is the only extra writable place, for temp files and tool caches; it is deleted after the run. Without it, npm and similar tools had no writable cache and a model could put one inside the project or in `.forge/` |
 | `--disable` apps, plugins, remote_plugin, browser_use, browser_use_external, computer_use, image_generation, in_app_browser, multi_agent, tool_suggest, skill_search, hooks, worktrees | High-risk features are off |
 | planner/reviewer additionally: `--disable shell_tool unified_exec view_image`, fresh empty temp directory | AI roles cannot run commands; they work only from the input Forge sends |
 | `--ephemeral --color never` | No saved session; plain output |

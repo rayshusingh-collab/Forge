@@ -201,6 +201,46 @@ describe('provider selection and failure behavior', () => {
     await rm(evidence, { force: true });
   });
 
+  // Regression (real run): npm inside the Codex sandbox had no writable cache, the model used
+  // `npm --cache .forge/npm-cache`, and the task stopped on an integrity violation.
+  it('a Codex implementer whose commands need an npm cache completes without touching Forge state', async () => {
+    const e = await environment({ planner: 'claude', implementer: 'codex', reviewer: 'claude' });
+    await e.claude.configure({ plannerResult: PLAN, reviewerResult: reviewJson([]) });
+    await planAndApply(e);
+    await e.codex.configure({ mode: 'success', npmCache: true, writes: { 'src/math.js': MULTIPLY } });
+    const run = cli(e.setup.root, e.env);
+    assert.equal(await run.run(['run', '--max-tasks', '1']), 0, run.stdout.text);
+    assert.doesNotMatch(run.stdout.text, /INTEGRITY VIOLATION/);
+    assert.match(run.stdout.text, /Commit: 1 file\(s\) committed/);
+
+    const cache = (await e.codex.npmCacheLocation())!;
+    assert.ok(!cache.toLowerCase().startsWith(e.setup.root.toLowerCase()), `cache went to ${cache}`);
+    await assert.rejects(readFile(join(e.setup.root, '.forge', 'npm-cache', '_update-notifier-last-checked')));
+    const state = await e.setup.store.load();
+    assert.equal(state.workerRuns[0]!.status, 'success');
+    assert.deepEqual(state.tasks[0]!.attempts[0]!.changes?.files.map((file) => `${file.path}:${file.attribution}`), ['src/math.js:task'], 'project changes are attributed as before');
+    assert.equal((await git(e.setup.root, 'show', '--name-only', '--format=%s', 'HEAD')).trim(), 'forge: complete task 1.1 - Add multiply\n\nsrc/math.js');
+  });
+
+  it('a Codex implementer that still writes a cache into .forge/ is an integrity violation', async () => {
+    const e = await environment({ planner: 'claude', implementer: 'codex', reviewer: 'claude' });
+    await e.claude.configure({ plannerResult: PLAN });
+    await planAndApply(e);
+    await e.codex.configure({ mode: 'success', writes: { 'src/math.js': MULTIPLY, '.forge/npm-cache/_logs/debug-0.log': 'npm log' } });
+    const run = cli(e.setup.root, e.env);
+    assert.equal(await run.run(['run']), 1);
+    assert.match(run.stdout.text, /STOP: INTEGRITY VIOLATION/);
+    const state = await e.setup.store.load();
+    assert.equal(state.tasks[0]!.attempts[0]!.outcome, 'integrity-violation');
+    const diagnostic = state.workerRuns[0]!.diagnostic ?? '';
+    assert.match(diagnostic, /added \.forge\/npm-cache, added \.forge\/npm-cache\/_logs, added \.forge\/npm-cache\/_logs\/debug-0\.log/, 'paths are reported with their .forge/ prefix');
+    const evidence = /Evidence: (\S+\.json)/.exec(diagnostic)?.[1];
+    assert.ok(evidence !== undefined);
+    const report = JSON.parse(await readFile(evidence, 'utf8')) as { pathsRelativeTo: string };
+    assert.equal(report.pathsRelativeTo, join(e.setup.root, '.forge'));
+    await rm(evidence, { force: true });
+  });
+
   it('Ctrl+C cancels a running Codex worker; nothing else starts and the lease is released', async () => {
     const e = await environment({ planner: 'claude', implementer: 'codex', reviewer: 'claude' });
     await e.claude.configure({ plannerResult: PLAN });

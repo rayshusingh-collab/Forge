@@ -12,6 +12,8 @@ import { WORKER_RESULT_LIMITS } from '../types.ts';
 import type { ProviderMetadata, Worker, WorkerCapabilities, WorkerExecuteOptions, WorkerHealth, WorkerHealthCheck, WorkerOutcome, WorkerProcessInfo, WorkerRequest, WorkerResult } from '../types.ts';
 import { buildCodexExecArgs, findMissingCodexCapabilities, parseCodexLoginStatus, parseCodexVersion } from './command.ts';
 import { parseCodexEvents } from './output.ts';
+import { createWorkerScratch } from './scratch.ts';
+import type { WorkerScratch } from './scratch.ts';
 
 export const CODEX_WORKER_ID = 'codex';
 
@@ -29,6 +31,8 @@ export interface CodexWorkerOptions {
   /** Configured absolute path; `null`/absent looks up `codex` on PATH. */
   readonly executable?: string | null;
   readonly logger?: Logger;
+  /** Parent of each edit run's scratch directory; defaults to the OS temp directory. Injected for tests. */
+  readonly scratchParent?: string;
   /** Injected for tests. */
   readonly resolve?: (name: string, options?: ResolveExecutableOptions) => Promise<ExecutableResolution>;
 }
@@ -41,8 +45,10 @@ type Readiness = { readonly ok: true; readonly executable: ResolvedExecutable } 
  * authentication is used as-is. Invocation and sandbox mapping: see
  * `command.ts`. Unlike the Claude worker, Codex runs model-generated shell
  * commands, inside its own sandbox (no network, writes only in the working
- * directory). Forge's own checks (integrity, scope, validation, safe commit)
- * apply exactly as for any worker.
+ * directory and, for edit runs, a per-run scratch directory outside the
+ * project for temp files and tool caches; see `scratch.ts`). Forge's own
+ * checks (integrity, scope, validation, safe commit) apply exactly as for any
+ * worker.
  */
 export class CodexWorker implements Worker {
   readonly id = CODEX_WORKER_ID;
@@ -121,18 +127,43 @@ export class CodexWorker implements Worker {
       return failEarly('unavailable', readiness.problem);
     }
 
-    // Codex has no separate system-prompt channel: Forge's rules come first, then the fenced task data.
-    const envelope = buildPromptEnvelope(request);
-    this.logger.info('Invoking Codex', { requestId: request.id, access: request.access, cwd: request.workingDirectory, timeoutMs: request.timeoutMs });
-    const run = await this.options.runner.run({
-      command: readiness.executable.command,
-      args: [...readiness.executable.prefixArgs, ...buildCodexExecArgs({ kind: 'worker', access: request.access, workingDirectory: request.workingDirectory })],
-      cwd: request.workingDirectory,
-      timeoutMs: request.timeoutMs,
-      input: `${envelope.instructions}\n\n${envelope.message}\n`,
-      maxOutputBytes: CODEX_MAX_OUTPUT_BYTES,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    });
+    // Edit runs execute commands that need writable temp and cache space; read-only runs cannot write anywhere.
+    let scratch: WorkerScratch | undefined;
+    if (request.access === 'edit') {
+      try {
+        scratch = await createWorkerScratch({
+          projectRoot: request.projectRoot,
+          ...(this.options.scratchParent === undefined ? {} : { parentDirectory: this.options.scratchParent }),
+        });
+      } catch (error) {
+        return failEarly('unavailable', `Could not prepare scratch space for Codex: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    let run: ProcessResult;
+    try {
+      // Codex has no separate system-prompt channel: Forge's rules come first, then the fenced task data.
+      const envelope = buildPromptEnvelope(request, scratch === undefined ? {} : { scratchDirectory: scratch.directory });
+      const args = buildCodexExecArgs({
+        kind: 'worker',
+        access: request.access,
+        workingDirectory: request.workingDirectory,
+        ...(scratch === undefined ? {} : { scratch }),
+      });
+      this.logger.info('Invoking Codex', { requestId: request.id, access: request.access, cwd: request.workingDirectory, scratch: scratch?.directory ?? null, timeoutMs: request.timeoutMs });
+      run = await this.options.runner.run({
+        command: readiness.executable.command,
+        args: [...readiness.executable.prefixArgs, ...args],
+        cwd: request.workingDirectory,
+        timeoutMs: request.timeoutMs,
+        input: `${envelope.instructions}\n\n${envelope.message}\n`,
+        maxOutputBytes: CODEX_MAX_OUTPUT_BYTES,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
+    } finally {
+      // The runner terminates the whole process tree before returning, so nothing still writes here.
+      await scratch?.dispose();
+    }
     const result = finish(interpretCodexRun(run));
     this.logger.info('Codex finished', { requestId: request.id, outcome: result.outcome, durationMs: result.durationMs });
     return result;
