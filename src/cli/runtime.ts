@@ -5,6 +5,10 @@ import { createAiProviderRegistry } from '../ai/index.ts';
 import type { AiProvider, AiProviderRegistry } from '../ai/index.ts';
 import { createWorkerRegistry } from '../workers/index.ts';
 import type { WorkerRegistry } from '../workers/index.ts';
+import { ProjectConfigStore } from '../config/index.ts';
+import type { ProjectConfig } from '../config/index.ts';
+import type { Registries } from '../control/index.ts';
+import type { LoadedProject } from '../projects/index.ts';
 import type { CliContext } from './types.ts';
 
 /** Loads configuration for commands that require it; throws `ConfigurationError`. */
@@ -63,4 +67,14 @@ export function createAiProvider(name: string, role: string, context: CliContext
     context.stderr.write(`forge: unknown ${role} "${name}" (available: ${known.join(', ')})\n`);
   }
   return provider;
+}
+
+/** The project configuration (.forge/config.json); invalid configuration is refused with a clear error. */
+export async function loadProjectSettings(project: LoadedProject): Promise<ProjectConfig> {
+  return new ProjectConfigStore(project.layout).load();
+}
+
+/** Both provider registries (implementer workers; planner/reviewer AI providers). */
+export function resolveRegistries(context: CliContext): Registries {
+  return { workers: resolveWorkers(context, { lenient: true }), aiProviders: resolveAiProviders(context) };
 }

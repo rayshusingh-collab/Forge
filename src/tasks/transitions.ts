@@ -1,3 +1,4 @@
+import { assertNotPaused } from '../control/pause.ts';
 import { WorkflowError } from '../core/errors.ts';
 import { TASK_LIMITS, describeDependencyProblem, findDependencyProblem } from '../state/index.ts';
 import type {
@@ -234,6 +235,7 @@ export function assertTaskCanStart(
 
 /** pending|failed -> running: records a new attempt linked to its worker run. */
 export function startAttempt(state: ProjectState, input: StartAttemptInput, now: Date): ProjectState {
+  assertNotPaused(state, 'start a task attempt');
   const view = assertTaskCanStart(state, input.taskId, input);
   const task = view.task;
   if (task.attempts.length + 1 !== input.attemptNumber) {

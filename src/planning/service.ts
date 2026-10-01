@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { ValidationError } from '../core/errors.ts';
+import { assertNotPaused } from '../control/pause.ts';
 import { runReadOnly } from '../ai/read-only-guard.ts';
 import type { AiProvider } from '../ai/types.ts';
 import { DEFAULT_CONTEXT_LIMITS, collectProjectContext, summarizeContext } from '../context/index.ts';
@@ -48,6 +49,7 @@ export async function createPlan(options: CreatePlanOptions): Promise<CreatePlan
   const store = options.store ?? openStateStore(options.project);
 
   const state = await store.load();
+  assertNotPaused(state, 'ask the AI planner');
   const profile = await new ValidationProfileStore(options.project.layout).load();
   const git = await GitClient.create({ runner: options.runner, root: options.project.layout.root });
   const status = await git.status();

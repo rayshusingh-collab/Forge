@@ -1,5 +1,6 @@
 import { tmpdir } from 'node:os';
 
+import { assertNotPaused } from '../control/pause.ts';
 import { IntegrityError } from '../core/errors.ts';
 import {
   describeIntegrityChanges,
@@ -125,7 +126,10 @@ export async function runRecordedWorker<P = undefined>(options: RecordedRunOptio
   const running = runningRecord(options, clock);
 
   if (options.request.access !== 'edit') {
-    await store.update((state) => started(options, withRun(state, running)));
+    await store.update((state) => {
+      assertNotPaused(state, 'start a worker');
+      return started(options, withRun(state, running));
+    });
     const snapshot = await snapshotControlState(options.project.layout, 'metadata');
     const result = await prepareAndExecute(options, clock);
     return finish(options, clock, running, result, snapshot, (change) => store.update(change));
@@ -134,7 +138,10 @@ export async function runRecordedWorker<P = undefined>(options: RecordedRunOptio
   // Throws StateConflictError if another Forge process holds the lock: the worker is not started.
   const lease = await store.acquireLease();
   try {
-    await lease.update((state) => started(options, withRun(state, running)));
+    await lease.update((state) => {
+      assertNotPaused(state, 'start a worker');
+      return started(options, withRun(state, running));
+    });
     const snapshot = await snapshotControlState(options.project.layout, 'full');
     const result = await prepareAndExecute(options, clock);
     return await finish(options, clock, running, result, snapshot, (change) => lease.update(change));

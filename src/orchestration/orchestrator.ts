@@ -6,6 +6,7 @@ import { ForgeError, IntegrityError, WorkflowError } from '../core/errors.ts';
 import type { ProcessExecutor } from '../execution/index.ts';
 import { GitClient } from '../git/index.ts';
 import type { LoadedProject } from '../projects/index.ts';
+import { consumeApproval, currentFingerprint, requestApproval, staleApprovals, sweepApprovals } from '../approvals/index.ts';
 import { decideReview, reviewTask } from '../review/index.ts';
 import type {
   AttemptOrigin,
@@ -19,7 +20,8 @@ import type {
   StateStore,
   ValidationStatus,
 } from '../state/index.ts';
-import { TaskEngine, deriveWorkflow, processLiveness, repairsUsed } from '../tasks/index.ts';
+import { ORCHESTRATION_LIMITS } from '../state/index.ts';
+import { TaskEngine, deriveWorkflow, processLiveness, recoverTask, repairsUsed } from '../tasks/index.ts';
 import type { ExecutorLiveness, WorkflowView } from '../tasks/index.ts';
 import type { Worker } from '../workers/index.ts';
 import { decideNext } from './decision.ts';
@@ -65,7 +67,8 @@ export interface OrchestratorOptions {
 
 /** Receives progress as it happens (for terminal output). */
 export interface OrchestrationReporter {
-  onStep?(step: StepResult): void;
+  /** Awaited before the next decision, so a reporter never races the loop. */
+  onStep?(step: StepResult): void | Promise<void>;
 }
 
 export interface StepResult {
@@ -101,6 +104,10 @@ export interface RunResult {
   readonly stopTaskKey: string | null;
   /** False when the final state could not be recorded (reported, never hidden). */
   readonly recorded: boolean;
+  /** The approval request this stop waits on (created now or earlier), if any. */
+  readonly approvalId: string | null;
+  /** True when this run created that approval request. */
+  readonly approvalCreated: boolean;
 }
 
 export class Orchestrator {
@@ -111,6 +118,7 @@ export class Orchestrator {
   private counters: OrchestrationCounters = EMPTY_COUNTERS;
   private readonly tasksStarted = new Set<string>();
   private readonly reviewsThisRun = new Set<string>();
+  private stopApproval: { readonly id: string; readonly created: boolean } | null = null;
 
   constructor(options: OrchestratorOptions) {
     if (options.policy.review.enabled && options.reviewer === null) {
@@ -170,7 +178,17 @@ export class Orchestrator {
     }
     const view = await this.view().catch(() => undefined);
     const stopTaskKey = stop.taskId === null ? null : (view?.task(stop.taskId)?.key ?? null);
-    return { runId: this.runId, steps, counters: this.counters, stop, nextRunnable: view?.runnable[0]?.key ?? null, stopTaskKey, recorded };
+    return {
+      runId: this.runId,
+      steps,
+      counters: this.counters,
+      stop,
+      nextRunnable: view?.runnable[0]?.key ?? null,
+      stopTaskKey,
+      recorded,
+      approvalId: this.stopApproval?.id ?? null,
+      approvalCreated: this.stopApproval?.created ?? false,
+    };
   }
 
   private async loop(mode: 'run' | 'step', lease: OrchestrationLease, steps: StepResult[]): Promise<OrchestrationStop> {
@@ -189,11 +207,15 @@ export class Orchestrator {
         return { reason: 'limit-steps', detail: `This run performed ${this.counters.steps} step(s) (limit ${policy.maxSteps})`, taskId: null };
       }
 
-      const state = await this.options.store.load();
+      let state = await this.options.store.load();
+      if (staleApprovals(state).length > 0) {
+        // Approvals bound to evidence that has since changed can never be used.
+        state = await this.options.store.update((current) => sweepApprovals(current, this.clock()));
+      }
       const view = deriveWorkflow(state, this.liveness);
       const action = decideNext(state, view, policy, this.context());
       if (action.kind === 'stop') {
-        return { reason: action.reason, detail: action.detail, taskId: action.taskId };
+        return this.stopWith(action);
       }
 
       const step = await this.perform(action, state, view);
@@ -210,14 +232,43 @@ export class Orchestrator {
         );
       } catch (error) {
         // Continuing without a trustworthy record is never safe; keep the step's own reason if it had one.
-        this.options.reporter?.onStep?.(step);
+        await this.options.reporter?.onStep?.(step);
         return step.stop ?? { reason: 'state-not-recorded', detail: `The orchestration event could not be recorded: ${describe(error)}`, taskId: step.taskId };
       }
-      this.options.reporter?.onStep?.(step);
+      await this.options.reporter?.onStep?.(step);
       if (step.stop !== null) {
         return step.stop;
       }
     }
+  }
+
+  /**
+   * Ends the loop. A human-required stop records (or points at) the
+   * approval request a human can resolve with `forge approval`; Forge
+   * never resolves it itself.
+   */
+  private async stopWith(action: Extract<NextAction, { kind: 'stop' }>): Promise<OrchestrationStop> {
+    const request = action.approvalRequest;
+    if (request !== undefined) {
+      let created = false;
+      let id = '';
+      await this.options.store.update((current) => {
+        const result = requestApproval(
+          current,
+          { ...request, id: (this.options.generateId ?? randomUUID)(), runId: this.runId },
+          this.clock(),
+        );
+        created = result.created;
+        id = result.approval.id;
+        return result.state;
+      });
+      this.stopApproval = { id, created };
+      return { reason: action.reason, detail: `${action.detail}; approval ${id.slice(0, 8)} ${created ? 'requested' : 'pending'}`, taskId: action.taskId };
+    }
+    if (action.approvalId !== undefined) {
+      this.stopApproval = { id: action.approvalId, created: false };
+    }
+    return { reason: action.reason, detail: action.detail, taskId: action.taskId };
   }
 
   private context(): DecisionContext {
@@ -255,6 +306,8 @@ export class Orchestrator {
           return await this.review(action.taskId, base);
         case 'commit':
           return await this.commit(action.taskId, base);
+        case 'apply-approval':
+          return await this.applyApproval(action, base);
         case 'complete-milestone':
           await this.options.engine.completeMilestone(action.milestoneId);
           this.counters = { ...this.counters, milestones: this.counters.milestones + 1 };
@@ -265,7 +318,73 @@ export class Orchestrator {
     }
   }
 
-  private async executeTask(action: Extract<NextAction, { kind: 'execute' | 'repair' }>, state: ProjectState, base: StepResult): Promise<StepResult> {
+  /**
+   * Uses ONE approved approval. Consumption is recorded first, atomically
+   * and only if the evidence still matches its fingerprint (otherwise the
+   * approval is invalidated and the next decision asks again). Then the
+   * single action it authorizes happens through the normal services.
+   */
+  private async applyApproval(action: Extract<NextAction, { kind: 'apply-approval' }>, base: StepResult): Promise<StepResult> {
+    const { store } = this.options;
+    const now = this.clock();
+    let stale = false;
+    let reason = '';
+    const after = await store.update((current) => {
+      const approval = current.approvals.find((candidate) => candidate.id === action.approvalId)!;
+      reason = approval.resolution?.reason ?? '';
+      const result = consumeApproval(current, approval.id, this.runId, currentFingerprint(current, approval), now);
+      stale = result.kind === 'stale';
+      if (stale) {
+        return result.state;
+      }
+      switch (action.approvalType) {
+        case 'review-acceptance':
+          return decideReview(result.state, action.taskId, 'accepted', `Accepted by a human through approval ${approval.id.slice(0, 8)}: ${reason}`, now, 'human');
+        case 'interrupted-recovery':
+          // Marks the interrupted attempt failed; never re-runs it.
+          return recoverTask(result.state, action.taskId, { force: false, liveness: this.liveness }, now);
+        default:
+          return result.state;
+      }
+    });
+    const id = action.approvalId.slice(0, 8);
+    if (stale) {
+      return { ...base, outcome: 'approval-invalidated', detail: `Approval ${id} no longer matched the evidence and was invalidated; nothing was done` };
+    }
+    switch (action.approvalType) {
+      case 'review-acceptance':
+        return { ...base, outcome: 'review-accepted', detail: `Approval ${id} used: review accepted by a human (${reason})` };
+      case 'interrupted-recovery':
+        return { ...base, outcome: 'recovered', detail: `Approval ${id} used: the interrupted attempt was marked failed; nothing was re-run` };
+      case 'violation-acknowledgement': {
+        const step = await this.executeTask({ kind: 'execute', taskId: action.taskId }, after, base, true);
+        return { ...step, detail: `Approval ${id} used (violation acknowledged)${step.detail === null ? '' : `; ${step.detail}`}` };
+      }
+      default: {
+        const task = after.tasks.find((candidate) => candidate.id === action.taskId)!;
+        const last = task.attempts.at(-1)!;
+        const remediation = after.taskReviews.find(
+          (review) => review.taskId === task.id && review.attempt === last.number && review.decision?.kind === 'remediation-required',
+        );
+        const canRepair = repairsUsed(task) < ORCHESTRATION_LIMITS.maxRepairsPerTask;
+        const execution: Extract<NextAction, { kind: 'execute' | 'repair' }> =
+          canRepair && last.outcome === 'validation-failed'
+            ? { kind: 'repair', taskId: task.id, trigger: 'validation', fromAttempt: last.number, reviewId: null, reopen: false }
+            : canRepair && last.outcome === 'review-rejected' && remediation !== undefined
+              ? { kind: 'repair', taskId: task.id, trigger: 'review', fromAttempt: last.number, reviewId: remediation.id, reopen: false }
+              : { kind: 'execute', taskId: task.id };
+        const step = await this.executeTask(execution, after, base);
+        return { ...step, detail: `Approval ${id} used (one more attempt)${step.detail === null ? '' : `; ${step.detail}`}` };
+      }
+    }
+  }
+
+  private async executeTask(
+    action: Extract<NextAction, { kind: 'execute' | 'repair' }>,
+    state: ProjectState,
+    base: StepResult,
+    acknowledgeIntegrityViolation = false,
+  ): Promise<StepResult> {
     const { engine, policy, worker, store, signal } = this.options;
     const unsafe = await this.unsafeGitState();
     if (unsafe !== null) {
@@ -305,6 +424,7 @@ export class Orchestrator {
         access: policy.access,
         timeoutMs: policy.workerTimeoutMs,
         origin,
+        acknowledgeIntegrityViolation,
         ...(repairEvidence === undefined ? {} : { repairEvidence }),
         ...(signal === undefined ? {} : { signal }),
       });

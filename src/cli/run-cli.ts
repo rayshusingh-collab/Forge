@@ -1,8 +1,14 @@
+import { redactSecrets, secretValues } from '../core/redaction.ts';
 import { isForgeError } from '../core/errors.ts';
 import { doctorCommand } from './commands/doctor.ts';
 import { milestoneCommand } from './commands/milestone.ts';
 import { planCommand } from './commands/plan.ts';
 import { runCommand } from './commands/run.ts';
+import { approvalCommand } from './commands/approval.ts';
+import { configCommand } from './commands/config.ts';
+import { auditCommand, explainCommand, pauseCommand, preflightCommand, resumeCommand, statusCommand } from './commands/control.ts';
+import { initCommand } from './commands/init.ts';
+import { providerCommand } from './commands/provider.ts';
 import { projectCommand } from './commands/project.ts';
 import { taskCommand } from './commands/task.ts';
 import { validationCommand } from './commands/validation.ts';
@@ -11,7 +17,26 @@ import { ExitCode } from './types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from './types.ts';
 
 /** Registered commands. New commands are added here. */
-export const COMMANDS: readonly CliCommand[] = [projectCommand, planCommand, milestoneCommand, taskCommand, runCommand, validationCommand, workerCommand, doctorCommand];
+export const COMMANDS: readonly CliCommand[] = [
+  initCommand,
+  projectCommand,
+  statusCommand,
+  planCommand,
+  milestoneCommand,
+  taskCommand,
+  runCommand,
+  approvalCommand,
+  pauseCommand,
+  resumeCommand,
+  explainCommand,
+  auditCommand,
+  preflightCommand,
+  configCommand,
+  validationCommand,
+  providerCommand,
+  workerCommand,
+  doctorCommand,
+];
 
 /**
  * Parses top-level arguments and dispatches to a command.
@@ -44,14 +69,23 @@ export async function runCli(argv: readonly string[], context: CliContext): Prom
   try {
     return await command.run(rest, context);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    // Never print credential values that happen to appear in a message.
+    const secrets = secretValues(context.env);
+    const message = redactSecrets(error instanceof Error ? error.message : String(error), secrets);
     if (isForgeError(error)) {
-      // Expected failure with a user-facing message; details only at debug level.
-      context.logger.debug(`Command "${command.name}" failed`, { code: error.code, details: error.details });
+      // Expected failure with an actionable, user-facing message; details only at debug level.
+      context.logger.debug(`Command "${command.name}" failed`, { code: error.code });
+      context.stderr.write(`forge ${command.name}: ${message}\n`);
     } else {
-      context.logger.error(`Command "${command.name}" failed unexpectedly`, { error: message });
+      // Unexpected: not swallowed, but no stack trace unless debug logging is on.
+      const stack = error instanceof Error && error.stack !== undefined ? redactSecrets(error.stack, secrets) : message;
+      context.logger.debug(`Command "${command.name}" failed unexpectedly`, { stack });
+      context.stderr.write(
+        `forge ${command.name}: internal error: ${message}\n` +
+          'This is not an expected failure. Nothing further was attempted; inspect the project with `forge status`.\n' +
+          'For diagnostics, re-run with FORGE_LOG_LEVEL=debug.\n',
+      );
     }
-    context.stderr.write(`forge ${command.name}: ${message}\n`);
     return ExitCode.Failure;
   }
 }

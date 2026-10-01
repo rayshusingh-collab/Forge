@@ -6,7 +6,8 @@ import type { LoadedProject } from '../../projects/index.ts';
 import type { PlanProposal } from '../../state/index.ts';
 import { deriveWorkflow } from '../../tasks/index.ts';
 import { expectPositionals, parseCommandArgs, requireProject, stringOption } from '../args.ts';
-import { createAiProvider, createRunner, lenientConfig, requireConfig } from '../runtime.ts';
+import { roleProvider } from '../../control/index.ts';
+import { createAiProvider, createRunner, lenientConfig, requireConfig, loadProjectSettings } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
 import { MAX_TIMEOUT_SECONDS, parseTimeoutSeconds } from './worker.ts';
@@ -71,7 +72,7 @@ async function create(args: readonly string[], context: CliContext, project: Loa
     return ExitCode.Usage;
   }
   const config = requireConfig(context);
-  const provider = createAiProvider(stringOption(parsed, 'planner') ?? 'claude', 'planner', context);
+  const provider = createAiProvider(roleProvider('planner', (await loadProjectSettings(project)).settings, stringOption(parsed, 'planner')).name, 'planner', context);
   if (provider === undefined) {
     return ExitCode.Usage;
   }

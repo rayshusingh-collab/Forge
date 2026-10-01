@@ -1,15 +1,19 @@
-import { createHash } from 'node:crypto';
-
 import { ValidationError } from '../core/errors.ts';
+import { fingerprintOf } from '../core/fingerprint.ts';
 import { SchemaViolation } from '../core/validation.ts';
 import { ORCHESTRATION_LIMITS, decodeOrchestrationPolicy } from '../state/index.ts';
 import type { OrchestrationPolicy, WorkerAccessMode } from '../state/index.ts';
+import type { ProjectSettings } from '../config/index.ts';
 
 /**
  * Orchestration policy: the complete, explicit list of what `forge run` may
- * do on its own. It is built only from Forge's conservative defaults plus
- * options a human passed on the command line; nothing an AI provider,
- * repository file, or validation output says can change it.
+ * do on its own. It is built only from Forge's conservative defaults, the
+ * human-controlled project configuration, and options a human passed on the
+ * command line; nothing an AI provider, repository file, or validation
+ * output says can change it.
+ *
+ * Precedence: hard limits (never overridable) > CLI option > project
+ * configuration > environment (timeouts) > conservative default.
  *
  * Out-of-range values are REFUSED, never clamped: a run either uses exactly
  * the policy it prints, or does not start.
@@ -61,10 +65,11 @@ export function buildPolicy(options: PolicyOptions, defaults: { readonly workerT
   if ((repairOnValidationFailure || repairOnBlockingReview) && maxPerTask === 0) {
     throw new ValidationError('Repairs are enabled but the repair budget is 0; use a budget of at least 1, or do not enable repairs');
   }
-  if (repairOnBlockingReview && options.review !== true && options.reviewer === undefined) {
+  // An explicit review choice wins; naming a reviewer alone enables review.
+  const reviewEnabled = options.review ?? options.reviewer !== undefined;
+  if (repairOnBlockingReview && !reviewEnabled) {
     throw new ValidationError('Review-driven repair requires AI review to be enabled (--review)');
   }
-  const reviewEnabled = options.review === true || options.reviewer !== undefined;
   const candidate = {
     maxTasks: options.maxTasks ?? POLICY_DEFAULTS.maxTasks,
     maxSteps: options.maxSteps ?? POLICY_DEFAULTS.maxSteps,
@@ -92,24 +97,73 @@ export function buildPolicy(options: PolicyOptions, defaults: { readonly workerT
   }
 }
 
+export type PolicySource = 'cli' | 'project' | 'default';
+
+export interface PolicyResolution {
+  readonly policy: OrchestrationPolicy;
+  /** Where each option came from (options not listed used the default). */
+  readonly sources: Readonly<Partial<Record<keyof PolicyOptions, PolicySource>>>;
+}
+
+/** Project configuration expressed as policy options (only keys the project actually sets). */
+export function policyOptionsFromProject(settings: ProjectSettings): PolicyOptions {
+  const options: Record<string, unknown> = {};
+  const map: readonly (readonly [keyof ProjectSettings, keyof PolicyOptions, (value: unknown) => unknown])[] = [
+    ['providers.implementer', 'worker', (value) => value],
+    ['providers.reviewer', 'reviewer', (value) => value],
+    ['run.allowEdits', 'access', (value) => (value === true ? 'edit' : 'read-only')],
+    ['run.maxTasks', 'maxTasks', (value) => value],
+    ['run.maxSteps', 'maxSteps', (value) => value],
+    ['run.repairOnValidationFailure', 'repairOnValidationFailure', (value) => value],
+    ['run.repairOnBlockingReview', 'repairOnBlockingReview', (value) => value],
+    ['run.maxRepairsPerTask', 'maxRepairsPerTask', (value) => value],
+    ['run.review', 'review', (value) => value],
+    ['run.continueOnConcerns', 'continueOnConcerns', (value) => value],
+    ['run.continueWithoutReview', 'continueWithoutReview', (value) => value],
+    ['run.autoCommit', 'autoCommit', (value) => value],
+    ['run.workerTimeoutSeconds', 'workerTimeoutMs', (value) => (value as number) * 1000],
+    ['run.reviewTimeoutSeconds', 'reviewTimeoutMs', (value) => (value as number) * 1000],
+  ];
+  for (const [key, option, convert] of map) {
+    const value = settings[key];
+    if (value !== undefined) {
+      options[option] = convert(value);
+    }
+  }
+  return options as PolicyOptions;
+}
+
+/**
+ * Applies the precedence rules. A reviewer named only in the project
+ * configuration never enables review by itself; `run.review` (or --review)
+ * does. The hard limits are enforced last, by `buildPolicy`, whatever the source.
+ */
+export function resolvePolicy(cli: PolicyOptions, project: ProjectSettings, defaults: { readonly workerTimeoutMs: number }): PolicyResolution {
+  const fromProject = policyOptionsFromProject(project);
+  const merged: Record<string, unknown> = { ...fromProject };
+  const sources: Partial<Record<keyof PolicyOptions, PolicySource>> = {};
+  for (const key of Object.keys(fromProject) as (keyof PolicyOptions)[]) {
+    sources[key] = 'project';
+  }
+  for (const [key, value] of Object.entries(cli) as [keyof PolicyOptions, unknown][]) {
+    if (value !== undefined) {
+      merged[key] = value;
+      sources[key] = 'cli';
+    }
+  }
+  if (merged['review'] === undefined && sources.reviewer === 'project') {
+    merged['review'] = false;
+  }
+  return { policy: buildPolicy(merged as PolicyOptions, defaults), sources };
+}
+
 export function describeLimits(): string {
   return `max tasks ${ORCHESTRATION_LIMITS.maxTasks}, max steps ${ORCHESTRATION_LIMITS.maxSteps}, max repairs per task ${ORCHESTRATION_LIMITS.maxRepairsPerTask}`;
 }
 
 /** SHA-256 over the policy with sorted keys, recorded with every run. */
 export function policyHash(policy: OrchestrationPolicy): string {
-  return createHash('sha256').update(canonicalJson(policy)).digest('hex');
-}
-
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(',')}]`;
-  }
-  if (value !== null && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
+  return fingerprintOf(policy);
 }
 
 /** Whether progressing requires a clean review (no concerns accepted automatically, no unreviewed continuation). */

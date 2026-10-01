@@ -1,9 +1,12 @@
 import { ObjectReader, SchemaViolation, isPlainObject } from '../core/validation.ts';
 import { checkWorkflowInvariants } from './invariants.ts';
+import { decodeApproval, decodeControlEvent, decodePause } from './control-schema.ts';
 import { decodeAttemptOrigin, decodeOrchestrationRun } from './orchestration-schema.ts';
 import { decodePlanDocument } from './plan-schema.ts';
 import {
   AI_LIMITS,
+  APPROVAL_LIMITS,
+  CONTROL_LIMITS,
   ORCHESTRATION_LIMITS,
   REVIEW_DECIDERS,
   ATTEMPT_OUTCOMES,
@@ -161,6 +164,15 @@ export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
       }),
     };
   },
+  // 6 -> 7: human control. No approvals, pause, or control events existed before.
+  6: (document) => {
+    for (const field of ['approvals', 'pause', 'controlEvents']) {
+      if (Object.hasOwn(document, field)) {
+        throw new SchemaViolation(field, 'is not a recognised field in schema version 6');
+      }
+    }
+    return { ...document, schemaVersion: 7, approvals: [], pause: null, controlEvents: [] };
+  },
 };
 
 function arrayOfObjects(value: unknown, path: string): Record<string, unknown>[] {
@@ -193,6 +205,9 @@ export function decodeProjectState(raw: unknown): ProjectState {
     'planProposals',
     'taskReviews',
     'orchestrationRuns',
+    'approvals',
+    'pause',
+    'controlEvents',
     'createdAt',
     'updatedAt',
   ]);
@@ -211,6 +226,9 @@ export function decodeProjectState(raw: unknown): ProjectState {
     planProposals: r.array('planProposals', decodePlanProposal, AI_LIMITS.proposals),
     taskReviews: r.array('taskReviews', decodeTaskReview, 20_000),
     orchestrationRuns: r.array('orchestrationRuns', decodeOrchestrationRun, ORCHESTRATION_LIMITS.retainedRuns),
+    approvals: r.array('approvals', decodeApproval, APPROVAL_LIMITS.retained),
+    pause: r.nullable('pause', decodePause),
+    controlEvents: r.array('controlEvents', decodeControlEvent, CONTROL_LIMITS.retainedEvents),
     createdAt: r.timestamp('createdAt'),
     updatedAt: r.timestamp('updatedAt'),
   };

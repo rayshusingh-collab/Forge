@@ -22,8 +22,10 @@
  * 6 — Milestone 7: autonomous orchestration — attempts record their
  *     orchestration origin and repair trigger, review decisions record who
  *     decided, and bounded orchestration run history (migrated from 5).
+ * 7 — Milestone 8: human control — approval requests, project pause, and
+ *     human control events (migrated from 6 as empty / not paused).
  */
-export const STATE_SCHEMA_VERSION = 6;
+export const STATE_SCHEMA_VERSION = 7;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -636,7 +638,7 @@ export type OrchestrationRunMode = (typeof ORCHESTRATION_RUN_MODES)[number];
 export const ORCHESTRATION_RUN_STATUSES = ['running', 'stopped', 'interrupted'] as const;
 export type OrchestrationRunStatus = (typeof ORCHESTRATION_RUN_STATUSES)[number];
 
-export const ORCHESTRATION_ACTIONS = ['execute', 'repair', 'review', 'commit', 'complete-milestone', 'stop'] as const;
+export const ORCHESTRATION_ACTIONS = ['execute', 'repair', 'review', 'commit', 'complete-milestone', 'apply-approval', 'stop'] as const;
 export type OrchestrationAction = (typeof ORCHESTRATION_ACTIONS)[number];
 
 /** Why an orchestration run stopped. Labels, categories and guidance live in `src/orchestration/stop-reason.ts`. */
@@ -670,6 +672,8 @@ export const STOP_REASONS = [
   'lease-lost',
   'step-refused',
   'error',
+  'paused',
+  'approval-rejected',
 ] as const;
 export type StopReason = (typeof STOP_REASONS)[number];
 
@@ -719,6 +723,96 @@ export interface OrchestrationRun {
   readonly stop: OrchestrationStop | null;
 }
 
+/**
+ * What a human approval authorizes. Each is single-purpose:
+ * - `review-acceptance`          accept a task's AI review despite concerns / blocking concerns
+ * - `violation-acknowledgement`  retry a task after an integrity or scope violation (acknowledged)
+ * - `task-retry`                 one more attempt of a failed task the policy would not retry
+ * - `interrupted-recovery`       mark an interrupted execution as failed (never re-runs it)
+ * - `lease-recovery`             forced removal of an orchestration lease whose owner cannot be proven dead
+ */
+export const APPROVAL_TYPES = ['review-acceptance', 'violation-acknowledgement', 'task-retry', 'interrupted-recovery', 'lease-recovery'] as const;
+export type ApprovalType = (typeof APPROVAL_TYPES)[number];
+
+/**
+ * pending      requested by Forge, waiting for a human
+ * approved     a human approved it; not yet used
+ * rejected     a human rejected it (terminal; Forge stops while it applies)
+ * consumed     Forge used the approval exactly once (terminal)
+ * invalidated  the evidence it was bound to changed before use (terminal)
+ */
+export const APPROVAL_STATUSES = ['pending', 'approved', 'rejected', 'consumed', 'invalidated'] as const;
+export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
+
+export const APPROVAL_DECISIONS = ['approved', 'rejected'] as const;
+export type ApprovalDecision = (typeof APPROVAL_DECISIONS)[number];
+
+export const APPROVAL_LIMITS = {
+  retained: 500,
+  reason: 1_000,
+  evidenceLines: 12,
+  evidenceLine: 300,
+  requestedAction: 300,
+  boundTo: 300,
+} as const;
+
+/** Only humans resolve approvals; the field exists so the record says so explicitly. */
+export interface ApprovalResolution {
+  readonly decision: ApprovalDecision;
+  readonly reason: string;
+  readonly by: 'human';
+  readonly at: string;
+}
+
+/** A request for a human decision, bound by fingerprint to the evidence it authorizes. */
+export interface ApprovalRecord {
+  readonly id: string;
+  readonly type: ApprovalType;
+  readonly status: ApprovalStatus;
+  /** The task it concerns (null for lease recovery). */
+  readonly taskId: string | null;
+  /** The orchestration run that requested it, or the lease owner's run for lease recovery. */
+  readonly runId: string | null;
+  /** Why Forge stopped (bounded). */
+  readonly reason: string;
+  /** Bounded summary of the evidence (IDs, statuses, short excerpts). */
+  readonly evidence: readonly string[];
+  /** What approving allows Forge to do. */
+  readonly requestedAction: string;
+  /** Human-readable description of what the fingerprint covers. */
+  readonly boundTo: string;
+  /** SHA-256 of the evidence it is bound to; any change makes the approval unusable. */
+  readonly fingerprint: string;
+  readonly createdAt: string;
+  readonly resolution: ApprovalResolution | null;
+  readonly consumedAt: string | null;
+  readonly consumedByRunId: string | null;
+  readonly invalidatedAt: string | null;
+  readonly invalidationReason: string | null;
+}
+
+/** A paused project refuses autonomous execution and AI/worker invocations until a human resumes it. */
+export interface PauseState {
+  readonly reason: string;
+  readonly pausedAt: string;
+  readonly by: 'human';
+}
+
+export const CONTROL_EVENT_KINDS = ['paused', 'resumed', 'lease-recovered', 'config-set', 'config-reset'] as const;
+export type ControlEventKind = (typeof CONTROL_EVENT_KINDS)[number];
+
+export const CONTROL_LIMITS = { retainedEvents: 500, reason: 1_000, detail: 300 } as const;
+
+/** A human control action that has no other authoritative record. */
+export interface ControlEvent {
+  readonly id: string;
+  readonly at: string;
+  readonly kind: ControlEventKind;
+  readonly reason: string | null;
+  readonly detail: string | null;
+  readonly by: 'human';
+}
+
 export interface ProjectState {
   readonly schemaVersion: typeof STATE_SCHEMA_VERSION;
   readonly projectId: string;
@@ -736,6 +830,12 @@ export interface ProjectState {
   readonly taskReviews: readonly TaskReview[];
   /** Orchestration runs, oldest first (bounded). */
   readonly orchestrationRuns: readonly OrchestrationRun[];
+  /** Human approval requests and their resolutions (bounded). */
+  readonly approvals: readonly ApprovalRecord[];
+  /** Non-null while a human has paused the project. */
+  readonly pause: PauseState | null;
+  /** Human control actions (pause, resume, lease recovery, config changes), oldest first (bounded). */
+  readonly controlEvents: readonly ControlEvent[];
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -755,6 +855,9 @@ export function createInitialState(projectId: string, now: Date): ProjectState {
     planProposals: [],
     taskReviews: [],
     orchestrationRuns: [],
+    approvals: [],
+    pause: null,
+    controlEvents: [],
     createdAt: timestamp,
     updatedAt: timestamp,
   };

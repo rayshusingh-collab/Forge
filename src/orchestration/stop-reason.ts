@@ -109,6 +109,12 @@ export const STOP_REASON_INFO: Readonly<Record<StopReason, StopReasonInfo>> = {
   },
   'step-refused': { label: 'STEP REFUSED', category: 'human', action: 'Forge refused the next step; read the reason and resolve it.' },
   error: { label: 'ERROR', category: 'error', action: 'An unexpected error stopped the run; read the message and inspect the project.' },
+  paused: { label: 'PAUSED', category: 'human', action: 'The project is paused; when ready, run `forge resume --reason "..."`.' },
+  'approval-rejected': {
+    label: 'APPROVAL REJECTED',
+    category: 'human',
+    action: 'A human rejected the approval Forge needed; resolve the task manually (e.g. `forge task cancel <task>`) or change the situation.',
+  },
 };
 
 export function describeStop(reason: StopReason): StopReasonInfo {

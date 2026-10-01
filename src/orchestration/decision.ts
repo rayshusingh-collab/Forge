@@ -1,4 +1,5 @@
-import type { OrchestrationPolicy, ProjectState, RepairTrigger, StopReason, TaskReview } from '../state/index.ts';
+import type { ApprovalType, OrchestrationPolicy, ProjectState, RepairTrigger, StopReason, TaskReview } from '../state/index.ts';
+import { taskApprovalBinding } from '../approvals/index.ts';
 import { commitEligibility, repairsUsed } from '../tasks/index.ts';
 import type { TaskView, WorkflowView } from '../tasks/index.ts';
 
@@ -37,7 +38,28 @@ export type NextAction =
   | { readonly kind: 'review'; readonly taskId: string; readonly attempt: number }
   | { readonly kind: 'commit'; readonly taskId: string; readonly attempt: number }
   | { readonly kind: 'complete-milestone'; readonly milestoneId: string }
-  | { readonly kind: 'stop'; readonly reason: StopReason; readonly detail: string; readonly taskId: string | null };
+  | { readonly kind: 'apply-approval'; readonly approvalId: string; readonly approvalType: ApprovalType; readonly taskId: string }
+  | {
+      readonly kind: 'stop';
+      readonly reason: StopReason;
+      readonly detail: string;
+      readonly taskId: string | null;
+      /** An existing approval request this stop is waiting on (pending) or blocked by (rejected). */
+      readonly approvalId?: string;
+      /** A human approval Forge should request for this stop (none exists for the current evidence yet). */
+      readonly approvalRequest?: ApprovalRequestSpec;
+    };
+
+/** What the orchestrator records as a pending approval request when it stops. */
+export interface ApprovalRequestSpec {
+  readonly type: Exclude<ApprovalType, 'lease-recovery'>;
+  readonly taskId: string;
+  readonly reason: string;
+  readonly evidence: readonly string[];
+  readonly requestedAction: string;
+  readonly boundTo: string;
+  readonly fingerprint: string;
+}
 
 export interface DecisionContext {
   /** The current run's ID; auto-commit only applies to attempts this run produced. */
@@ -51,7 +73,10 @@ export interface DecisionContext {
 const COMPLETED_REVIEW = new Set(['clear', 'concerns', 'blocking-concerns']);
 
 export function decideNext(state: ProjectState, view: WorkflowView, policy: OrchestrationPolicy, context: DecisionContext): NextAction {
-  const global = globalStop(view);
+  if (state.pause !== null) {
+    return { kind: 'stop', reason: 'paused', detail: `Paused by a human since ${state.pause.pausedAt}: ${state.pause.reason}`, taskId: null };
+  }
+  const global = globalStop(state, view);
   if (global !== null) {
     return global;
   }
@@ -76,10 +101,21 @@ export function decideNext(state: ProjectState, view: WorkflowView, policy: Orch
 }
 
 /** Conditions that must be resolved by a human (or another process) before anything else happens. */
-function globalStop(view: WorkflowView): NextAction | null {
+function globalStop(state: ProjectState, view: WorkflowView): NextAction | null {
   const interrupted = view.tasks.find((task) => task.condition === 'interrupted');
   if (interrupted !== undefined) {
-    return stop('interrupted-task', `Task ${interrupted.key} "${interrupted.task.title}" was interrupted and needs \`forge task recover ${interrupted.key}\``, interrupted);
+    const last = interrupted.lastAttempt!;
+    return gate(
+      state,
+      'interrupted-recovery',
+      interrupted,
+      stop('interrupted-task', `Task ${interrupted.key} "${interrupted.task.title}" was interrupted and needs recovery`, interrupted),
+      [
+        `attempt ${last.number} started ${last.startedAt} by pid ${last.executor.pid} on ${last.executor.host}, which is no longer running`,
+        `worker run ${last.runId.slice(0, 8)} never recorded an outcome`,
+      ],
+      'Mark the interrupted attempt as failed (nothing is re-run; a retry needs its own approval). Same as `forge task recover`.',
+    );
   }
   const running = view.tasks.find((task) => task.condition === 'running');
   if (running !== undefined) {
@@ -122,7 +158,10 @@ function followUpAction(state: ProjectState, task: TaskView, policy: Orchestrati
     }
   }
 
-  if (policy.autoCommit && attempt.origin.runId === context.runId && attempt.commit === null && (attempt.changes?.files.length ?? 0) > 0) {
+  // Work from this run, or orchestrated work from an earlier run that nothing has run after since
+  // (e.g. it waited for a human review decision). The M5 safe-commit rules re-verify it live.
+  const ownWork = attempt.origin.runId === context.runId || nothingStartedSince(state, attempt.finishedAt);
+  if (policy.autoCommit && ownWork && attempt.commit === null && (attempt.changes?.files.length ?? 0) > 0) {
     const eligibility = commitEligibility(attempt);
     if (!eligibility.ok) {
       return stop('commit-refused', `Task ${task.key}: ${eligibility.reason}`, task);
@@ -130,6 +169,11 @@ function followUpAction(state: ProjectState, task: TaskView, policy: Orchestrati
     return { kind: 'commit', taskId: task.task.id, attempt: attempt.number };
   }
   return null;
+}
+
+/** True when no task attempt started after `finishedAt` (so no other work can be mixed into its files). */
+function nothingStartedSince(state: ProjectState, finishedAt: string | null): boolean {
+  return finishedAt !== null && state.tasks.every((task) => task.attempts.every((attempt) => attempt.startedAt <= finishedAt));
 }
 
 /** Returns the action the latest review of this attempt requires, or null when the task may progress. */
@@ -153,19 +197,21 @@ function reviewGate(state: ProjectState, task: TaskView, attempt: number, policy
     return null;
   }
   const count = (severities: readonly string[]): number => review.findings.filter((finding) => severities.includes(finding.severity)).length;
+  const evidence = reviewEvidence(task, review);
+  const accept = 'Accept the implementation despite the review (recorded as a human review decision); the run then continues.';
   if (review.status === 'concerns') {
     return policy.review.onConcerns === 'continue'
       ? null
-      : stop('review-decision-required', `Review of task ${task.key} raised ${count(['warning'])} concern(s); a human decision is required`, task);
+      : gate(state, 'review-acceptance', task, stop('review-decision-required', `Review of task ${task.key} raised ${count(['warning'])} concern(s); a human decision is required`, task), evidence, accept);
   }
   // blocking-concerns
   const blocking = `Review of task ${task.key} raised ${count(['error', 'critical'])} blocking concern(s)`;
   if (!policy.repair.onBlockingReview) {
-    return stop('review-decision-required', `${blocking}; a human decision is required`, task);
+    return gate(state, 'review-acceptance', task, stop('review-decision-required', `${blocking}; a human decision is required`, task), evidence, accept);
   }
   const problem = repairProblem(task, policy) ?? reopenProblem(state, task);
   if (problem !== null) {
-    return stop(problem.reason, `${blocking}; ${problem.detail}`, task);
+    return gate(state, 'review-acceptance', task, stop(problem.reason, `${blocking}; ${problem.detail}`, task), evidence, accept);
   }
   return { kind: 'repair', taskId: task.task.id, trigger: 'review', fromAttempt: attempt, reviewId: review.id, reopen: true };
 }
@@ -182,20 +228,30 @@ function runnableAction(state: ProjectState, task: TaskView, policy: Orchestrati
 
   // A failed task with attempts remaining: only a policy-permitted repair may re-run it.
   const last = task.lastAttempt!;
+  const evidence = attemptEvidence(task, policy);
+  const retry = 'Run ONE more attempt of the task (with the failure evidence when it failed validation or review); it is validated normally.';
   if (task.requiresIntegrityAcknowledgement) {
-    return stop(
-      last.outcome === 'scope-violation' ? 'scope-acknowledgement-required' : 'integrity-acknowledgement-required',
-      `Task ${task.key}'s last attempt ended in a ${last.outcome}${last.note === null ? '' : ` (${last.note})`}`,
+    return gate(
+      state,
+      'violation-acknowledgement',
       task,
+      stop(
+        last.outcome === 'scope-violation' ? 'scope-acknowledgement-required' : 'integrity-acknowledgement-required',
+        `Task ${task.key}'s last attempt ended in a ${last.outcome}${last.note === null ? '' : ` (${last.note})`}`,
+        task,
+      ),
+      evidence,
+      'Retry the task once, acknowledging the violation (inspect .forge/ and the changes first); the attempt is validated normally.',
+      overLimit,
     );
   }
   if (last.outcome === 'validation-failed') {
     if (!policy.repair.onValidationFailure) {
-      return stop('repair-not-permitted', `Task ${task.key} failed deterministic validation${last.note === null ? '' : ` (${last.note})`}`, task);
+      return gate(state, 'task-retry', task, stop('repair-not-permitted', `Task ${task.key} failed deterministic validation${last.note === null ? '' : ` (${last.note})`}`, task), evidence, retry, overLimit);
     }
     const problem = repairProblem(task, policy);
     if (problem !== null) {
-      return stop(problem.reason, `Task ${task.key} failed deterministic validation; ${problem.detail}`, task);
+      return gate(state, 'task-retry', task, stop(problem.reason, `Task ${task.key} failed deterministic validation; ${problem.detail}`, task), evidence, retry, overLimit);
     }
     return overLimit ?? { kind: 'repair', taskId: task.task.id, trigger: 'validation', fromAttempt: last.number, reviewId: null, reopen: false };
   }
@@ -204,16 +260,89 @@ function runnableAction(state: ProjectState, task: TaskView, policy: Orchestrati
       (candidate) => candidate.taskId === task.task.id && candidate.attempt === last.number && candidate.decision?.kind === 'remediation-required',
     );
     if (!policy.repair.onBlockingReview || review === undefined) {
-      return stop('review-remediation-required', `Task ${task.key} was reopened for remediation after a review`, task);
+      return gate(state, 'task-retry', task, stop('review-remediation-required', `Task ${task.key} was reopened for remediation after a review`, task), evidence, retry, overLimit);
     }
     const problem = repairProblem(task, policy);
     if (problem !== null) {
-      return stop(problem.reason, `Task ${task.key} requires remediation; ${problem.detail}`, task);
+      return gate(state, 'task-retry', task, stop(problem.reason, `Task ${task.key} requires remediation; ${problem.detail}`, task), evidence, retry, overLimit);
     }
     return overLimit ?? { kind: 'repair', taskId: task.task.id, trigger: 'review', fromAttempt: last.number, reviewId: review.id, reopen: false };
   }
   // Worker failures, timeouts, cancellations, human rejections: not a repair; a human decides.
-  return stop('worker-failed', `Task ${task.key}'s last attempt ended as ${last.outcome}${last.note === null ? '' : ` (${last.note})`}`, task);
+  return gate(state, 'task-retry', task, stop('worker-failed', `Task ${task.key}'s last attempt ended as ${last.outcome}${last.note === null ? '' : ` (${last.note})`}`, task), evidence, retry, overLimit);
+}
+
+/**
+ * Turns a human-required stop into an approval decision point. An approval
+ * applies only while its fingerprint matches the current evidence:
+ *   approved  -> apply it (one use; the orchestrator consumes it)
+ *   rejected  -> stop: a human said no
+ *   pending   -> stop and point at it
+ *   none      -> stop and ask the orchestrator to request one
+ */
+function gate(
+  state: ProjectState,
+  type: Exclude<ApprovalType, 'lease-recovery'>,
+  task: TaskView,
+  stopAction: NextAction,
+  evidence: readonly string[],
+  requestedAction: string,
+  overLimit: NextAction | null = null,
+): NextAction {
+  if (stopAction.kind !== 'stop') {
+    return stopAction;
+  }
+  const binding = taskApprovalBinding(state, type, task.task.id)!;
+  const match = [...state.approvals]
+    .reverse()
+    .find(
+      (approval) =>
+        approval.type === type &&
+        approval.taskId === task.task.id &&
+        approval.fingerprint === binding.fingerprint &&
+        (approval.status === 'pending' || approval.status === 'approved' || approval.status === 'rejected'),
+    );
+  if (match?.status === 'approved') {
+    return overLimit ?? { kind: 'apply-approval', approvalId: match.id, approvalType: type, taskId: task.task.id };
+  }
+  if (match?.status === 'rejected') {
+    return {
+      kind: 'stop',
+      reason: 'approval-rejected',
+      detail: `${stopAction.detail}; approval ${match.id.slice(0, 8)} was rejected by a human: ${match.resolution?.reason ?? ''}`,
+      taskId: task.task.id,
+      approvalId: match.id,
+    };
+  }
+  if (match?.status === 'pending') {
+    return { ...stopAction, detail: `${stopAction.detail}; approval ${match.id.slice(0, 8)} is pending`, approvalId: match.id };
+  }
+  return {
+    ...stopAction,
+    approvalRequest: { type, taskId: task.task.id, reason: stopAction.detail, evidence, requestedAction, boundTo: binding.boundTo, fingerprint: binding.fingerprint },
+  };
+}
+
+/** Bounded evidence for a review-acceptance request: Forge-derived status, finding titles, and validation result. */
+function reviewEvidence(task: TaskView, review: TaskReview): string[] {
+  const validation = task.lastAttempt?.validation ?? null;
+  return [
+    `deterministic validation: ${validation === null ? 'none' : `${validation.status} (${validation.checks.filter((check) => check.status === 'passed').map((check) => check.id).join(', ')})`}`,
+    `review ${review.id.slice(0, 8)}: ${review.status} (reviewer ${review.call.provider}; advisory)`,
+    ...review.findings.slice(0, 8).map((finding) => `[${finding.severity}] ${finding.title}`),
+    ...(review.findings.length > 8 ? [`… and ${review.findings.length - 8} more finding(s); see forge task review-show ${task.key}`] : []),
+  ];
+}
+
+/** Bounded evidence for a retry / acknowledgement request. */
+function attemptEvidence(task: TaskView, policy: OrchestrationPolicy): string[] {
+  const last = task.lastAttempt!;
+  return [
+    `attempt ${last.number}/${task.task.maxAttempts}: ${last.outcome}${last.note === null ? '' : ` — ${last.note}`}`,
+    `deterministic validation: ${last.validation?.status ?? 'not run'}`,
+    `repairs used: ${repairsUsed(task.task)} (policy allows ${policy.repair.onValidationFailure || policy.repair.onBlockingReview ? policy.repair.maxPerTask : 0})`,
+    `changed files: ${last.changes?.files.length ?? 0}`,
+  ];
 }
 
 /** Why the task cannot be repaired now (budget or attempts), or null. */

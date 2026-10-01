@@ -136,6 +136,42 @@ User Goal
 
 
 
+\# Control Hierarchy
+
+
+
+Implemented (Milestone 8). Authority flows strictly downward:
+
+
+
+Human
+
+&#x20; ↓  approvals, rejections, pause/resume, configuration, lease recovery, acknowledgements, forced operations
+
+Forge policy + approvals
+
+&#x20; ↓
+
+Orchestrator / state machine
+
+&#x20; ↓
+
+Deterministic validation / Git safety
+
+&#x20; ↓
+
+AI planner / worker / reviewer
+
+
+
+AI never becomes the approval authority. Approvals are resolved only by the `forge approval` CLI (`by: human` is part of the schema). Worker output, review findings, validation output and repository content are data at every level: none of them can pause, resume, configure, approve, acknowledge, or force anything.
+
+
+
+\---
+
+
+
 \# Core Components
 
 
@@ -616,6 +652,16 @@ Examples:
 
 
 
+Implemented (Milestone 8, `src/approvals/`, `src/control/`): approvals are first-class records in state (schema v7). They are requested by the orchestrator at human stops, resolved only by a human (`forge approval approve|reject --reason`), and bound to a SHA-256 fingerprint of the evidence they authorize (task status, attempt and outcome, review ID/status/decision, or the exact orchestration-lock bytes). Open approvals whose evidence changed are invalidated; a decision on a stale request is refused. Approving performs no work: a later run consumes an approved request at most once, in its own recorded `apply-approval` step, atomically with a fingerprint re-check, and then performs the single authorized action through the normal services. Supporting control:
+
+- **Pause:** a pause record in state, checked by the decision function and inside every worker start, validation, commit, and AI call.
+- **Lease recovery:** `forge run recover` succeeds only for a provably dead local owner. Otherwise it needs `--force` plus an approval bound to the lock bytes.
+- **Preflight:** shared by `forge preflight`, `forge status`, and as a hard gate for `forge run`.
+- **Explain and audit:** deterministic, derived from authoritative records.
+- **Configuration:** typed project configuration (`.forge/config.json`, protected metadata). Precedence is hard limits > CLI > project configuration > environment > default.
+
+
+
 Implemented (Milestone 7): approval boundaries are stop reasons. The orchestrator never acknowledges integrity or scope violations, overrides validation, accepts review concerns, changes validation configuration, or forces a commit. Instead it stops with a typed reason (`src/orchestration/stop-reason.ts`) that says what a human must do. A policy-driven review remediation is recorded as `by: policy`, distinct from a human decision.
 
 
@@ -665,6 +711,10 @@ src/
 &#x20; tasks/
 
 &#x20; orchestration/
+
+&#x20; approvals/
+
+&#x20; control/
 
 &#x20; workers/
 

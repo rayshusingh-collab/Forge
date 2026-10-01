@@ -66,9 +66,28 @@ Early development. Implemented so far:
 - explicit orchestration policy with conservative defaults and hard maximums (refused, never clamped)
 - one orchestration run per project (lease), bounded run history, state schema v6 (migrated from v5)
 
+**Milestone 8 — Human Control & Production Hardening**
+
+- first-class **approvals**: Forge records a request when it stops for a human; only a human resolves it (`forge approval`); an approval is single-use and bound by fingerprint to the evidence it authorizes
+- `forge pause` / `forge resume`, explicit **lease recovery** (`forge run recover`), `forge preflight`, `forge status`, `forge explain`, `forge audit`
+- typed project configuration (`.forge/config.json`, `forge config`) with documented precedence; provider health by role (`forge provider`); safe onboarding (`forge init`)
+- redacted, actionable error output; state schema v7 (migrated from v6)
+
 Nothing autonomous happens unless you run `forge run`, and it does only what its printed policy allows. It never pushes.
 
 > **Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Orchestrator coordinates. Forge state machine decides. Human approves consequential exceptions.**
+
+```
+Human
+  ↓  approvals, pause/resume, configuration, lease recovery, acknowledgements (never AI)
+Forge policy + approvals
+  ↓
+Orchestrator / state machine
+  ↓
+Deterministic validation / Git safety
+  ↓
+AI planner / worker / reviewer   (output is data; never authority)
+```
 
 ## Prerequisites
 
@@ -172,6 +191,20 @@ forge run [--allow-edits] [--worker <name>] [--timeout <seconds>]
           [--auto-commit] [--dry-run]
 forge run step [same options]
 forge run status
+forge run recover --reason <text> [--force]
+
+forge init [<path>] [--name <name>] [--description <text>]
+forge status [--no-providers]
+forge preflight [--no-providers]
+forge explain
+forge audit [--limit <n>]
+forge approval list [--all] | show <id>
+forge approval approve <id> --reason <text>
+forge approval reject <id> --reason <text>
+forge pause --reason <text>
+forge resume --reason <text>
+forge config show | get <key> | set <key> <value> | reset <key> | validate
+forge provider list | check [--role planner|implementer|reviewer] [<provider>]
 ```
 
 Exit codes: `0` success, `1` failure, `2` usage error.
@@ -199,8 +232,9 @@ Registration only creates `<project-root>/.forge/`. It does not initialize or co
 | `.gitignore`   | Contains `*`, so Git ignores all Forge metadata without touching the project's own `.gitignore` |
 | `state.lock`   | Exists only briefly while state is being written                                             |
 | `orchestration.lock` | Exists only while a `forge run` controls the project (see Autonomous orchestration)   |
+| `config.json`  | Human-chosen defaults for roles and orchestration (`forge config`); never credentials  |
 
-`.forge/` holds **Forge metadata only — never credentials**, and no logs or raw worker output. Both documents carry a `schemaVersion`. They are validated whenever they are read, because they may have been edited by hand. Forge refuses (rather than repairs) malformed, unsupported-version, or relocated metadata. Older state is migrated step by step on load (v1 → v2 → … → v6). Version 2 placeholder tasks, which no Forge command ever created, are refused rather than guessed at.
+`.forge/` holds **Forge metadata only — never credentials**, and no logs or raw worker output. Both documents carry a `schemaVersion`. They are validated whenever they are read, because they may have been edited by hand. Forge refuses (rather than repairs) malformed, unsupported-version, or relocated metadata. Older state is migrated step by step on load (v1 → v2 → … → v7). Version 2 placeholder tasks, which no Forge command ever created, are refused rather than guessed at.
 
 ## Claude Code worker
 
@@ -486,11 +520,53 @@ Values outside the limits are **refused, never clamped**; there is no "0 means u
 
 **Interruption and recovery.** Ctrl+C cancels the active worker or reviewer through the normal cancellation path. The attempt is recorded truthfully (`cancelled`), the loop stops, and nothing else starts. A cancelled or crashed attempt is never re-run or committed automatically: the next `forge run` stops with `WORKER FAILED` or `INTERRUPTED TASK` (`forge task recover`). A run record left `running` by a dead process is marked `interrupted` by the next run.
 
-**One run at a time.** A run holds `.forge/orchestration.lock` (run ID, process, host, random token). A second `forge run` is refused. A lock whose owner is gone is reported as probably stale, but **never taken over**: delete it yourself. Forge checks before every step that the lock is still its own; if it was removed or replaced, the run stops and leaves it alone. The lock is separate from the state lock, which the task engine keeps using per operation, so the two cannot deadlock.
+**One run at a time.** A run holds `.forge/orchestration.lock` (run ID, process, host, random token). A second `forge run` is refused. A lock whose owner is gone is reported as probably stale, but **never taken over** automatically: recover it with `forge run recover` (see Human control). Forge checks before every step that the lock is still its own; if it was removed or replaced, the run stops and leaves it alone. The lock is separate from the state lock, which the task engine keeps using per operation, so the two cannot deadlock.
 
 **History.** `state.json` keeps the last 50 runs, each with at most 200 events (action, task, attempt, outcome code, a detail of at most 300 characters), counters, the policy and its hash, and the stop reason. Prompts, diffs, validation output, worker claims and provider text are never stored there.
 
 **Manual vs autonomous.** Every manual command (`forge task run|validate|review|review-accept|review-reject|commit`, `forge plan …`, `forge validation …`) works exactly as before. Manually started attempts carry no orchestration origin, so `forge run` never auto-reviews or auto-commits them. It does include them in selection and repair decisions based on their recorded outcome.
+
+## Human control
+
+**Authority.** Approvals, rejections, pause/resume, configuration changes, lease recovery, violation acknowledgements, policy selection and every forced operation are deterministic human actions through the CLI. No AI provider, worker output, review finding, validation output, or repository file can start or authorize any of them.
+
+**Approvals.** When `forge run` stops for a human, it records an approval request (and `FORGE RUN RESULT` prints its ID):
+
+| Type | Requested when | Approving lets the next run… |
+| --- | --- | --- |
+| `review-acceptance` | review concerns / blocking concerns need a decision | record a human review acceptance, then continue |
+| `violation-acknowledgement` | an integrity or scope violation needs acknowledgement | retry the task once, acknowledging the violation |
+| `task-retry` | validation failed and repair is not permitted, the repair budget is spent, a worker failed, or remediation was required | run ONE more attempt (a repair with evidence when applicable) |
+| `interrupted-recovery` | an execution was interrupted | mark the attempt failed (same as `forge task recover`; never re-runs) |
+| `lease-recovery` | `forge run recover --force` on a lock whose owner cannot be proven gone | remove that exact lock |
+
+- `forge approval list | show <id>` shows the bounded evidence (IDs, statuses, finding titles, short excerpts) and exactly what approving allows.
+- `forge approval approve|reject <id> --reason "..."` needs an explicit subcommand and a reason; there is no prompt, default answer, or timeout. **Approving performs no work.**
+- Each approval is bound to a SHA-256 **fingerprint** of the evidence (task status, attempt and outcome, review ID and status and decision, or the exact lock bytes). If that evidence changes, the approval is **invalidated** and can never be used; a decision on a stale request is refused.
+- A later `forge run` uses an approved request **at most once**, in its own recorded `apply-approval` step (consumption is recorded atomically with the fingerprint check), then the authorized action happens through the normal services and is validated normally. A rejected request makes the run stop with `APPROVAL REJECTED` while the evidence is unchanged.
+- The manual paths still exist (`forge task review-accept`, `forge task run --acknowledge-integrity-violation`, `forge task recover`); using them makes the pending request stale.
+
+**Pause / resume.** `forge pause --reason "..."` records who (a human), why and when. While paused, `forge run` refuses to start, a running orchestration stops before its next step, and new worker runs, AI planner/reviewer calls, validation runs and commits are refused. Inspection, approvals, configuration, cancellations and recovery still work. Pausing never interrupts a worker that is already running (use Ctrl+C in its terminal); while an edit-enabled task holds the project lock, `forge pause` cannot be recorded and says so. `forge resume --reason "..."` starts nothing.
+
+**Lease recovery.** `forge run recover --reason "..."` removes a crashed run's `orchestration.lock` only when Forge can **prove** the owner is gone: the lock names a process on this machine that no longer exists and a run this project's state knows. A live owner is always refused (even with `--force`). Anything unprovable (another host, unreadable owner, unknown run) needs `--force`, which requests a `lease-recovery` approval bound to the exact lock bytes, including the owner's random token; after a human approves it, run `forge run recover --force` again. The lock is re-read and must be byte-identical before removal; replacing it invalidates the approval. A crash during an edit-enabled task also leaves `.forge/state.lock` behind (that task holds it for its whole run); recovery removes it under the same rule (its owner must be provably gone on this machine; a lock without a recorded host, from an older Forge, must be removed by hand). Recovery marks the dead run `interrupted`, records a control event, and never re-runs a task.
+
+**Preflight.** `forge preflight` checks metadata, state and invariants, configuration, the project boundary, Git (conflicts fail; a detached HEAD, no commits or a dirty tree warn), well-known secret files that are tracked or not ignored (path-based only), validation checks, pause, the orchestration lease, pending approvals, tasks needing attention, and provider health per role. Each check is PASS, WARN or FAIL; a WARN is never shown as PASS. `forge run` runs the same checks first and refuses to start while any **critical** check fails.
+
+**Configuration.** `.forge/config.json` holds human-chosen defaults: `providers.implementer|planner|reviewer` and `run.allowEdits, run.maxTasks, run.maxSteps, run.repairOnValidationFailure, run.repairOnBlockingReview, run.maxRepairsPerTask, run.review, run.continueOnConcerns, run.continueWithoutReview, run.autoCommit, run.workerTimeoutSeconds, run.reviewTimeoutSeconds`. Keys are flat and typed; unknown keys, wrong types, out-of-range values, and credential-like keys or values are refused; writes are atomic and validated; the file is protected Forge metadata. `forge config show` shows each effective value with its source.
+
+**Precedence:** hard safety limits (never overridable) > command-line option > project configuration > environment (`FORGE_WORKER_TIMEOUT_MS`, timeouts only) > conservative default. Boolean options have `--no-<option>` forms so the command line can turn a project default off. A reviewer named in the configuration never enables review by itself. AI output and repository content are never configuration sources. `forge run --dry-run` and the run header list which settings came from the command line and which from the project.
+
+**Status, explain, audit.** `forge status` is a concise operational view (pause, active run, current milestone, next task, blockers, interrupted tasks, approvals, last run, validation, Git, uncommitted succeeded tasks, providers, the human action required). `forge explain` says in plain language why Forge stopped (deterministic validation, AI review, repair policy, the related approval) and the next safe commands; it is built from stored records, never by an AI. `forge audit` is a chronological history derived from the authoritative records (plans, attempts, validation, reviews, commits, approvals, runs, human control events); there is no second log that could disagree.
+
+**Providers by role.** `forge provider list` shows the planner, implementer and reviewer and where each choice comes from; `forge provider check [--role r]` runs local health checks (no AI call). All roles are Claude-backed today; nothing assumes they stay that way or share a provider.
+
+**Onboarding.** `forge init` registers the project (or preserves an existing registration), creates an empty configuration, and reports Git safety, validation checks and provider availability. It only *suggests* validation commands from `package.json` scripts; it never adds or runs them, never runs `git init`, never installs dependencies, and never starts a worker. `forge project add` is unchanged.
+
+**Inspection is read-only.** `status`, `preflight`, `explain`, `audit`, `config show|get|validate`, `provider list|check`, `approval list|show`, `run status` and `run --dry-run` never change state, configuration, metadata, source files or Git (tested byte-for-byte). Provider checks launch local processes only.
+
+**Failure output.** Expected failures print one actionable line (with the relevant task, approval or run ID and the next safe command) and no stack trace. Unexpected errors are reported as `internal error`, never swallowed, with details only under `FORGE_LOG_LEVEL=debug`. Values of credential-like environment variables (names containing TOKEN, SECRET, PASSWORD, API_KEY, …) are redacted from error output; configuration, state and history never store credentials or environment values.
+
+**Metadata backups.** Forge does not keep automatic backups of `.forge/`. Its documents are validated on every read and write and written atomically, invalid metadata is refused rather than repaired, and nothing is ever restored automatically. Copy `.forge/state.json` and `.forge/config.json` yourself if you want a backup.
 
 ## Current limitations
 
@@ -505,6 +581,9 @@ Values outside the limits are **refused, never clamped**; there is no "0 means u
 - **No model identifier:** the Claude CLI's JSON output doesn't reliably report the model used, so none is recorded.
 - **Orchestration is sequential and local:** one task at a time, one implementer, one project per run. There are no worktrees, no parallelism, no background service, and no push.
 - **Manual commands during a run:** a manual `forge task …` command in another terminal is serialized by the state lock, not refused. The orchestrator re-reads state before every step and stops if it finds a task running elsewhere.
+- **Approvals stop at the first human-blocked task:** independent tasks are not run around a task waiting for a human decision.
+- **Pause during an edit-enabled task** cannot be recorded until that task's step finishes (the task holds the project lock); use Ctrl+C to stop it immediately.
+- **Lease recovery across machines** always needs `--force` and a human approval: Forge cannot check processes on another host.
 - **Auto-commit refusals need you:** after a commit refusal, commit the changes yourself and continue without `--auto-commit`. Forge cannot tell that you committed them.
 - **Ignored files are invisible:** attribution and scope checks rely on `git status`, so a worker writing to a Git-ignored path (`dist/`, `.env`) isn't observed. Forge verifies what Git and the file system show inside the project, not the whole machine.
 - **Validation runs project code:** a check such as `npm test` executes code the worker may have changed. Forge protects the check definitions, not the code they run. V1 is not a sandbox.
@@ -518,6 +597,6 @@ Carried over from Milestone 2:
 - **Path safety:** the boundary resolves links for the parts of a path that exist. Components that don't exist yet can't be resolved, and a link created between the check and the use (time-of-check/time-of-use) isn't prevented. The boundary is a guard for Forge's own operations, not an OS sandbox.
 - **Case sensitivity:** Windows paths compare case-insensitively. Elsewhere comparison is case-sensitive, so on case-insensitive macOS volumes a differently-cased path is conservatively treated as outside.
 - **Moving a project:** moving a registered project directory invalidates its metadata, which records the original root. Re-registering requires removing `.forge/` manually.
-- **Stale locks:** a stale `.forge/state.lock` left by a crashed process is not removed automatically. Delete it manually when no Forge process is running.
+- **Stale locks:** a stale `.forge/state.lock` left by a crashed process is not removed automatically. Delete it manually when no Forge process is running. (A stale `orchestration.lock` is recovered with `forge run recover`.)
 - **No project list:** there is no global registry of projects; each project is found through its own `.forge/`.
 - **Inherited Git variables:** `GIT_DIR`/`GIT_WORK_TREE` set in Forge's own environment are passed through to Git and would affect repository detection.

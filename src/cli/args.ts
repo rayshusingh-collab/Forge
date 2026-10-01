@@ -19,9 +19,10 @@ export function parseCommandArgs(
   args: readonly string[],
   context: CliContext,
   options: OptionsConfig,
+  settings: { readonly allowNegative?: boolean } = {},
 ): ParsedArgs | undefined {
   try {
-    const { values, positionals } = parseArgs({ args: [...args], options, allowPositionals: true, strict: true });
+    const { values, positionals } = parseArgs({ args: [...args], options, allowPositionals: true, strict: true, allowNegative: settings.allowNegative === true });
     return { values: values as ParsedArgs['values'], positionals };
   } catch (error) {
     context.stderr.write(`forge ${command}: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -36,6 +37,12 @@ export function stringOption(parsed: ParsedArgs, name: string): string | undefin
 
 export function booleanOption(parsed: ParsedArgs, name: string): boolean {
   return parsed.values[name] === true;
+}
+
+/** `--x` is true, `--no-x` is false (when negation is allowed), absent is undefined. */
+export function optionalBoolean(parsed: ParsedArgs, name: string): boolean | undefined {
+  const value = parsed.values[name];
+  return typeof value === 'boolean' ? value : undefined;
 }
 
 /** All values of a repeatable string option; each value may also be comma-separated. */

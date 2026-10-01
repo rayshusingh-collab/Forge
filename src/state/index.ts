@@ -7,6 +7,12 @@ export { decodeOrchestrationPolicy } from './orchestration-schema.ts';
 export { decodePlanDocument } from './plan-schema.ts';
 export {
   AI_LIMITS,
+  APPROVAL_DECISIONS,
+  APPROVAL_LIMITS,
+  APPROVAL_STATUSES,
+  APPROVAL_TYPES,
+  CONTROL_EVENT_KINDS,
+  CONTROL_LIMITS,
   ORCHESTRATION_ACTIONS,
   ORCHESTRATION_LIMITS,
   ORCHESTRATION_RUN_MODES,
@@ -42,6 +48,14 @@ export {
 } from './model.ts';
 export type {
   AiCallMetadata,
+  ApprovalDecision,
+  ApprovalRecord,
+  ApprovalResolution,
+  ApprovalStatus,
+  ApprovalType,
+  ControlEvent,
+  ControlEventKind,
+  PauseState,
   AttemptOrigin,
   OrchestrationAction,
   OrchestrationCounters,

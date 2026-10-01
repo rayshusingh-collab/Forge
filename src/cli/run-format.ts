@@ -1,6 +1,6 @@
 import type { AiProvider } from '../ai/index.ts';
 import { ALWAYS_STOP_CONDITIONS, describePolicy, describeStop } from '../orchestration/index.ts';
-import type { RunPreview, RunResult, StepResult } from '../orchestration/index.ts';
+import type { PolicyResolution, RunPreview, RunResult, StepResult } from '../orchestration/index.ts';
 import type { OrchestrationPolicy, OrchestrationRun, OrchestrationStop } from '../state/index.ts';
 import type { Worker } from '../workers/index.ts';
 
@@ -9,12 +9,20 @@ import type { Worker } from '../workers/index.ts';
  * verdicts, and stop reasons — never prompts, diffs, or provider output.
  */
 
-export function formatPolicyHeader(projectName: string, mode: 'run' | 'step', policy: OrchestrationPolicy, worker: Worker, reviewer: AiProvider | null): string {
+export function formatPolicyHeader(
+  projectName: string,
+  mode: 'run' | 'step',
+  policy: OrchestrationPolicy,
+  worker: Worker,
+  reviewer: AiProvider | null,
+  sources: PolicyResolution['sources'] = {},
+): string {
   return [
     mode === 'step' ? 'FORGE RUN STEP (at most one workflow step)' : 'FORGE RUN (bounded autonomous orchestration)',
     `Project:       ${projectName}`,
     `Roles:         implementer ${worker.id}; reviewer ${reviewer === null ? 'none' : reviewer.id}; validation = deterministic checks run by Forge`,
     ...describePolicy(policy),
+    describeSources(sources),
     'Always stops for: ' + ALWAYS_STOP_CONDITIONS.join('; '),
     '',
     '',
@@ -47,6 +55,16 @@ export function formatStep(step: StepResult): string {
     case 'complete-milestone':
       lines.push(`MILESTONE: ${step.outcome.toUpperCase()}${step.detail === null ? '' : ` — ${step.detail}`}`);
       break;
+    case 'apply-approval':
+      lines.push(`TASK ${step.taskKey ?? '?'} ${step.taskTitle ?? ''}`, `  Human approval: ${step.detail ?? step.outcome}`);
+      if (step.worker !== null) {
+        lines.push(
+          `  Worker: ${step.worker.id} — ${step.worker.outcome} (a claim, not evidence)`,
+          `  Validation: ${step.validation === null ? 'not run' : step.validation === 'passed' ? 'PASSED' : step.validation.toUpperCase()}`,
+          `  Forge decision: ${decision(step.outcome)}`,
+        );
+      }
+      break;
     case 'stop':
       break;
   }
@@ -76,17 +94,24 @@ export function formatRunResult(result: RunResult): string {
     `Stop reason:           ${info.label} (${result.stop.reason})`,
     `Next runnable task:    ${result.nextRunnable ?? 'none'}`,
     `Human action required: ${info.category === 'complete' && result.stop.reason === 'complete' ? 'none' : withTask(info.action, result.stopTaskKey) ?? 'none'}`,
+    ...(result.approvalId === null
+      ? []
+      : [
+          `Approval:              ${result.approvalId.slice(0, 8)} ${result.approvalCreated ? '(requested now)' : '(already requested)'} — inspect: forge approval show ${result.approvalId.slice(0, 8)}`,
+          `                       decide: forge approval approve|reject ${result.approvalId.slice(0, 8)} --reason "..."; explanation: forge explain`,
+        ]),
     ...(result.recorded ? [] : ['WARNING: the run\'s final state could not be recorded in .forge/state.json.']),
     'Nothing was pushed.',
     '',
   ].join('\n');
 }
 
-export function formatPreview(projectName: string, policy: OrchestrationPolicy, preview: RunPreview): string {
+export function formatPreview(projectName: string, policy: OrchestrationPolicy, preview: RunPreview, sources: PolicyResolution['sources'] = {}): string {
   const lines = [
     'FORGE RUN — DRY RUN (nothing is executed, reviewed, committed, or changed)',
     `Project:       ${projectName}`,
     ...describePolicy(policy),
+    describeSources(sources),
     '',
     `Next runnable task: ${preview.firstRunnable === null ? 'none' : `${preview.firstRunnable.key} ${preview.firstRunnable.task.title}`}`,
     `Next action:   ${describeNext(preview)}`,
@@ -192,4 +217,15 @@ function decision(outcome: string): string {
     default:
       return outcome.toUpperCase();
   }
+}
+
+/** Which settings came from the command line or the project configuration (everything else is a default). */
+function describeSources(sources: PolicyResolution['sources']): string {
+  const from = (source: string): string[] =>
+    Object.entries(sources)
+      .filter(([, value]) => value === source)
+      .map(([key]) => key);
+  const cli = from('cli');
+  const project = from('project');
+  return `Settings from: command line [${cli.join(', ') || 'none'}]; project config [${project.join(', ') || 'none'}]; everything else default`;
 }

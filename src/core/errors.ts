@@ -19,7 +19,8 @@ export type ForgeErrorCode =
   | 'INTEGRITY_VIOLATION'
   | 'WORKFLOW_ERROR'
   | 'GIT_ERROR'
-  | 'VALIDATION_CONFIG_ERROR';
+  | 'VALIDATION_CONFIG_ERROR'
+  | 'PROJECT_CONFIG_ERROR';
 
 export type ErrorDetails = Readonly<Record<string, unknown>>;
 
@@ -132,4 +133,11 @@ export class ValidationConfigError extends ForgeError {
 
 export function isForgeError(value: unknown): value is ForgeError {
   return value instanceof ForgeError;
+}
+
+/** Invalid project configuration (`.forge/config.json`) or a refused configuration change. */
+export class ProjectConfigError extends ForgeError {
+  constructor(message: string, options: ForgeErrorOptions = {}) {
+    super('PROJECT_CONFIG_ERROR', message, options);
+  }
 }

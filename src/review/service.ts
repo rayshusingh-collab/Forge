@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { WorkflowError } from '../core/errors.ts';
+import { assertNotPaused } from '../control/pause.ts';
 import { runReadOnly } from '../ai/read-only-guard.ts';
 import type { AiProvider } from '../ai/types.ts';
 import type { ProcessExecutor } from '../execution/index.ts';
@@ -49,6 +50,7 @@ export async function reviewTask(options: ReviewTaskOptions): Promise<ReviewTask
   const store = options.store ?? openStateStore(options.project);
 
   const state = await store.load();
+  assertNotPaused(state, 'ask the AI reviewer');
   const taskId = resolveTaskReference(state, options.task);
   const task = state.tasks.find((candidate) => candidate.id === taskId)!;
   const attempt = task.attempts.at(-1);

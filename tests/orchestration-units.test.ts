@@ -206,7 +206,8 @@ describe('forge run (CLI)', () => {
     const worker = scriptedWorker(setup.root, [{ 'src/math.js': MULTIPLY }]);
     const { stderr, run } = cli(setup.root, { workers: fakeRegistry(worker) });
     assert.equal(await run(['--allow-edits', '--worker', 'fake']), 1);
-    assert.match(stderr.text, /Another orchestration run controls this project/);
+    assert.match(stderr.text, /preflight failed; nothing was started/);
+    assert.match(stderr.text, /Orchestration lease\s+held by run other/);
     assert.equal(worker.requests.length, 0);
     await lease.release();
   });

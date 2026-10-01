@@ -127,6 +127,32 @@ export function checkWorkflowInvariants(state: ProjectState): void {
   checkTaskReviews(state);
   checkRepairs(state);
   checkOrchestrationRuns(state);
+  checkApprovals(state, taskIds);
+  uniqueIds(state.controlEvents, 'controlEvents');
+}
+
+/**
+ * Approvals reference real tasks, and at most one open (pending or approved)
+ * approval exists per type and subject, so a decision is never ambiguous.
+ */
+function checkApprovals(state: ProjectState, taskIds: ReadonlySet<string>): void {
+  uniqueIds(state.approvals, 'approvals');
+  const open = new Set<string>();
+  state.approvals.forEach((approval, index) => {
+    if (approval.taskId !== null && !taskIds.has(approval.taskId)) {
+      throw new SchemaViolation(`approvals[${index}].taskId`, `references unknown task "${approval.taskId}"`);
+    }
+    if ((approval.type === 'lease-recovery') !== (approval.taskId === null)) {
+      throw new SchemaViolation(`approvals[${index}].taskId`, 'must be null exactly for lease recovery');
+    }
+    if (approval.status === 'pending' || approval.status === 'approved') {
+      const subject = `${approval.type}#${approval.taskId ?? approval.runId ?? '-'}`;
+      if (open.has(subject)) {
+        throw new SchemaViolation(`approvals[${index}]`, 'is a second open approval for the same type and subject');
+      }
+      open.add(subject);
+    }
+  });
 }
 
 /**

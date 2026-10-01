@@ -2,7 +2,8 @@ import { TaskEngine, resolveTaskReference } from '../../tasks/index.ts';
 import type { TaskRunOutcome, TaskView, WorkflowView } from '../../tasks/index.ts';
 import type { Worker } from '../../workers/index.ts';
 import { booleanOption, expectPositionals, listOption, parseCommandArgs, requireProject, stringOption } from '../args.ts';
-import { createRunner, lenientConfig, requireConfig } from '../runtime.ts';
+import { roleProvider } from '../../control/index.ts';
+import { createRunner, lenientConfig, loadProjectSettings, requireConfig } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
 import { formatChanges, formatReady, formatTask, formatTaskTable } from '../workflow-format.ts';
@@ -42,7 +43,7 @@ const USAGE = [
   'Worker output is a claim; validation is evidence; Forge decides the task status.',
 ].join('\n');
 
-type Subcommand = (args: readonly string[], context: CliContext, engine: TaskEngine, projectName: string) => Promise<ExitCodeValue>;
+type Subcommand = (args: readonly string[], context: CliContext, engine: TaskEngine, project: LoadedProject) => Promise<ExitCodeValue>;
 
 /** AI review commands (advisory evidence; see task-review.ts). */
 const REVIEW_SUBCOMMANDS: Readonly<Record<string, (args: readonly string[], context: CliContext, project: LoadedProject) => Promise<ExitCodeValue>>> = {
@@ -89,7 +90,7 @@ export const taskCommand: CliCommand = {
       return project;
     }
     const engine = new TaskEngine({ project, runner: createRunner(context, lenientConfig(context)) });
-    return subcommand(rest, context, engine, project.project.name);
+    return subcommand(rest, context, engine, project);
   },
 };
 
@@ -169,7 +170,7 @@ async function ready(args: readonly string[], context: CliContext, engine: TaskE
   return ExitCode.Success;
 }
 
-async function run(args: readonly string[], context: CliContext, engine: TaskEngine, projectName: string): Promise<ExitCodeValue> {
+async function run(args: readonly string[], context: CliContext, engine: TaskEngine, project: LoadedProject): Promise<ExitCodeValue> {
   const parsed = parseCommandArgs('task run', args, context, {
     worker: { type: 'string' },
     timeout: { type: 'string' },
@@ -186,7 +187,7 @@ async function run(args: readonly string[], context: CliContext, engine: TaskEng
     return ExitCode.Usage;
   }
   const config = requireConfig(context);
-  const worker = createWorker(stringOption(parsed, 'worker') ?? 'claude', context);
+  const worker = createWorker(roleProvider('implementer', (await loadProjectSettings(project)).settings, stringOption(parsed, 'worker')).name, context);
   if (worker === undefined) {
     return ExitCode.Usage;
   }
@@ -195,7 +196,7 @@ async function run(args: readonly string[], context: CliContext, engine: TaskEng
 
   // Validate before announcing anything; the engine checks again atomically when starting.
   const before = (await engine.view()).task(await engine.resolveTask(positionals[0]!))!;
-  context.stderr.write(formatTaskBanner(worker, before, projectName, access, timeoutMs));
+  context.stderr.write(formatTaskBanner(worker, before, project.project.name, access, timeoutMs));
 
   const outcome = await engine.runTask(before.task.id, {
     worker,

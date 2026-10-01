@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { hostname } from 'node:os';
 import { lstat, open, readFile, rename, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
@@ -142,6 +143,8 @@ export interface HeldFileLock {
 export async function acquireFileLock(lockPath: string, options: LockOptions): Promise<HeldFileLock> {
   const content = JSON.stringify({
     pid: process.pid,
+    // pid + host let a human recovery prove a crashed owner is gone (`forge run recover`).
+    host: hostname(),
     acquiredAt: new Date().toISOString(),
     token: randomBytes(16).toString('hex'),
   });

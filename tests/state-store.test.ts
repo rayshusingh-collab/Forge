@@ -141,8 +141,17 @@ function populatedState(): ProjectState {
   };
 }
 
-/** Removes fields introduced in schema version 6, for documents of older versions. */
+/** Removes fields introduced in schema version 7, for documents of older versions. */
+function stripV7(doc: Record<string, unknown>): Record<string, unknown> {
+  delete doc['approvals'];
+  delete doc['pause'];
+  delete doc['controlEvents'];
+  return doc;
+}
+
+/** Removes fields introduced in schema versions 6 and 7, for documents of older versions. */
 function stripV6(doc: Record<string, unknown>): Record<string, unknown> {
+  stripV7(doc);
   delete doc['orchestrationRuns'];
   for (const task of (doc['tasks'] as Record<string, unknown>[] | undefined) ?? []) {
     for (const attempt of (task['attempts'] as Record<string, unknown>[] | undefined) ?? []) {
@@ -383,6 +392,50 @@ describe('StateStore: rejecting bad data', () => {
   it('refuses version 4 state that already contains version 5 fields', () =>
     expectLoadError({ ...valid(), schemaVersion: 4 }, /planProposals is not a recognised field in schema version 4/));
 
+  it('migrates version 6 state: no approvals, not paused, no control events', async () => {
+    const v6 = stripV7(valid());
+    v6['schemaVersion'] = 6;
+    await writeRaw(f.stateFile, v6);
+    const loaded = await f.store.load();
+    assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
+    assert.deepEqual([loaded.approvals, loaded.pause, loaded.controlEvents], [[], null, []]);
+    assert.deepEqual(loaded.tasks, populatedState().tasks, 'everything else is preserved');
+  });
+
+  it('refuses version 6 state that already contains version 7 fields', () =>
+    expectLoadError({ ...valid(), schemaVersion: 6 }, /approvals is not a recognised field in schema version 6/));
+
+  it('rejects inconsistent approval records and duplicate open approvals', async () => {
+    const approval = (fields: Record<string, unknown>) => ({
+      id: 'ap1',
+      type: 'task-retry',
+      status: 'pending',
+      taskId: 't1',
+      runId: null,
+      reason: 'r',
+      evidence: ['e'],
+      requestedAction: 'a',
+      boundTo: 'b',
+      fingerprint: 'c'.repeat(64),
+      createdAt: T0.toISOString(),
+      resolution: null,
+      consumedAt: null,
+      consumedByRunId: null,
+      invalidatedAt: null,
+      invalidationReason: null,
+      ...fields,
+    });
+    await writeRaw(f.stateFile, { ...valid(), approvals: [approval({})] });
+    assert.equal((await f.store.load()).approvals.length, 1);
+    await expectLoadError({ ...valid(), approvals: [approval({ status: 'approved' })] }, /inconsistent with its resolution/);
+    await expectLoadError(
+      { ...valid(), approvals: [approval({ resolution: { decision: 'approved', reason: 'x', by: 'reviewer', at: T0.toISOString() }, status: 'approved' })] },
+      /by must be one of: human/,
+    );
+    await expectLoadError({ ...valid(), approvals: [approval({}), approval({ id: 'ap2' })] }, /second open approval/);
+    await expectLoadError({ ...valid(), approvals: [approval({ taskId: 'ghost' })] }, /references unknown task/);
+  });
+
   it('migrates version 5 state: manual attempts, human review decisions, empty run history', async () => {
     const v5 = stripV6(valid());
     v5['schemaVersion'] = 5;
@@ -405,7 +458,7 @@ describe('StateStore: rejecting bad data', () => {
     ];
     await writeRaw(f.stateFile, v5);
     const loaded = await f.store.load();
-    assert.equal(loaded.schemaVersion, 6);
+    assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
     assert.deepEqual(loaded.orchestrationRuns, []);
     assert.ok(loaded.tasks.every((task) => task.attempts.every((attempt) => attempt.origin === null)));
     assert.equal(loaded.taskReviews[0]!.decision?.by, 'human');

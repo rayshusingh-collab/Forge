@@ -1,30 +1,34 @@
 import { StateConflictError, ValidationError } from '../../core/errors.ts';
-import { Orchestrator, buildPolicy, previewRun } from '../../orchestration/index.ts';
-import type { PolicyOptions } from '../../orchestration/index.ts';
+import { runPreflight } from '../../control/index.ts';
+import { Orchestrator, previewRun, recoverOrchestrationLease, resolvePolicy } from '../../orchestration/index.ts';
+import type { PolicyOptions, PolicyResolution } from '../../orchestration/index.ts';
 import { openStateStore } from '../../projects/index.ts';
 import type { LoadedProject } from '../../projects/index.ts';
 import { ORCHESTRATION_LIMITS } from '../../state/index.ts';
-import type { OrchestrationPolicy } from '../../state/index.ts';
 import { TaskEngine } from '../../tasks/index.ts';
-import { booleanOption, parseCommandArgs, requireProject, stringOption } from '../args.ts';
+import { booleanOption, optionalBoolean, parseCommandArgs, requireProject, stringOption } from '../args.ts';
 import type { ParsedArgs } from '../args.ts';
-import { createAiProvider, createRunner, requireConfig } from '../runtime.ts';
+import { formatPreflight } from '../control-format.ts';
+import { createAiProvider, createRunner, loadProjectSettings, requireConfig, resolveRegistries } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
 import { formatPolicyHeader, formatPreview, formatRunResult, formatRunStatus, formatStep } from '../run-format.ts';
 import { MAX_TIMEOUT_SECONDS, createWorker, parseTimeoutSeconds } from './worker.ts';
 
 const USAGE = [
-  'forge run [step | status] [options]',
+  'forge run [step | status | recover] [options]',
   '',
   'forge run [options]              Run the bounded autonomous loop until done, blocked, or a limit',
   'forge run step [options]         Perform exactly ONE workflow step, then stop',
   'forge run --dry-run [options]    Show the policy and what would happen next (changes nothing)',
   'forge run status                 Show orchestration state, history, and blockers',
+  'forge run recover --reason <text> [--force]',
+  '                                 Remove a crashed run\'s orchestration lock (owner must be provably gone;',
+  '                                 --force requests a human approval instead)',
   '',
-  'Policy options (defaults are conservative; nothing risky is enabled implicitly):',
+  'Policy options override the project configuration (`forge config`); --no-<option> turns one off:',
   '  --allow-edits              Let the implementer modify files (required for real progress)',
-  '  --worker <name>            Implementer (default: claude)',
+  '  --worker <name>            Implementer (default: providers.implementer)',
   '  --timeout <seconds>        Implementer timeout per attempt',
   `  --max-tasks <n>            Distinct tasks per run (default 5, max ${ORCHESTRATION_LIMITS.maxTasks})`,
   `  --max-steps <n>            Workflow steps per run (default 30, max ${ORCHESTRATION_LIMITS.maxSteps})`,
@@ -32,14 +36,15 @@ const USAGE = [
   '  --repair-review            Repair automatically after blocking review concerns (requires --review)',
   `  --max-repairs <n>          Repairs per task, across runs (default 2, max ${ORCHESTRATION_LIMITS.maxRepairsPerTask})`,
   '  --review                   Run an advisory AI review of every validated task',
-  '  --reviewer <name>          Reviewer provider (default: claude; implies --review)',
+  '  --reviewer <name>          Reviewer provider (implies --review)',
   '  --review-timeout <seconds> Reviewer timeout',
   '  --continue-on-concerns     Do not stop for review warnings (blocking concerns still stop)',
   '  --continue-without-review  Continue unreviewed when the reviewer is unavailable (default: stop)',
   '  --auto-commit              Commit each validated task\'s own changes locally (never pushes)',
   '',
+  'Precedence: hard limits > command-line option > project configuration > default.',
   'Values above the hard maximums are refused, not clamped. Forge never pushes, never',
-  'overrides validation, and never acknowledges violations on its own.',
+  'overrides validation, and never acknowledges violations or approves anything on its own.',
 ].join('\n');
 
 const POLICY_OPTIONS = {
@@ -61,12 +66,15 @@ const POLICY_OPTIONS = {
 
 export const runCommand: CliCommand = {
   name: 'run',
-  summary: 'Run the bounded autonomous orchestration loop (or one step, a dry run, or status)',
+  summary: 'Run the bounded autonomous orchestration loop (or one step, a dry run, status, or lease recovery)',
   usage: USAGE,
   async run(args, context) {
     const [first, ...rest] = args;
     if (first === 'status') {
       return status(rest, context);
+    }
+    if (first === 'recover') {
+      return recover(rest, context);
     }
     const mode = first === 'step' ? 'step' : 'run';
     return execute(mode, mode === 'step' ? rest : args, context);
@@ -75,7 +83,7 @@ export const runCommand: CliCommand = {
 
 async function execute(mode: 'run' | 'step', args: readonly string[], context: CliContext): Promise<ExitCodeValue> {
   const command = mode === 'step' ? 'run step' : 'run';
-  const parsed = parseCommandArgs(command, args, context, { ...POLICY_OPTIONS, 'dry-run': { type: 'boolean' } });
+  const parsed = parseCommandArgs(command, args, context, { ...POLICY_OPTIONS, 'dry-run': { type: 'boolean' } }, { allowNegative: true });
   if (parsed === undefined) {
     return ExitCode.Usage;
   }
@@ -88,17 +96,25 @@ async function execute(mode: 'run' | 'step', args: readonly string[], context: C
     return project;
   }
   const config = requireConfig(context);
-  const policy = parsePolicy(command, parsed, context, config.workerTimeoutMs);
-  if (policy === undefined) {
+  const resolution = parsePolicy(command, parsed, context, config.workerTimeoutMs, (await loadProjectSettings(project)).settings);
+  if (resolution === undefined) {
     return ExitCode.Usage;
   }
+  const { policy } = resolution;
   const runner = createRunner(context, config);
   const store = openStateStore(project);
 
   if (booleanOption(parsed, 'dry-run')) {
     const preview = await previewRun({ project, store, runner, policy });
-    context.stdout.write(formatPreview(project.project.name, policy, preview));
+    context.stdout.write(formatPreview(project.project.name, policy, preview, resolution.sources));
     return ExitCode.Success;
+  }
+
+  // The same safety checks `forge preflight` reports; any critical failure refuses the run before anything starts.
+  const preflight = await runPreflight({ project, store, runner, policy, registries: resolveRegistries(context) });
+  if (!preflight.runnable) {
+    context.stderr.write(`forge ${command}: preflight failed; nothing was started.\n${formatPreflight(preflight, { onlyProblems: true })}`);
+    return ExitCode.Failure;
   }
 
   const worker = createWorker(policy.worker, context);
@@ -107,7 +123,7 @@ async function execute(mode: 'run' | 'step', args: readonly string[], context: C
     return ExitCode.Usage;
   }
 
-  context.stdout.write(formatPolicyHeader(project.project.name, mode, policy, worker, reviewer));
+  context.stdout.write(formatPolicyHeader(project.project.name, mode, policy, worker, reviewer, resolution.sources));
   const engine = new TaskEngine({ project, store, runner });
   const orchestrator = new Orchestrator({
     project,
@@ -147,14 +163,63 @@ async function status(args: readonly string[], context: CliContext): Promise<Exi
     return project;
   }
   const config = requireConfig(context);
-  const policy = buildPolicy({}, { workerTimeoutMs: config.workerTimeoutMs });
+  const { policy } = resolvePolicy({}, (await loadProjectSettings(project)).settings, { workerTimeoutMs: config.workerTimeoutMs });
   const preview = await previewRun({ project, store: openStateStore(project), runner: createRunner(context, config), policy });
   context.stdout.write(formatRunStatus(project.project.name, policy, preview));
   return ExitCode.Success;
 }
 
-/** Builds the policy from explicit options; out-of-range values are refused with the hard limits. */
-function parsePolicy(command: string, parsed: ParsedArgs, context: CliContext, workerTimeoutMs: number): OrchestrationPolicy | undefined {
+async function recover(args: readonly string[], context: CliContext): Promise<ExitCodeValue> {
+  const parsed = parseCommandArgs('run recover', args, context, { reason: { type: 'string' }, force: { type: 'boolean' } });
+  if (parsed === undefined || parsed.positionals.length > 0) {
+    if (parsed !== undefined) {
+      context.stderr.write('forge run recover: expected no arguments\n');
+    }
+    return ExitCode.Usage;
+  }
+  const reason = stringOption(parsed, 'reason');
+  if (reason === undefined) {
+    context.stderr.write('forge run recover: --reason <text> is required; lease recoveries are recorded\n');
+    return ExitCode.Usage;
+  }
+  const project = await requireProject('run recover', context);
+  if (typeof project === 'number') {
+    return project;
+  }
+  const result = await recoverOrchestrationLease({ project, store: openStateStore(project), reason, force: booleanOption(parsed, 'force') });
+  switch (result.kind) {
+    case 'no-lease':
+      context.stdout.write('No orchestration lease or state lock is held; nothing to recover.\n');
+      return ExitCode.Success;
+    case 'approval-required':
+      context.stdout.write(
+        [
+          `Forced lease recovery needs a human approval: ${result.why}.`,
+          `Approval ${result.approvalId.slice(0, 8)} ${result.created ? 'was requested' : 'is pending'}.`,
+          `Inspect it with: forge approval show ${result.approvalId.slice(0, 8)}`,
+          `Approve with:    forge approval approve ${result.approvalId.slice(0, 8)} --reason "..."`,
+          'Then run `forge run recover --force --reason "..."` again. The lock must still be byte-identical.',
+          'Nothing was removed.',
+          '',
+        ].join('\n'),
+      );
+      return ExitCode.Failure;
+    case 'recovered':
+      context.stdout.write(
+        [
+          `Recovered the orchestration lease${result.owner === null ? '' : ` of run ${result.owner.runId.slice(0, 8)} (pid ${result.owner.pid} on ${result.owner.host})`}${result.forced ? ' (forced, with a human approval)' : ' (its owner process no longer exists)'}.`,
+          ...(result.stateLockRemoved ? ['The stale state lock left by the crashed process was removed too.'] : []),
+          result.owner === null ? 'No orchestration run was involved.' : result.runMarkedInterrupted ? 'The run is now recorded as interrupted.' : 'The run had already recorded how it ended.',
+          'No task was re-run. Interrupted tasks still need their own recovery (see `forge explain`).',
+          '',
+        ].join('\n'),
+      );
+      return ExitCode.Success;
+  }
+}
+
+/** Builds the policy: command-line options over project configuration; out-of-range values are refused with the hard limits. */
+function parsePolicy(command: string, parsed: ParsedArgs, context: CliContext, workerTimeoutMs: number, project: Parameters<typeof resolvePolicy>[1]): PolicyResolution | undefined {
   const problems: string[] = [];
   const count = (name: string): number | undefined => {
     const text = stringOption(parsed, name);
@@ -175,25 +240,28 @@ function parsePolicy(command: string, parsed: ParsedArgs, context: CliContext, w
     }
     return value === undefined ? undefined : value * 1000;
   };
-  const options: PolicyOptions = {
-    access: booleanOption(parsed, 'allow-edits') ? 'edit' : 'read-only',
+  const allowEdits = optionalBoolean(parsed, 'allow-edits');
+  const reviewer = stringOption(parsed, 'reviewer');
+  const review = optionalBoolean(parsed, 'review') ?? (reviewer === undefined ? undefined : true);
+  const cli: PolicyOptions = {
+    ...optional<'access', 'edit' | 'read-only'>('access', allowEdits === undefined ? undefined : allowEdits ? 'edit' : 'read-only'),
     ...optional('worker', stringOption(parsed, 'worker')),
     ...optional('workerTimeoutMs', seconds('timeout')),
     ...optional('maxTasks', count('max-tasks')),
     ...optional('maxSteps', count('max-steps')),
     ...optional('maxRepairsPerTask', count('max-repairs')),
-    repairOnValidationFailure: booleanOption(parsed, 'repair'),
-    repairOnBlockingReview: booleanOption(parsed, 'repair-review'),
-    review: booleanOption(parsed, 'review'),
-    ...optional('reviewer', stringOption(parsed, 'reviewer')),
+    ...optional('repairOnValidationFailure', optionalBoolean(parsed, 'repair')),
+    ...optional('repairOnBlockingReview', optionalBoolean(parsed, 'repair-review')),
+    ...optional('review', review),
+    ...optional('reviewer', reviewer),
     ...optional('reviewTimeoutMs', seconds('review-timeout')),
-    continueOnConcerns: booleanOption(parsed, 'continue-on-concerns'),
-    continueWithoutReview: booleanOption(parsed, 'continue-without-review'),
-    autoCommit: booleanOption(parsed, 'auto-commit'),
+    ...optional('continueOnConcerns', optionalBoolean(parsed, 'continue-on-concerns')),
+    ...optional('continueWithoutReview', optionalBoolean(parsed, 'continue-without-review')),
+    ...optional('autoCommit', optionalBoolean(parsed, 'auto-commit')),
   };
   if (problems.length === 0) {
     try {
-      return buildPolicy(options, { workerTimeoutMs });
+      return resolvePolicy(cli, project, { workerTimeoutMs });
     } catch (error) {
       if (!(error instanceof ValidationError)) {
         throw error;

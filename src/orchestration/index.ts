@@ -14,3 +14,8 @@ export { STOP_REASON_INFO, describeStop } from './stop-reason.ts';
 export type { StopCategory, StopReasonInfo } from './stop-reason.ts';
 export { previewRun } from './preview.ts';
 export type { PreviewOptions, RunPreview } from './preview.ts';
+export { recoverOrchestrationLease } from './recovery.ts';
+export type { LeaseRecoveryOptions, LeaseRecoveryResult } from './recovery.ts';
+export { policyOptionsFromProject, resolvePolicy } from './policy.ts';
+export type { PolicyResolution, PolicySource } from './policy.ts';
+export type { ApprovalRequestSpec } from './decision.ts';

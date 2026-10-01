@@ -111,6 +111,8 @@ function expectedPipeline(next: NextAction, policy: OrchestrationPolicy, require
       return ['local commit of the task\'s own attributed changes (M5 safe-commit rules; never pushed)'];
     case 'complete-milestone':
       return ['complete the milestone (every task is succeeded or cancelled)'];
+    case 'apply-approval':
+      return [`use human approval ${next.approvalId.slice(0, 8)} (${next.approvalType}) once, then continue`];
     case 'stop':
       return [];
   }

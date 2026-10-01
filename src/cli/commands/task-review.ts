@@ -4,7 +4,8 @@ import { decideReview, reviewTask } from '../../review/index.ts';
 import type { ProjectState, TaskReview } from '../../state/index.ts';
 import { deriveWorkflow, resolveTaskReference } from '../../tasks/index.ts';
 import { expectPositionals, parseCommandArgs, stringOption } from '../args.ts';
-import { createAiProvider, createRunner, requireConfig } from '../runtime.ts';
+import { roleProvider } from '../../control/index.ts';
+import { createAiProvider, createRunner, loadProjectSettings, requireConfig } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliContext, ExitCodeValue } from '../types.ts';
 import { MAX_TIMEOUT_SECONDS, parseTimeoutSeconds } from './worker.ts';
@@ -27,7 +28,7 @@ export async function reviewCommand(args: readonly string[], context: CliContext
     return ExitCode.Usage;
   }
   const config = requireConfig(context);
-  const provider = createAiProvider(stringOption(parsed, 'reviewer') ?? 'claude', 'reviewer', context);
+  const provider = createAiProvider(roleProvider('reviewer', (await loadProjectSettings(project)).settings, stringOption(parsed, 'reviewer')).name, 'reviewer', context);
   if (provider === undefined) {
     return ExitCode.Usage;
   }

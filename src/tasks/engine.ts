@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 
+import { assertNotPaused } from '../control/pause.ts';
 import { GitError, IntegrityError, WorkflowError } from '../core/errors.ts';
 import { ProcessRunner } from '../execution/index.ts';
 import type { ProcessExecutor } from '../execution/index.ts';
@@ -325,6 +326,7 @@ export class TaskEngine {
     const lease = await this.store.acquireLease();
     try {
       const state = await this.store.load();
+      assertNotPaused(state, 'run validation');
       const taskId = resolveTaskReference(state, reference);
       const task = state.tasks.find((candidate) => candidate.id === taskId)!;
       const last = task.attempts.at(-1);
@@ -370,6 +372,7 @@ export class TaskEngine {
     const lease = await this.store.acquireLease();
     try {
       const state = await this.store.load();
+      assertNotPaused(state, 'commit');
       const taskId = resolveTaskReference(state, reference);
       const view = deriveWorkflow(state, this.liveness).task(taskId)!;
       const attempt = view.lastAttempt;
