@@ -12,6 +12,7 @@ describe('loadConfig', () => {
       mode: 'production',
       workerTimeoutMs: 600_000,
       claudeExecutable: null,
+      codexExecutable: null,
     });
   });
 
@@ -21,12 +22,14 @@ describe('loadConfig', () => {
 
   it('applies valid overrides', () => {
     const claudePath = process.platform === 'win32' ? 'C:\\Tools\\Claude Code\\claude.exe' : '/opt/claude code/claude';
+    const codexPath = process.platform === 'win32' ? 'C:\\Tools\\Codex\\codex.exe' : '/opt/codex/codex';
     const config = loadConfig({
       FORGE_LOG_LEVEL: 'debug',
       FORGE_PROCESS_TIMEOUT_MS: '5000',
       FORGE_ENV: 'development',
       FORGE_WORKER_TIMEOUT_MS: '900000',
       FORGE_CLAUDE_EXECUTABLE: claudePath,
+      FORGE_CODEX_EXECUTABLE: codexPath,
     });
     assert.deepEqual(config, {
       logLevel: 'debug',
@@ -34,6 +37,7 @@ describe('loadConfig', () => {
       mode: 'development',
       workerTimeoutMs: 900_000,
       claudeExecutable: claudePath,
+      codexExecutable: codexPath,
     });
   });
 
@@ -81,6 +85,12 @@ describe('loadConfig', () => {
   for (const value of ['0', 'forever', '-1']) {
     it(`rejects worker timeout "${value}"`, () => {
       assert.throws(() => loadConfig({ FORGE_WORKER_TIMEOUT_MS: value }), /FORGE_WORKER_TIMEOUT_MS must be an integer/);
+    });
+  }
+
+  for (const value of ['codex', './bin/codex']) {
+    it(`rejects a non-absolute Codex executable "${value}"`, () => {
+      assert.throws(() => loadConfig({ FORGE_CODEX_EXECUTABLE: value }), /FORGE_CODEX_EXECUTABLE must be an absolute path/);
     });
   }
 

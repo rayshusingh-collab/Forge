@@ -20,6 +20,11 @@ export interface ForgeConfig {
    * `claude` on PATH. Only configurable here, never from task input.
    */
   readonly claudeExecutable: string | null;
+  /**
+   * Absolute path to the Codex CLI executable, or `null` to look up
+   * `codex` on PATH. Only configurable here, never from task input.
+   */
+  readonly codexExecutable: string | null;
 }
 
 /** Environment variables Forge reads. Kept in one place so docs and code agree. */
@@ -29,6 +34,7 @@ export const ENV_VARS = {
   mode: 'FORGE_ENV',
   workerTimeoutMs: 'FORGE_WORKER_TIMEOUT_MS',
   claudeExecutable: 'FORGE_CLAUDE_EXECUTABLE',
+  codexExecutable: 'FORGE_CODEX_EXECUTABLE',
 } as const;
 
 export const DEFAULT_CONFIG: ForgeConfig = Object.freeze({
@@ -37,6 +43,7 @@ export const DEFAULT_CONFIG: ForgeConfig = Object.freeze({
   mode: 'production',
   workerTimeoutMs: 600_000,
   claudeExecutable: null,
+  codexExecutable: null,
 });
 
 /** Upper bound on the default timeout (24h) so a typo cannot disable timeouts in practice. */
@@ -71,12 +78,13 @@ export function loadConfig(env: Environment = process.env): ForgeConfig {
     issues,
   );
   const claudeExecutable = readAbsolutePath(env, ENV_VARS.claudeExecutable, issues);
+  const codexExecutable = readAbsolutePath(env, ENV_VARS.codexExecutable, issues);
 
   if (issues.length > 0) {
     throw new ConfigurationError(issues);
   }
 
-  return Object.freeze({ logLevel, processTimeoutMs, mode, workerTimeoutMs, claudeExecutable });
+  return Object.freeze({ logLevel, processTimeoutMs, mode, workerTimeoutMs, claudeExecutable, codexExecutable });
 }
 
 function isRuntimeMode(value: string): value is RuntimeMode {

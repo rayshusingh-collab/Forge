@@ -2,6 +2,7 @@ import type { ForgeConfig } from '../config/index.ts';
 import type { ProcessExecutor } from '../execution/index.ts';
 import type { Logger } from '../logging/index.ts';
 import { ClaudeCodeAiProvider } from './claude-provider.ts';
+import { CodexAiProvider } from './codex-provider.ts';
 import type { AiProvider, AiProviderDescriptor, AiProviderRegistry } from './types.ts';
 
 export interface AiProviderRegistryDependencies {
@@ -17,12 +18,20 @@ const BUILT_IN: readonly (AiProviderDescriptor & { readonly create: (deps: AiPro
     displayName: 'Claude Code',
     create: ({ config, runner, logger }) => new ClaudeCodeAiProvider({ runner, executable: config.claudeExecutable, logger }),
   },
+  {
+    id: 'codex',
+    aliases: ['codex-cli'],
+    displayName: 'Codex CLI',
+    create: ({ config, runner, logger }) => new CodexAiProvider({ runner, executable: config.codexExecutable, logger }),
+  },
 ];
 
 /**
  * Providers available to AI roles. The planner and reviewer are chosen per
- * invocation (`--planner`, `--reviewer`) and recorded by provider ID, so a
- * future provider can plan or review while another implements.
+ * invocation (`--planner`, `--reviewer`) or by project configuration and
+ * recorded by provider ID; any provider can plan or review while another
+ * implements. There is no fallback: an unknown or unavailable provider is
+ * reported, never silently replaced.
  */
 export function createAiProviderRegistry(dependencies: AiProviderRegistryDependencies): AiProviderRegistry {
   return {

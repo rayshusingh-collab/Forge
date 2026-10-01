@@ -2,6 +2,7 @@ import type { ForgeConfig } from '../config/index.ts';
 import type { ProcessExecutor } from '../execution/index.ts';
 import type { Logger } from '../logging/index.ts';
 import { CLAUDE_CODE_WORKER_ID, ClaudeCodeWorker } from './claude-code/worker.ts';
+import { CODEX_WORKER_ID, CodexWorker } from './codex/worker.ts';
 import type { Worker } from './types.ts';
 
 export interface WorkerDescriptor {
@@ -33,6 +34,12 @@ const BUILT_IN: readonly (WorkerDescriptor & { readonly factory: WorkerFactory }
     displayName: 'Claude Code',
     factory: ({ config, runner, logger }) =>
       new ClaudeCodeWorker({ runner, executable: config.claudeExecutable, logger }),
+  },
+  {
+    id: CODEX_WORKER_ID,
+    aliases: ['codex-cli'],
+    displayName: 'Codex CLI',
+    factory: ({ config, runner, logger }) => new CodexWorker({ runner, executable: config.codexExecutable, logger }),
   },
 ];
 

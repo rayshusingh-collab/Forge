@@ -7,7 +7,7 @@ import { openStateStore } from '../../projects/index.ts';
 import type { LoadedProject } from '../../projects/index.ts';
 import { expectPositionals, parseCommandArgs, requireProject } from '../args.ts';
 import { formatEffectiveConfig } from '../control-format.ts';
-import { requireConfig } from '../runtime.ts';
+import { requireConfig, resolveRegistries } from '../runtime.ts';
 import { ExitCode } from '../types.ts';
 import type { CliCommand, CliContext, ExitCodeValue } from '../types.ts';
 
@@ -84,6 +84,9 @@ async function set(args: readonly string[], context: CliContext, project: Loaded
     throw new ProjectConfigError(describeUnknownKey(key));
   }
   const value = parseSettingValue(key, text);
+  if (key.startsWith('providers.')) {
+    assertKnownProvider(key, String(value), context);
+  }
   const { previous } = await new ProjectConfigStore(project.layout).set(key, value);
   await recordChange(project, 'config-set', `${key}: ${String(previous ?? 'default')} -> ${String(value)}`);
   context.stdout.write(`${key} = ${String(value)} (project override; was ${String(previous ?? 'the default')})\n`);
@@ -137,4 +140,19 @@ async function recordChange(project: LoadedProject, kind: 'config-set' | 'config
 function shown(value: unknown): string {
   const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
   return text.length <= 60 ? text : `${text.slice(0, 59)}…`;
+}
+
+/**
+ * A provider role must name a provider that the registry for that role
+ * knows (the implementer comes from the worker registry; the planner and
+ * reviewer from the AI-role registry). Availability is NOT required here
+ * (check it with `forge provider check`), but an unknown name is refused.
+ */
+function assertKnownProvider(key: string, name: string, context: CliContext): void {
+  const registries = resolveRegistries(context);
+  const registry = key === 'providers.implementer' ? registries.workers : registries.aiProviders;
+  if (registry.create(name) === undefined) {
+    const known = registry.list().flatMap((entry) => [entry.id, ...entry.aliases]);
+    throw new ProjectConfigError(`${key}: unknown provider "${name}" (known for this role: ${known.join(', ')})`);
+  }
 }

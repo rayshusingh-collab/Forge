@@ -2,6 +2,7 @@ import { tmpdir } from 'node:os';
 
 import { assertNotPaused } from '../control/pause.ts';
 import { IntegrityError } from '../core/errors.ts';
+import { redactSecrets, secretValues } from '../core/redaction.ts';
 import {
   describeIntegrityChanges,
   openStateStore,
@@ -170,8 +171,9 @@ async function finish<P>(
     status: result.outcome,
     finishedAt: clock().toISOString(),
     durationMs: result.durationMs,
-    summary: result.summary === null ? null : truncate(result.summary.trim(), WORKER_RUN_LIMITS.summary),
-    diagnostic: result.diagnostics[0] === undefined ? null : excerpt(result.diagnostics[0], WORKER_RUN_LIMITS.diagnostic),
+    // Provider text is persisted only after credential values from the environment are redacted.
+    summary: result.summary === null ? null : truncate(redact(result.summary.trim()), WORKER_RUN_LIMITS.summary),
+    diagnostic: result.diagnostics[0] === undefined ? null : excerpt(redact(result.diagnostics[0]), WORKER_RUN_LIMITS.diagnostic),
   };
 
   if (integrity.ok) {
@@ -280,4 +282,9 @@ function withRun(state: ProjectState, run: WorkerRunRecord): ProjectState {
   const excess = Math.max(0, manual.length - WORKER_RUN_LIMITS.retainedRuns);
   const dropped = new Set(manual.slice(0, excess).map((candidate) => candidate.id));
   return { ...state, workerRuns: runs.filter((candidate) => !dropped.has(candidate.id)) };
+}
+
+/** Replaces values of credential-like environment variables before provider text is stored. */
+function redact(text: string): string {
+  return redactSecrets(text, secretValues(process.env));
 }

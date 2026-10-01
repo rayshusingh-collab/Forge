@@ -73,6 +73,13 @@ Early development. Implemented so far:
 - typed project configuration (`.forge/config.json`, `forge config`) with documented precedence; provider health by role (`forge provider`); safe onboarding (`forge init`)
 - redacted, actionable error output; state schema v7 (migrated from v6)
 
+**Milestone 9 — Multi-Provider Execution**
+
+- **OpenAI Codex CLI** is a second first-class provider next to Claude Code, for every role: implementer, planner and reviewer
+- each role is chosen independently (`providers.implementer|planner|reviewer`); mixed configurations such as Claude planner → Codex implementer → Claude reviewer run through the same pipeline
+- provider health per role, no silent fallback, provider identity recorded in runs, plans, reviews and the audit
+- timeouts and Ctrl+C now terminate the whole process tree on Windows, so a provider's child processes cannot keep editing files
+
 Nothing autonomous happens unless you run `forge run`, and it does only what its printed policy allows. It never pushes.
 
 > **Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Orchestrator coordinates. Forge state machine decides. Human approves consequential exceptions.**
@@ -94,7 +101,9 @@ AI planner / worker / reviewer   (output is data; never authority)
 - **Node.js ≥ 22.18.0** (Node 24 LTS recommended). Development and tests run TypeScript directly via Node's built-in type stripping, which is enabled by default from 22.18.
 - npm (bundled with Node)
 - **Git** on `PATH` (required to register projects; the test suite creates temporary repositories)
-- **Claude Code** (verified with 2.1.x), installed and logged in with `claude auth login`. Required only to run the Claude worker; the automated tests use a fake CLI and never call Claude.
+- **Claude Code** (verified with 2.1.x), installed and logged in with `claude auth login`. Required only for roles that use Claude.
+- **OpenAI Codex CLI** (verified with codex-cli 0.157.0), installed and logged in with `codex login`. Required only for roles that use Codex.
+- The automated tests use fake CLIs and never call either provider.
 
 ## Installation
 
@@ -120,6 +129,7 @@ Forge reads configuration from environment variables. `npm run dev` and `npm sta
 | `FORGE_ENV`                | `development`, `production`, `test`  | `production` |
 | `FORGE_WORKER_TIMEOUT_MS`  | integer, 1 – 86400000                | `600000`     |
 | `FORGE_CLAUDE_EXECUTABLE`  | absolute path to Claude Code         | `claude` on `PATH` |
+| `FORGE_CODEX_EXECUTABLE`   | absolute path to the Codex CLI       | `codex` on `PATH` |
 
 Invalid values are reported together with a clear error; run `forge doctor` to check them.
 
@@ -270,6 +280,52 @@ Forge never uses `--dangerously-skip-permissions` or `bypassPermissions`, and ne
 - The worker cannot run commands, tests, builds, or Git. Running those is Forge's job, in later milestones.
 - Runs are read-only unless you pass `--allow-edits`.
 - If a task needs something the policy denies, the run still finishes, and Forge reports the denied tool requests.
+
+## Codex CLI provider
+
+Forge drives the OpenAI Codex CLI you already have installed and logged in, as an external process, exactly as it drives Claude Code. Forge never asks for, stores, forwards or prints OpenAI credentials, and has no login flow: authentication belongs to Codex (`codex login`).
+
+```sh
+forge provider check codex --role implementer
+forge config set providers.implementer codex      # or providers.planner / providers.reviewer
+```
+
+**How Forge runs it.** `codex exec --json` (non-interactive), with the prompt on stdin (`-`), never as an argument and never through a shell. Every invocation:
+
+| Setting | Why |
+| --- | --- |
+| `--ignore-user-config --ignore-rules` | Your `~/.codex/config.toml` can enable plugins, MCP servers, notify hooks and computer use; Forge inherits none of it and sets what it needs explicitly |
+| `--sandbox workspace-write` (edit) / `read-only` (read-only runs, planner, reviewer) | Codex's own sandbox: writes only inside the working directory |
+| `sandbox_workspace_write.network_access=false`, `exclude_tmpdir_env_var=true`, `exclude_slash_tmp=true` | No network; the temp directories are NOT writable (by default Codex allows writing there, outside the project) |
+| `approval_policy=never` | Codex never escalates out of the sandbox; refused actions just fail |
+| `windows.sandbox=unelevated` | Codex's Windows sandbox mode that needs no per-machine admin setup (without the user config, workspace writes would otherwise be impossible on Windows) |
+| `shell_environment_policy.inherit=core` | Commands the model runs get a minimal environment |
+| `--disable` apps, plugins, remote_plugin, browser_use, browser_use_external, computer_use, image_generation, in_app_browser, multi_agent, tool_suggest, skill_search, hooks, worktrees | High-risk features are off |
+| planner/reviewer additionally: `--disable shell_tool unified_exec view_image`, fresh empty temp directory | AI roles cannot run commands; they work only from the input Forge sends |
+| `--ephemeral --color never` | No saved session; plain output |
+
+Forge never passes `--dangerously-bypass-approvals-and-sandbox`, `danger-full-access`, `--approve-for-me`, `--search`, `--add-dir`, `--worktree`, `--remote` or `--oss`. Health checks (`forge provider check`, `forge doctor`) run only `codex --version`, `codex exec --help` (every option above must exist) and `codex login status` (only the logged-in verdict is used); they make no AI call and touch no project.
+
+**Differences from Claude, stated honestly.** The Codex implementer can run shell commands (tests, builds) inside its sandbox; the Claude implementer cannot run commands at all. Codex's sandbox restricts writes and network, not reads: a Codex worker can read files outside the project that your user account can read (the Claude worker's file tools are confined to the working directory). Codex has no separate system-prompt channel, so Forge's rules are placed first in the input, before the fenced task data. In both cases Forge's own guarantees do not depend on the provider: changes are attributed from Git, `.forge/` is integrity-checked, validation decides success, and only the safe-commit rules commit.
+
+**Output.** Forge parses Codex's JSONL events and keeps only the final agent message (the worker's summary, a claim), the thread ID, token counts, and counts of file changes and commands. A failed turn, a non-zero exit, a missing final message, non-JSON output or output over 8 MiB is never success. Codex reports no model identifier and no cost, so none is recorded.
+
+## Provider roles
+
+Forge has three AI roles and two providers. Each role is configured independently, with the M8 precedence (command line > project configuration > default `claude`):
+
+| Role | Setting | CLI option | Providers |
+| --- | --- | --- | --- |
+| implementer | `providers.implementer` | `--worker` | `claude` (Claude Code), `codex` |
+| planner | `providers.planner` | `--planner` | `claude`, `codex` |
+| reviewer | `providers.reviewer` | `--reviewer` | `claude`, `codex` |
+
+- `forge config set providers.<role> <name>` refuses names the role's registry does not know.
+- **Mixed providers are supported**: any combination runs through the same tasks, attempts, changeset attribution, validation, review, approvals and safe commit. The provider never changes Forge's workflow semantics.
+- **No fallback**: if the chosen provider is missing, logged out or unusable, preflight fails and `forge run` refuses (`forge task run` reports it); Forge never substitutes another provider.
+- **No ranking or routing**: Forge does not judge providers; the choice is yours.
+- **Identity**: worker runs record `claude-code` or `codex`; plans and reviews record their provider; `forge audit` shows the worker of every attempt. Model identifiers are recorded only if a provider reports one reliably (neither does today).
+- `forge provider list`, `forge status`, `forge run --dry-run` and the `forge run` header show which provider fills each role and where the choice came from.
 
 ## Milestones and tasks
 
@@ -558,7 +614,7 @@ Values outside the limits are **refused, never clamped**; there is no "0 means u
 
 **Status, explain, audit.** `forge status` is a concise operational view (pause, active run, current milestone, next task, blockers, interrupted tasks, approvals, last run, validation, Git, uncommitted succeeded tasks, providers, the human action required). `forge explain` says in plain language why Forge stopped (deterministic validation, AI review, repair policy, the related approval) and the next safe commands; it is built from stored records, never by an AI. `forge audit` is a chronological history derived from the authoritative records (plans, attempts, validation, reviews, commits, approvals, runs, human control events); there is no second log that could disagree.
 
-**Providers by role.** `forge provider list` shows the planner, implementer and reviewer and where each choice comes from; `forge provider check [--role r]` runs local health checks (no AI call). All roles are Claude-backed today; nothing assumes they stay that way or share a provider.
+**Providers by role.** `forge provider list` shows the planner, implementer and reviewer and where each choice comes from; `forge provider check [--role r]` runs local health checks (no AI call). Claude Code and Codex are both available for every role (see Provider roles).
 
 **Onboarding.** `forge init` registers the project (or preserves an existing registration), creates an empty configuration, and reports Git safety, validation checks and provider availability. It only *suggests* validation commands from `package.json` scripts; it never adds or runs them, never runs `git init`, never installs dependencies, and never starts a worker. `forge project add` is unchanged.
 
@@ -573,12 +629,16 @@ Values outside the limits are **refused, never clamped**; there is no "0 means u
 - **Control-state guard is detective, not preventive:** Claude's file tools are not blocked from `.forge/`, because Forge doesn't rely on unverified path-rule syntax. Instead, the guard described below detects any change. It does not prevent the change or undo it.
 - **Long edit runs block other writers:** while an edit-enabled run is in progress, other Forge processes cannot update that project's state; they fail with a lock conflict after 5 seconds.
 - **Prompt rules are advisory:** the rules Forge sends ("stay in scope, don't commit") are instructions to the model. What is actually enforced is the tool and permission set above, together with the working-directory confinement Claude applies.
-- **Worker environment:** the worker inherits Forge's environment variables. It has no tool that could read them.
+- **Worker environment:** workers inherit Forge's environment variables. The Claude worker has no tool that could read them; Codex's own model-run commands get only a minimal (`core`) environment, but the Codex process itself inherits Forge's.
+- **Codex reads:** Codex's sandbox restricts writes and network, not reads; a Codex worker or role could read files outside the project that your account can read (role runs cannot run commands, so they cannot read anything at all).
+- **Codex sandbox mode:** on Windows, Forge uses Codex's `unelevated` sandbox (no admin setup required), not the stronger `elevated` mode, which needs per-machine setup Forge cannot verify.
+- **Codex login status** reflects what `codex login status` reports; an expired token may only show up as a failed run (reported as `failed`, never success).
+- **Process-tree termination** on timeout/Ctrl+C is implemented for Windows (`taskkill /T`); on other platforms only the direct child is signalled.
 - **Interrupted manual runs:** a `forge worker run` interrupted by a crash (not by Ctrl+C) stays recorded as `running`. Task executions are detected as `interrupted` and recovered with `forge task recover`.
 - **Interruption detection is local:** Forge checks whether the recorded process ID is still alive on the same host. An executor on another host can't be checked (use `--force`), and a reused process ID could make a dead execution look alive.
 - **AI context is best-effort about secrets:** ignored files and secret-like paths are excluded, but a secret inside ordinary tracked source would be included.
 - **Concurrent edits during AI calls:** planning and review can't tell your concurrent edits from AI changes, so editing files during a call discards its result.
-- **No model identifier:** the Claude CLI's JSON output doesn't reliably report the model used, so none is recorded.
+- **No model identifier:** neither the Claude CLI's JSON result nor Codex's event stream reliably reports the model used, so none is recorded.
 - **Orchestration is sequential and local:** one task at a time, one implementer, one project per run. There are no worktrees, no parallelism, no background service, and no push.
 - **Manual commands during a run:** a manual `forge task …` command in another terminal is serialized by the state lock, not refused. The orchestrator re-reads state before every step and stops if it finds a task running elsewhere.
 - **Approvals stop at the first human-blocked task:** independent tasks are not run around a task waiting for a human decision.

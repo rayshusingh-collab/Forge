@@ -41,3 +41,18 @@ export type {
   WorkerRequest,
   WorkerResult,
 } from './types.ts';
+export {
+  CODEX_DISABLED_FEATURES,
+  CODEX_ROLE_DISABLED_FEATURES,
+  FORBIDDEN_CODEX_OPTIONS,
+  REQUIRED_CODEX_EXEC_OPTIONS,
+  buildCodexExecArgs,
+  findMissingCodexCapabilities,
+  parseCodexLoginStatus,
+  parseCodexVersion,
+} from './codex/command.ts';
+export type { CodexInvocation } from './codex/command.ts';
+export { parseCodexEvents } from './codex/output.ts';
+export type { CodexOutputParse, CodexRunReport } from './codex/output.ts';
+export { CODEX_EXECUTABLE_NAME, CODEX_MAX_OUTPUT_BYTES, CODEX_WORKER_ID, CodexWorker, checkCodexCapabilities, interpretCodexRun } from './codex/worker.ts';
+export type { CodexWorkerOptions } from './codex/worker.ts';

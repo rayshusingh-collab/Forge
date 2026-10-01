@@ -34,6 +34,7 @@ export function deriveAudit(state: ProjectState, view: WorkflowView): AuditEvent
       add(plan.decidedAt, `plan ${plan.status}`, `plan ${plan.id.slice(0, 8)}`, plan.reason ?? 'by a human');
     }
   }
+  const runs = new Map(state.workerRuns.map((run) => [run.id, run]));
   for (const task of state.tasks) {
     for (const attempt of task.attempts) {
       const origin =
@@ -42,7 +43,8 @@ export function deriveAudit(state: ProjectState, view: WorkflowView): AuditEvent
           : attempt.origin.repair === null
             ? `run ${attempt.origin.runId.slice(0, 8)}`
             : `run ${attempt.origin.runId.slice(0, 8)}, repair ${attempt.origin.repair.number} (${attempt.origin.repair.trigger})`;
-      add(attempt.startedAt, 'attempt started', `${key(task.id)} #${attempt.number}`, origin);
+      const worker = runs.get(attempt.runId)?.worker ?? 'unknown worker';
+      add(attempt.startedAt, 'attempt started', `${key(task.id)} #${attempt.number}`, `${origin}; worker ${worker}`);
       add(
         attempt.finishedAt,
         'attempt finished',

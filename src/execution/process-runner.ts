@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { stat } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 import { ValidationError } from '../core/errors.ts';
@@ -165,7 +165,15 @@ export class ProcessRunner implements ProcessExecutor {
           return;
         }
         terminationReason = reason;
-        child.kill('SIGTERM');
+        if (process.platform === 'win32' && child.pid !== undefined) {
+          // Windows does not signal descendants: an agent CLI's own child processes (e.g. the
+          // shell commands a Codex worker runs) would survive and keep changing files after
+          // Forge recorded the outcome. Terminate the whole tree FIRST — taskkill can only
+          // find descendants while the root is still alive — then the direct kill follows.
+          void killProcessTree(child.pid).then(() => child.kill('SIGTERM'));
+        } else {
+          child.kill('SIGTERM');
+        }
         timers.push(
           setTimeout(() => {
             child.kill('SIGKILL');
@@ -284,3 +292,31 @@ function toSpawnFailure(error: unknown): ProcessSpawnFailure {
   }
   return { message: String(error), code: undefined };
 }
+
+/**
+ * Terminates a process and all of its descendants on Windows using the
+ * system's own `taskkill` (fixed absolute path, fixed arguments, no shell).
+ * Resolves when taskkill has finished (or after a short bound); best effort,
+ * because the direct kill and the SIGKILL backstop still follow.
+ */
+function killProcessTree(pid: number): Promise<void> {
+  const systemRoot = process.env['SystemRoot'] ?? process.env['SYSTEMROOT'] ?? 'C:\\Windows';
+  return new Promise((resolve) => {
+    const done = (): void => resolve();
+    try {
+      const killer = spawn(join(systemRoot, 'System32', 'taskkill.exe'), ['/PID', String(pid), '/T', '/F'], {
+        shell: false,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      killer.once('error', done);
+      killer.once('exit', done);
+      setTimeout(done, TREE_KILL_BOUND_MS).unref();
+    } catch {
+      done();
+    }
+  });
+}
+
+/** Upper bound on waiting for taskkill before the direct kill proceeds anyway. */
+const TREE_KILL_BOUND_MS = 5_000;

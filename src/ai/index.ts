@@ -1,4 +1,6 @@
 export { ClaudeCodeAiProvider } from './claude-provider.ts';
+export { CodexAiProvider } from './codex-provider.ts';
+export type { CodexAiProviderOptions } from './codex-provider.ts';
 export type { ClaudeCodeAiProviderOptions } from './claude-provider.ts';
 export { DATA_RULES, dataBlock } from './envelope.ts';
 export { runReadOnly } from './read-only-guard.ts';

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { WorkflowError } from '../core/errors.ts';
+import { redactSecrets, secretValues } from '../core/redaction.ts';
 import { assertNotPaused } from '../control/pause.ts';
 import { runReadOnly } from '../ai/read-only-guard.ts';
 import type { AiProvider } from '../ai/types.ts';
@@ -100,7 +101,7 @@ export async function reviewTask(options: ReviewTaskOptions): Promise<ReviewTask
         findings: [],
         call: response.call,
         context: packet.summary,
-        diagnostic: parsed.diagnostic.slice(0, AI_LIMITS.diagnostic),
+        diagnostic: redactSecrets(parsed.diagnostic, secretValues(process.env)).slice(0, AI_LIMITS.diagnostic),
         createdAt: clock().toISOString(),
         decision: null,
       };

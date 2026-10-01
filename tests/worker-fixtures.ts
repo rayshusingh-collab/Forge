@@ -19,8 +19,13 @@ import { TempDirs, initGitRepo, testRunner } from './fixtures.ts';
 const FAKE_CLAUDE_SOURCE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
 
 export interface FakeClaudeConfig {
-  readonly mode?: 'success' | 'error' | 'garbage' | 'crash' | 'sleep' | 'flood';
+  readonly mode?: 'success' | 'error' | 'garbage' | 'crash' | 'sleep' | 'flood' | 'write';
   readonly result?: string;
+  /** Files the fake worker writes in `write` mode (relative to its working directory). */
+  readonly writes?: Readonly<Record<string, string>>;
+  /** Answers for the AI roles (selected by the system prompt). */
+  readonly plannerResult?: string;
+  readonly reviewerResult?: string;
   readonly version?: string;
   readonly help?: string;
   readonly loggedIn?: boolean;

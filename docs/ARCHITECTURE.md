@@ -94,7 +94,7 @@ User Goal
 
 &#x20;      │
 
-&#x20;      └──────── Future Codex Worker
+&#x20;      └──────── Codex Worker (Milestone 9)
 
 &#x20;                    │
 
@@ -439,6 +439,30 @@ Implemented (Milestone 3): `src/workers/` defines `Worker` (`id`, `capabilities`
 
 
 Executables are resolved to absolute programs before spawning (`src/execution/executable-resolver.ts`). Windows npm `.cmd` launchers are unwrapped to the program they wrap, so no shell is ever needed.
+
+
+
+Implemented (Milestone 9, `src/workers/codex/`, `src/ai/codex-provider.ts`): the OpenAI Codex CLI is the second provider, for every role. It proves the abstraction is real:
+
+- **Registration only.** `CodexWorker` (implementer) and `CodexAiProvider` (planner, reviewer) register in the existing worker and AI-provider registries. Nothing in orchestration, planning, review, task execution or the CLI checks which provider is in use: higher layers ask a registry for the role's configured provider (`providers.<role>`, `--worker`, `--planner`, `--reviewer`).
+- **Invocation.** The adapter runs `codex exec --json` with the prompt on stdin. It ignores the user's Codex config (`--ignore-user-config --ignore-rules`) so no plugin, MCP server or hook is inherited, and sets the safety it needs explicitly:
+  - sandbox `workspace-write` for edits, `read-only` otherwise;
+  - network off;
+  - temp directories excluded from writable roots;
+  - `approval_policy=never`;
+  - `windows.sandbox=unelevated`;
+  - a minimal command environment;
+  - high-risk features disabled.
+
+  AI roles also disable command execution and run in an empty scratch directory.
+- **Output.** The JSONL event stream is normalized into the same `WorkerResult` / `AiResponse` shapes as Claude's JSON. Role answers then pass the same strict plan and review decoders.
+- **Health.** Health comes from `--version`, `exec --help` capability detection and `login status`, so Forge never handles credentials.
+- **No fallback.** An unknown name is refused by `forge config set`; an unavailable provider fails preflight and stops the run; no other provider is substituted.
+- **Known differences.** The Codex worker can run sandboxed commands and can read outside the project. Codex has no system-prompt channel, so the rules are placed first in the input. Forge's own guarantees (attribution, integrity, validation, safe commit, approvals) are provider-independent and unchanged.
+
+
+
+Implemented (Milestone 9, `src/execution/process-runner.ts`): on Windows, a timeout or cancellation terminates the child's whole process tree (`taskkill /T /F`, fixed absolute program, no shell) before killing the child itself, so an agent CLI's descendants (e.g. the commands a Codex worker runs) cannot keep changing files after Forge records the outcome.
 
 
 
