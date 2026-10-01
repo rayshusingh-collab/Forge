@@ -6,6 +6,9 @@ export { FAILED_ATTEMPT_OUTCOMES, checkWorkflowInvariants, runStatusForAttempt, 
 export { decodeOrchestrationPolicy } from './orchestration-schema.ts';
 export { decodePlanDocument } from './plan-schema.ts';
 export {
+  AI_DECISION_EFFECTS,
+  AI_DECISION_STATUSES,
+  AI_DECISION_VERDICTS,
   AI_LIMITS,
   APPROVAL_DECISIONS,
   APPROVAL_LIMITS,
@@ -17,7 +20,10 @@ export {
   ORCHESTRATION_LIMITS,
   ORCHESTRATION_RUN_MODES,
   ORCHESTRATION_RUN_STATUSES,
+  FINDING_ASSESSMENTS,
+  REMEDIATION_STATUSES,
   REPAIR_TRIGGERS,
+  REQUIREMENT_ASSESSMENTS,
   REVIEW_CONCERN_POLICIES,
   REVIEW_DECIDERS,
   REVIEW_FAILURE_POLICIES,
@@ -48,6 +54,16 @@ export {
 } from './model.ts';
 export type {
   AiCallMetadata,
+  AiDecisionEffect,
+  AiDecisionRecord,
+  AiDecisionStatus,
+  AiDecisionVerdict,
+  FindingAssessment,
+  FindingAssessmentStatus,
+  RemediationRecord,
+  RemediationStatus,
+  RequirementAssessment,
+  RequirementAssessmentStatus,
   ApprovalDecision,
   ApprovalRecord,
   ApprovalResolution,
@@ -114,7 +130,7 @@ export type {
   WorkerRunStatus,
   WorkerRunTrigger,
 } from './model.ts';
-export { STATE_MIGRATIONS, decodeFinding, decodeProjectState } from './schema.ts';
+export { STATE_MIGRATIONS, decodeFinding, decodeProjectState, remediationIdFor } from './schema.ts';
 export { DEFAULT_LOCK_TIMEOUT_MS, StateStore } from './state-store.ts';
 export type { StateLease, StateStoreOptions } from './state-store.ts';
 export { UnsupportedVersionError, readSchemaVersion, upgradeDocument } from './versioning.ts';

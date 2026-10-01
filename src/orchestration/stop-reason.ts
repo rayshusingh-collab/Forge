@@ -78,6 +78,16 @@ export const STOP_REASON_INFO: Readonly<Record<StopReason, StopReasonInfo>> = {
     category: 'human',
     action: 'Check the reviewer (`forge doctor`), then run `forge run` again, or `forge task review <task>` yourself.',
   },
+  'decision-escalated': {
+    label: 'AI DECISION ESCALATED — HUMAN DECISION REQUIRED',
+    category: 'human',
+    action: 'Read the escalation (`forge task review-show <task>`), then decide: `forge task review-accept <task> --reason "..."` or `forge task review-reject <task> --reason "..."` (or the pending approval).',
+  },
+  'decision-maker-unavailable': {
+    label: 'DECISION-MAKER UNAVAILABLE — HUMAN DECISION REQUIRED',
+    category: 'human',
+    action: 'The AI decision-maker gave no usable answer (never treated as acceptance). Decide the review yourself (`forge task review-accept|review-reject <task>`), or check the provider (`forge provider check --role decision-maker`) and run again.',
+  },
   'commit-refused': {
     label: 'COMMIT REFUSED',
     category: 'human',

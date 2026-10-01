@@ -39,7 +39,7 @@ export function buildRepairEvidence(
     `Repair of task "${task.title}" after attempt ${fromAttempt}.`,
     trigger === 'validation'
       ? 'Why: Forge ran the project\'s required deterministic checks on the previous attempt and they did not pass.'
-      : 'Why: an AI review of the previous attempt reported blocking concerns, and remediation was decided.',
+      : 'Why: an AI review of the previous attempt reported concerns, and remediation was decided.',
     '',
   ];
   let summary: string;
@@ -96,7 +96,7 @@ function reviewLines(review: TaskReview | undefined): string[] {
   }
   const lines = [`Review status (derived by Forge from finding severities): ${review.status}`];
   if (review.decision !== null) {
-    lines.push(`Remediation decided by ${review.decision.by === 'human' ? 'a human' : 'Forge orchestration policy'}: ${review.decision.reason}`);
+    lines.push(`Remediation decided by ${review.decision.by === 'human' ? 'a human' : review.decision.by === 'ai' ? 'the AI decision-maker' : 'Forge orchestration policy'}: ${review.decision.reason}`);
   }
   lines.push('Findings (the reviewer\'s opinion, not verified facts):');
   for (const finding of review.findings) {

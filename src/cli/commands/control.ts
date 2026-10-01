@@ -5,7 +5,10 @@ import { deriveAudit, explain, pauseProject, resumeProject, runPreflight, withKe
 import { describeStop, previewRun, resolvePolicy } from '../../orchestration/index.ts';
 import { openStateStore } from '../../projects/index.ts';
 import type { LoadedProject } from '../../projects/index.ts';
+import type { ProjectSettings } from '../../config/index.ts';
+import type { OrchestrationPolicy, ProjectState } from '../../state/index.ts';
 import { acceptedWork, deriveWorkflow } from '../../tasks/index.ts';
+import type { WorkflowView } from '../../tasks/index.ts';
 import { booleanOption, expectPositionals, parseCommandArgs, requireProject, stringOption } from '../args.ts';
 import { formatAudit, formatPreflight, preflightSummary } from '../control-format.ts';
 import { createRunner, loadProjectSettings, requireConfig, resolveRegistries } from '../runtime.ts';
@@ -152,6 +155,8 @@ export const statusCommand = projectCommand(
       `Validation:       ${check('validation')?.detail ?? '?'}`,
       `Git:              ${check('git')?.detail ?? '?'}`,
       `Uncommitted done: ${uncommitted.length === 0 ? 'none' : uncommitted.map((task) => task.key).join(', ')}`,
+      `Auto-decision:    ${describeAutoDecision(report.config.settings, run?.policy ?? null)}`,
+      `Remediation:      ${describeOpenRemediation(state, view)}`,
     );
     for (const role of report.checks.filter((candidate) => candidate.id.startsWith('provider-'))) {
       lines.push(`${`${role.title}:`.padEnd(18)}${role.status === 'pass' ? '' : `${role.status.toUpperCase()} `}${role.detail}`);
@@ -201,3 +206,21 @@ export const auditCommand = projectCommand(
     return ExitCode.Success;
   },
 );
+
+/** Whether auto-decision is configured for the project and was active in the last run. */
+function describeAutoDecision(settings: ProjectSettings, lastRun: OrchestrationPolicy | null): string {
+  const configured = settings['run.autoDecide'] === true;
+  const provider = typeof settings['providers.decisionMaker'] === 'string' ? settings['providers.decisionMaker'] : 'claude';
+  const last = lastRun === null ? 'no run yet' : lastRun.decision.enabled ? `ACTIVE in the last run (${lastRun.decision.provider})` : 'off in the last run';
+  return `${configured ? `configured ON (run.autoDecide; decision-maker ${provider})` : 'not configured (enable with forge run --auto-decide)'}; ${last}`;
+}
+
+/** Tasks with remediation that a later review decision has not yet accepted. */
+function describeOpenRemediation(state: ProjectState, view: WorkflowView): string {
+  const open = state.remediations.filter((remediation) => remediation.status === 'open');
+  if (open.length === 0) {
+    return 'none open';
+  }
+  const keys = [...new Set(open.map((remediation) => view.task(remediation.taskId)?.key ?? remediation.taskId.slice(0, 8)))];
+  return `${open.length} open on task(s) ${keys.join(', ')} (forge task show <task>)`;
+}

@@ -26,6 +26,8 @@ export interface FakeClaudeConfig {
   /** Answers for the AI roles (selected by the system prompt). */
   readonly plannerResult?: string;
   readonly reviewerResult?: string;
+  /** Answer of the AI decision-maker role. */
+  readonly decisionResult?: string;
   readonly version?: string;
   readonly help?: string;
   readonly loggedIn?: boolean;

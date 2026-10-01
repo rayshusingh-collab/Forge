@@ -1,6 +1,7 @@
 import { ObjectReader, SchemaViolation, isPlainObject } from '../core/validation.ts';
 import { checkWorkflowInvariants } from './invariants.ts';
 import { decodeApproval, decodeControlEvent, decodePause } from './control-schema.ts';
+import { decodeAiDecision, decodeRemediation } from './decision-schema.ts';
 import { decodeAttemptOrigin, decodeOrchestrationRun } from './orchestration-schema.ts';
 import { decodePlanDocument } from './plan-schema.ts';
 import {
@@ -185,7 +186,80 @@ export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
       return { ...task, humanRepair: null };
     }),
   }),
+  // 8 -> 9: auto-decision. No AI decision existed before. Every existing
+  // remediation decision becomes a structured remediation record (its reason
+  // is the requirement), satisfied when a later review of the task was
+  // accepted. Stored policies gain a disabled `decision` section and run
+  // counters a zero `decisions` count; nothing else changes.
+  8: (document) => {
+    for (const field of ['remediations', 'aiDecisions']) {
+      if (Object.hasOwn(document, field)) {
+        throw new SchemaViolation(field, 'is not a recognised field in schema version 8');
+      }
+    }
+    const reviews = arrayOfObjects(document['taskReviews'], 'taskReviews').map((review, index) => {
+      const decision = review['decision'];
+      if (decision === null || decision === undefined) {
+        return review;
+      }
+      if (typeof decision !== 'object' || Array.isArray(decision) || Object.hasOwn(decision, 'aiDecisionId')) {
+        throw new SchemaViolation(`taskReviews[${index}].decision`, 'is not a schema version 8 review decision');
+      }
+      return { ...review, decision: { ...decision, aiDecisionId: null } };
+    });
+    return {
+      ...document,
+      schemaVersion: 9,
+      taskReviews: reviews,
+      remediations: migratedRemediations(reviews),
+      aiDecisions: [],
+      orchestrationRuns: arrayOfObjects(document['orchestrationRuns'], 'orchestrationRuns').map((run, index) => {
+        const policy = run['policy'];
+        const counters = run['counters'];
+        if (!isPlainObject(policy) || !isPlainObject(counters) || Object.hasOwn(policy, 'decision') || Object.hasOwn(counters, 'decisions')) {
+          throw new SchemaViolation(`orchestrationRuns[${index}]`, 'is not a schema version 8 orchestration run');
+        }
+        const review = isPlainObject(policy['review']) ? policy['review'] : {};
+        return {
+          ...run,
+          policy: { ...policy, decision: { enabled: false, provider: null, timeoutMs: review['timeoutMs'] ?? policy['workerTimeoutMs'] } },
+          counters: { ...counters, decisions: 0 },
+        };
+      }),
+    };
+  },
 };
+
+/** Version 9 remediation records for the remediation decisions a version 8 document already holds. */
+function migratedRemediations(reviews: readonly Record<string, unknown>[]): Record<string, unknown>[] {
+  const decided = reviews.filter((review) => isPlainObject(review['decision']));
+  return decided
+    .filter((review) => (review['decision'] as Record<string, unknown>)['kind'] === 'remediation-required')
+    .map((review) => {
+      const decision = review['decision'] as Record<string, unknown>;
+      const resolver = decided.find((candidate) => {
+        const kind = (candidate['decision'] as Record<string, unknown>)['kind'];
+        return candidate['taskId'] === review['taskId'] && kind === 'accepted' && Number(candidate['attempt']) > Number(review['attempt']);
+      });
+      return {
+        id: remediationIdFor(String(review['id'])),
+        taskId: review['taskId'],
+        fromAttempt: review['attempt'],
+        reviewId: review['id'],
+        source: decision['by'],
+        requirements: [decision['reason']],
+        createdAt: decision['decidedAt'],
+        status: resolver === undefined ? 'open' : 'satisfied',
+        resolvedAt: resolver === undefined ? null : (resolver['decision'] as Record<string, unknown>)['decidedAt'],
+        resolvedByReviewId: resolver === undefined ? null : resolver['id'],
+      };
+    });
+}
+
+/** One remediation per remediation-required review decision, so its ID derives from the review's. */
+export function remediationIdFor(reviewId: string): string {
+  return `rem-${reviewId}`.slice(0, 64);
+}
 
 function arrayOfObjects(value: unknown, path: string): Record<string, unknown>[] {
   if (!Array.isArray(value)) {
@@ -220,6 +294,8 @@ export function decodeProjectState(raw: unknown): ProjectState {
     'approvals',
     'pause',
     'controlEvents',
+    'remediations',
+    'aiDecisions',
     'createdAt',
     'updatedAt',
   ]);
@@ -241,6 +317,8 @@ export function decodeProjectState(raw: unknown): ProjectState {
     approvals: r.array('approvals', decodeApproval, APPROVAL_LIMITS.retained),
     pause: r.nullable('pause', decodePause),
     controlEvents: r.array('controlEvents', decodeControlEvent, CONTROL_LIMITS.retainedEvents),
+    remediations: r.array('remediations', decodeRemediation, 20_000),
+    aiDecisions: r.array('aiDecisions', decodeAiDecision, 20_000),
     createdAt: r.timestamp('createdAt'),
     updatedAt: r.timestamp('updatedAt'),
   };
@@ -555,7 +633,7 @@ function decodeMapping(value: unknown, path: string): PlanMapping {
   return { proposalId: r.string('proposalId', { maxLength: 32 }), forgeId: r.id('forgeId') };
 }
 
-function decodeCallMetadata(value: unknown, path: string): AiCallMetadata {
+export function decodeCallMetadata(value: unknown, path: string): AiCallMetadata {
   const r = new ObjectReader(value, path, ['provider', 'model', 'durationMs', 'costUsd', 'inputTokens', 'outputTokens']);
   return {
     provider: r.string('provider', NAME_RULES),
@@ -567,7 +645,7 @@ function decodeCallMetadata(value: unknown, path: string): AiCallMetadata {
   };
 }
 
-function decodeContextSummary(value: unknown, path: string): ContextSummary {
+export function decodeContextSummary(value: unknown, path: string): ContextSummary {
   const r = new ObjectReader(value, path, ['files', 'bytes', 'truncated']);
   return { files: r.integer('files', { min: 0 }), bytes: r.integer('bytes', { min: 0 }), truncated: r.field('truncated', decodeBoolean) };
 }
@@ -622,13 +700,18 @@ export function decodeFinding(value: unknown, path: string): ReviewFinding {
 }
 
 function decodeReviewDecision(value: unknown, path: string): ReviewDecision {
-  const r = new ObjectReader(value, path, ['kind', 'reason', 'decidedAt', 'by']);
-  return {
+  const r = new ObjectReader(value, path, ['kind', 'reason', 'decidedAt', 'by', 'aiDecisionId']);
+  const decision: ReviewDecision = {
     kind: r.oneOf('kind', REVIEW_DECISIONS),
     reason: r.string('reason', { maxLength: AI_LIMITS.reason }),
     decidedAt: r.timestamp('decidedAt'),
     by: r.oneOf('by', REVIEW_DECIDERS),
+    aiDecisionId: r.nullableId('aiDecisionId'),
   };
+  if ((decision.by === 'ai') !== (decision.aiDecisionId !== null)) {
+    throw new SchemaViolation(`${path}.aiDecisionId`, 'must be set exactly when the AI decision-maker decided');
+  }
+  return decision;
 }
 
 function decodeOneOfValue<T extends string>(value: unknown, path: string, allowed: readonly T[]): T {

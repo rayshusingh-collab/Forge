@@ -116,8 +116,21 @@ export function formatReview(review: TaskReview, state: ProjectState): string {
       lines.push(`      remediation: ${finding.remediation.replace(/\s+/g, ' ').slice(0, 300)}`);
     }
   }
+  for (const decision of state.aiDecisions.filter((candidate) => candidate.reviewId === review.id)) {
+    const answer = decision.status === 'decided' ? `${decision.verdict}, ${decision.confidence} confidence` : `no usable answer (${decision.status})`;
+    lines.push(`  AI decision ${decision.id.slice(0, 8)} (${decision.call.provider}): ${decision.effect.toUpperCase()} — ${answer}`);
+    for (const [label, text] of [['reason', decision.reason], ['Forge rule', decision.policyNote], ['needs a human because', decision.humanReason], ['problem', decision.diagnostic]] as const) {
+      if (text !== null) {
+        lines.push(`      ${label}: ${text.replace(/s+/g, ' ').slice(0, 400)}`);
+      }
+    }
+    for (const action of decision.requiredActions) {
+      lines.push(`      required: ${action.replace(/s+/g, ' ').slice(0, 300)}`);
+    }
+  }
   if (review.decision !== null) {
-    lines.push(`  Human decision: ${review.decision.kind} — ${review.decision.reason} (${review.decision.decidedAt})`);
+    const who = review.decision.by === 'human' ? 'Human decision' : review.decision.by === 'ai' ? 'AI decision applied' : 'Policy decision';
+    lines.push(`  ${who}: ${review.decision.kind} — ${review.decision.reason} (${review.decision.decidedAt})`);
   } else if (['clear', 'concerns', 'blocking-concerns'].includes(review.status)) {
     const key = view?.key ?? review.taskId;
     lines.push(`  Advisory only. Decide with: forge task review-accept ${key} --reason "..."   or   forge task review-reject ${key} --reason "..." (reopens the task)`);

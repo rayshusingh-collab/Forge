@@ -13,7 +13,7 @@ import { deriveWorkflow, processLiveness } from '../tasks/index.ts';
 import type { ExecutorLiveness } from '../tasks/index.ts';
 import { ValidationProfileStore } from '../validation/index.ts';
 import { checkRole } from './providers.ts';
-import type { Registries } from './providers.ts';
+import type { ProviderRole, Registries } from './providers.ts';
 
 /**
  * Preflight: one read-only health report for a project, used by
@@ -57,7 +57,7 @@ export interface PreflightOptions {
   readonly project: LoadedProject;
   readonly store: StateStore;
   readonly runner: ProcessExecutor;
-  /** When given, provider checks cover the roles this policy uses (reviewer only if review is enabled). */
+  /** When given, provider checks cover the roles this policy uses (reviewer / decision-maker only when enabled). */
   readonly policy?: OrchestrationPolicy;
   /** Omit to skip provider checks (e.g. when no process should be launched). */
   readonly registries?: Registries;
@@ -260,11 +260,17 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
   // Providers.
   if (options.registries !== undefined && config !== null) {
     const settings = config.settings;
-    const roles: { role: 'implementer' | 'reviewer' | 'planner'; override?: string; critical: boolean }[] = [
+    const roles: { role: ProviderRole; override?: string; critical: boolean }[] = [
       { role: 'implementer', ...(options.policy === undefined ? {} : { override: options.policy.worker }), critical: true },
     ];
     if (options.policy === undefined || options.policy.review.enabled) {
       roles.push({ role: 'reviewer', ...(options.policy?.review.reviewer == null ? {} : { override: options.policy.review.reviewer }), critical: options.policy !== undefined });
+    }
+    // A run with auto-decision needs its decision-maker; there is no fallback to another provider.
+    if (options.policy?.decision.enabled === true) {
+      roles.push({ role: 'decision-maker', override: options.policy.decision.provider!, critical: true });
+    } else if (options.policy === undefined && settings['run.autoDecide'] === true) {
+      roles.push({ role: 'decision-maker', critical: false });
     }
     if (options.policy === undefined) {
       roles.push({ role: 'planner', critical: false });
@@ -278,7 +284,7 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
       }));
       add({
         id: `provider-${role.role}`,
-        title: `${role.role[0]!.toUpperCase()}${role.role.slice(1)}`,
+        title: role.role === 'decision-maker' ? 'Decision-maker' : `${role.role[0]!.toUpperCase()}${role.role.slice(1)}`,
         status: health.available ? 'pass' : role.critical ? 'fail' : 'warn',
         detail: `${health.configured}: ${health.detail}`,
         action: health.available ? null : `Check it with \`forge provider check --role ${role.role}\` and \`forge doctor\``,

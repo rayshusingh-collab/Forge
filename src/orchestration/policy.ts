@@ -40,6 +40,9 @@ export interface PolicyOptions {
   readonly reviewTimeoutMs?: number;
   readonly continueOnConcerns?: boolean;
   readonly continueWithoutReview?: boolean;
+  readonly autoDecide?: boolean;
+  readonly decisionMaker?: string;
+  readonly decisionTimeoutMs?: number;
   readonly autoCommit?: boolean;
 }
 
@@ -53,6 +56,7 @@ export const ALWAYS_STOP_CONDITIONS: readonly string[] = [
   'task awaiting manual validation (validation is never overridden automatically)',
   'failed worker invocation, or repair budget / attempts exhausted',
   'unresolved merge conflicts or other unsafe Git state',
+  'AI decision-maker escalation, low confidence, malformed output, or unavailability (never treated as acceptance)',
   'commit refused by the safe-commit rules (e.g. mixed attribution)',
   'provider unavailable when no safe continuation exists',
   'workflow complete, limit reached, or Ctrl+C',
@@ -70,6 +74,14 @@ export function buildPolicy(options: PolicyOptions, defaults: { readonly workerT
   if (repairOnBlockingReview && !reviewEnabled) {
     throw new ValidationError('Review-driven repair requires AI review to be enabled (--review)');
   }
+  // An explicit auto-decide choice wins; naming a decision-maker alone enables it.
+  const decisionEnabled = options.autoDecide ?? options.decisionMaker !== undefined;
+  if (decisionEnabled && !reviewEnabled) {
+    throw new ValidationError('Auto-decision judges AI reviews, so it requires AI review to be enabled (--review)');
+  }
+  if (decisionEnabled && (maxPerTask === 0)) {
+    throw new ValidationError('Auto-decision rejections are repaired automatically, so the repair budget must be at least 1');
+  }
   const candidate = {
     maxTasks: options.maxTasks ?? POLICY_DEFAULTS.maxTasks,
     maxSteps: options.maxSteps ?? POLICY_DEFAULTS.maxSteps,
@@ -83,6 +95,11 @@ export function buildPolicy(options: PolicyOptions, defaults: { readonly workerT
       timeoutMs: options.reviewTimeoutMs ?? defaults.workerTimeoutMs,
       onConcerns: options.continueOnConcerns === true ? 'continue' : 'stop',
       onFailure: options.continueWithoutReview === true ? 'continue' : 'stop',
+    },
+    decision: {
+      enabled: decisionEnabled,
+      provider: decisionEnabled ? (options.decisionMaker ?? 'claude') : null,
+      timeoutMs: options.decisionTimeoutMs ?? options.reviewTimeoutMs ?? defaults.workerTimeoutMs,
     },
     autoCommit: options.autoCommit ?? false,
   };
@@ -111,6 +128,9 @@ export function policyOptionsFromProject(settings: ProjectSettings): PolicyOptio
   const map: readonly (readonly [keyof ProjectSettings, keyof PolicyOptions, (value: unknown) => unknown])[] = [
     ['providers.implementer', 'worker', (value) => value],
     ['providers.reviewer', 'reviewer', (value) => value],
+    ['providers.decisionMaker', 'decisionMaker', (value) => value],
+    ['run.autoDecide', 'autoDecide', (value) => value],
+    ['run.decisionTimeoutSeconds', 'decisionTimeoutMs', (value) => (value as number) * 1000],
     ['run.allowEdits', 'access', (value) => (value === true ? 'edit' : 'read-only')],
     ['run.maxTasks', 'maxTasks', (value) => value],
     ['run.maxSteps', 'maxSteps', (value) => value],
@@ -136,7 +156,8 @@ export function policyOptionsFromProject(settings: ProjectSettings): PolicyOptio
 /**
  * Applies the precedence rules. A reviewer named only in the project
  * configuration never enables review by itself; `run.review` (or --review)
- * does. The hard limits are enforced last, by `buildPolicy`, whatever the source.
+ * does. Likewise a decision-maker named only there never enables
+ * auto-decision; `run.autoDecide` (or --auto-decide) does. The hard limits are enforced last, by `buildPolicy`, whatever the source.
  */
 export function resolvePolicy(cli: PolicyOptions, project: ProjectSettings, defaults: { readonly workerTimeoutMs: number }): PolicyResolution {
   const fromProject = policyOptionsFromProject(project);
@@ -153,6 +174,9 @@ export function resolvePolicy(cli: PolicyOptions, project: ProjectSettings, defa
   }
   if (merged['review'] === undefined && sources.reviewer === 'project') {
     merged['review'] = false;
+  }
+  if (merged['autoDecide'] === undefined && sources.decisionMaker === 'project') {
+    merged['autoDecide'] = false;
   }
   return { policy: buildPolicy(merged as PolicyOptions, defaults), sources };
 }
@@ -186,6 +210,9 @@ export function describePolicy(policy: OrchestrationPolicy): string[] {
   const review = policy.review.enabled
     ? `enabled (reviewer ${policy.review.reviewer}, ${seconds(policy.review.timeoutMs)}); concerns: ${policy.review.onConcerns === 'stop' ? 'stop for a human' : 'continue'}; review unavailable: ${policy.review.onFailure === 'stop' ? 'stop' : 'continue unreviewed'}`
     : 'disabled';
+  const decision = policy.decision.enabled
+    ? `ENABLED (decision-maker ${policy.decision.provider}, ${seconds(policy.decision.timeoutMs)}): judges reviews that would stop for a human; accept needs high confidence and evidence, otherwise escalates`
+    : 'disabled (review decisions stop for a human)';
   return [
     `Implementer:   ${policy.worker} (${policy.access === 'edit' ? 'edit — MAY MODIFY FILES' : 'read-only'}, timeout ${seconds(policy.workerTimeoutMs)})`,
     `Max tasks:     ${policy.maxTasks}`,
@@ -193,6 +220,7 @@ export function describePolicy(policy: OrchestrationPolicy): string[] {
     `Repairs:       ${repairs}`,
     `AI review:     ${review}`,
     `Clean review required: ${requiresCleanReview(policy) ? 'yes' : 'no'}`,
+    `Auto-decision: ${decision}`,
     `Auto-commit:   ${policy.autoCommit ? 'enabled (local only, safe-commit rules; never pushes)' : 'disabled'}`,
     'Push:          never',
   ];

@@ -96,6 +96,6 @@ export function formatEffectiveConfig(settings: readonly EffectiveSetting[]): st
 
 export function formatRoleHealth(roles: readonly RoleHealth[]): string {
   return `${roles
-    .map((role) => `  [${role.available ? 'PASS' : 'FAIL'}] ${role.role.padEnd(11)}  ${role.configured} (${role.source})${role.providerId === null ? '' : ` → ${role.providerId}`}: ${role.detail}`)
+    .map((role) => `  [${role.available ? 'PASS' : 'FAIL'}] ${role.role.padEnd(14)}  ${role.configured} (${role.source})${role.providerId === null ? '' : ` → ${role.providerId}`}: ${role.detail}`)
     .join('\n')}\n`;
 }

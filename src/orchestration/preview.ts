@@ -100,6 +100,7 @@ function expectedPipeline(next: NextAction, policy: OrchestrationPolicy, require
         steps.push(
           policy.repair.onValidationFailure ? `on failure: repair (up to ${policy.repair.maxPerTask} per task)` : 'on failure: stop for a human',
           policy.review.enabled ? `on success: AI review by ${policy.review.reviewer} (advisory)` : 'on success: no AI review',
+          ...(policy.decision.enabled ? [`review concerns: judged by AI decision-maker ${policy.decision.provider} (accept needs high confidence and evidence; otherwise remediation or a human)`] : []),
           policy.autoCommit ? 'then: local commit if the safe-commit rules allow it (never pushed)' : 'then: no commit (auto-commit disabled)',
         );
       }
@@ -107,6 +108,8 @@ function expectedPipeline(next: NextAction, policy: OrchestrationPolicy, require
     }
     case 'review':
       return [`AI review by ${policy.review.reviewer} (advisory; the task status does not change)`];
+    case 'decide':
+      return [`AI decision-maker ${policy.decision.provider} judges the review (accept / remediation / escalate to a human), under Forge's rules`];
     case 'commit':
       return ['local commit of the task\'s own attributed changes (M5 safe-commit rules; never pushed)'];
     case 'complete-milestone':

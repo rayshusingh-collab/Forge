@@ -25,11 +25,12 @@ import type {
 } from '../state/index.ts';
 import { ValidationProfileStore, runValidation } from '../validation/index.ts';
 import type { ValidationProfile } from '../validation/index.ts';
-import { prepareWorkerRequest, runRecordedWorker } from '../workers/index.ts';
+import { WORKER_REQUEST_LIMITS, prepareWorkerRequest, runRecordedWorker } from '../workers/index.ts';
 import type { RecordedRun, Worker, WorkerHealth } from '../workers/index.ts';
 import { commitEligibility, decideBeforeValidation, decideFromValidation, humanRepairCommitEligibility, scopeProblem } from './decision.ts';
 import type { PostExecution } from './decision.ts';
 import { resolveMilestoneReference, resolveTaskReference } from './references.ts';
+import { outstandingRemediationText, withOutstandingRemediation } from './remediation.ts';
 import * as transitions from './transitions.ts';
 import { deriveWorkflow, processLiveness } from './view.ts';
 import type { ExecutorLiveness, TaskView, WorkflowView } from './view.ts';
@@ -267,7 +268,8 @@ export class TaskEngine {
       project: this.project,
       task: view.task.instruction,
       context: view.task.context,
-      repairEvidence: options.repairEvidence ?? null,
+      // Open remediation always reaches the worker, whoever started the attempt.
+      repairEvidence: withOutstandingRemediation(options.repairEvidence, outstandingRemediationText(state, taskId), WORKER_REQUEST_LIMITS.repairEvidenceCharacters) ?? null,
       access: options.access,
       timeoutMs: options.timeoutMs,
       id: this.generateId(),

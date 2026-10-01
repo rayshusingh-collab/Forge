@@ -2,14 +2,14 @@ import type { AiCallMetadata } from '../state/index.ts';
 import type { WorkerHealth } from '../workers/index.ts';
 
 /**
- * Provider-independent AI roles. A role (planner, reviewer) is Forge code
+ * Provider-independent AI roles. A role (planner, reviewer, decision-maker) is Forge code
  * that builds a request, calls whichever provider is selected, and
  * validates the answer. A provider only turns text into text; it never
  * sees Forge state, never touches the project, and its answer is untrusted
  * until the role has validated it.
  */
 
-export type AiRole = 'planner' | 'reviewer';
+export type AiRole = 'planner' | 'reviewer' | 'decision-maker';
 
 export interface AiRequest {
   readonly role: AiRole;

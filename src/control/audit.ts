@@ -77,6 +77,20 @@ export function deriveAudit(state: ProjectState, view: WorkflowView): AuditEvent
       add(review.decision.decidedAt, 'review decision', `${key(review.taskId)} #${review.attempt}`, `${review.decision.kind} by ${review.decision.by}: ${review.decision.reason}`);
     }
   }
+  for (const decision of state.aiDecisions) {
+    const subject = `${key(decision.taskId)} #${decision.attempt}`;
+    const answer =
+      decision.status === 'decided'
+        ? `${decision.verdict} (confidence ${decision.confidence}) -> ${decision.effect}`
+        : `no usable answer (${decision.status}) -> ${decision.effect}`;
+    const why = decision.policyNote ?? decision.humanReason ?? decision.reason ?? decision.diagnostic ?? '';
+    add(decision.createdAt, `AI decision: ${decision.effect.toUpperCase()}`, subject, `by ${decision.call.provider}${decision.call.model === null ? '' : ` (${decision.call.model})`}: ${answer}; review ${decision.reviewId.slice(0, 8)}, decision ${decision.id.slice(0, 8)}${why === '' ? '' : ` — ${why}`}`);
+  }
+  for (const remediation of state.remediations) {
+    const subject = `${key(remediation.taskId)} #${remediation.fromAttempt}`;
+    add(remediation.createdAt, 'remediation required', subject, `by ${remediation.source}: ${remediation.requirements.join('; ')}`);
+    add(remediation.resolvedAt, 'remediation satisfied', subject, `accepted with review ${remediation.resolvedByReviewId?.slice(0, 8) ?? '?'}`);
+  }
   for (const approval of state.approvals) {
     const subject = `approval ${approval.id.slice(0, 8)}`;
     add(approval.createdAt, 'approval requested', subject, `${approval.type}${approval.taskId === null ? '' : ` for ${key(approval.taskId)}`}: ${approval.reason}`);

@@ -16,11 +16,12 @@ export function formatPolicyHeader(
   worker: Worker,
   reviewer: AiProvider | null,
   sources: PolicyResolution['sources'] = {},
+  decisionMaker: AiProvider | null = null,
 ): string {
   return [
     mode === 'step' ? 'FORGE RUN STEP (at most one workflow step)' : 'FORGE RUN (bounded autonomous orchestration)',
     `Project:       ${projectName}`,
-    `Roles:         implementer ${worker.id}; reviewer ${reviewer === null ? 'none' : reviewer.id}; validation = deterministic checks run by Forge`,
+    `Roles:         implementer ${worker.id}; reviewer ${reviewer === null ? 'none' : reviewer.id}; decision-maker ${decisionMaker === null ? 'none (humans decide reviews)' : decisionMaker.id}; validation = deterministic checks run by Forge`,
     ...describePolicy(policy),
     describeSources(sources),
     'Always stops for: ' + ALWAYS_STOP_CONDITIONS.join('; '),
@@ -45,6 +46,9 @@ export function formatStep(step: StepResult): string {
     }
     case 'review':
       lines.push(`TASK ${step.taskKey ?? '?'} ${step.taskTitle ?? ''}`, `  Review: ${(step.review ?? step.outcome).toUpperCase()} (advisory)${step.detail === null ? '' : ` — ${step.detail}`}`);
+      break;
+    case 'decide':
+      lines.push(`TASK ${step.taskKey ?? '?'} ${step.taskTitle ?? ''}`, `  AI decision: ${aiDecisionLabel(step.outcome)}${step.detail === null ? '' : ` — ${step.detail}`}`);
       break;
     case 'commit':
       lines.push(
@@ -228,4 +232,18 @@ function describeSources(sources: PolicyResolution['sources']): string {
   const cli = from('cli');
   const project = from('project');
   return `Settings from: command line [${cli.join(', ') || 'none'}]; project config [${project.join(', ') || 'none'}]; everything else default`;
+}
+
+/** Step outcome of an AI decision, as shown to the human. */
+function aiDecisionLabel(outcome: string): string {
+  switch (outcome) {
+    case 'ai-accepted':
+      return 'ACCEPTED (AI decision; the review is accepted, safe-commit rules still apply)';
+    case 'ai-rejected':
+      return 'REJECTED — remediation required (the task will be repaired within its budget)';
+    case 'ai-escalated':
+      return 'ESCALATED — a human decides';
+    default:
+      return outcome.toUpperCase();
+  }
 }

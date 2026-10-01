@@ -106,8 +106,30 @@ export function formatTask(task: TaskView, view: WorkflowView, state: ProjectSta
   const review = state.taskReviews.filter((candidate) => candidate.taskId === task.task.id).at(-1);
   if (review !== undefined) {
     lines.push(
-      `  AI review:   ${review.status} (attempt ${review.attempt}, advisory)${review.decision === null ? '' : ` — decided: ${review.decision.kind}`}   (forge task review-show ${task.key})`,
+      `  AI review:   ${review.status} (attempt ${review.attempt}, advisory)${review.decision === null ? '' : ` — decided: ${review.decision.kind} by ${review.decision.by}`}   (forge task review-show ${task.key})`,
     );
+  }
+  const remediations = state.remediations.filter((candidate) => candidate.taskId === task.task.id);
+  if (remediations.length > 0) {
+    lines.push('  Remediation:');
+    for (const remediation of remediations) {
+      lines.push(
+        `    from attempt ${remediation.fromAttempt} (by ${remediation.source}): ${remediation.status === 'open' ? 'OPEN — not yet accepted' : `satisfied (review ${remediation.resolvedByReviewId?.slice(0, 8)} accepted ${remediation.resolvedAt})`}`,
+        ...remediation.requirements.map((requirement) => `      - ${oneLine(requirement, 300)}`),
+      );
+    }
+  }
+  const decisions = state.aiDecisions.filter((candidate) => candidate.taskId === task.task.id);
+  if (decisions.length > 0) {
+    lines.push('  AI decisions:');
+    for (const decision of decisions) {
+      const answer = decision.status === 'decided' ? `${decision.verdict}, ${decision.confidence} confidence` : `no usable answer (${decision.status})`;
+      lines.push(`    attempt ${decision.attempt}: ${decision.effect.toUpperCase()} — ${answer} by ${decision.call.provider} (${decision.createdAt})`);
+      const why = decision.policyNote ?? decision.humanReason ?? decision.reason ?? decision.diagnostic;
+      if (why !== null) {
+        lines.push(`       ${oneLine(why, 300)}`);
+      }
+    }
   }
   if (task.task.attempts.length > 0) {
     lines.push('  History:');

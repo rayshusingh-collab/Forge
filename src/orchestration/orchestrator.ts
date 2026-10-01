@@ -7,6 +7,7 @@ import type { ProcessExecutor } from '../execution/index.ts';
 import { GitClient } from '../git/index.ts';
 import type { LoadedProject } from '../projects/index.ts';
 import { consumeApproval, currentFingerprint, requestApproval, staleApprovals, sweepApprovals } from '../approvals/index.ts';
+import { decideTask } from '../decision/index.ts';
 import { decideReview, reviewTask } from '../review/index.ts';
 import type {
   AttemptOrigin,
@@ -20,7 +21,7 @@ import type {
   StateStore,
   ValidationStatus,
 } from '../state/index.ts';
-import { ORCHESTRATION_LIMITS } from '../state/index.ts';
+import { AI_LIMITS, ORCHESTRATION_LIMITS } from '../state/index.ts';
 import { TaskEngine, deriveWorkflow, processLiveness, recoverTask, repairsUsed } from '../tasks/index.ts';
 import type { ExecutorLiveness, WorkflowView } from '../tasks/index.ts';
 import type { Worker } from '../workers/index.ts';
@@ -56,6 +57,8 @@ export interface OrchestratorOptions {
   readonly worker: Worker;
   /** The reviewer; required when the policy enables review. */
   readonly reviewer: AiProvider | null;
+  /** The AI decision-maker; required when the policy enables auto-decision. */
+  readonly decisionMaker?: AiProvider | null;
   readonly policy: OrchestrationPolicy;
   readonly clock?: () => Date;
   readonly generateId?: () => string;
@@ -118,11 +121,15 @@ export class Orchestrator {
   private counters: OrchestrationCounters = EMPTY_COUNTERS;
   private readonly tasksStarted = new Set<string>();
   private readonly reviewsThisRun = new Set<string>();
+  private readonly decisionsThisRun = new Set<string>();
   private stopApproval: { readonly id: string; readonly created: boolean } | null = null;
 
   constructor(options: OrchestratorOptions) {
     if (options.policy.review.enabled && options.reviewer === null) {
       throw new WorkflowError('The policy enables AI review but no reviewer was provided');
+    }
+    if (options.policy.decision.enabled && (options.decisionMaker ?? null) === null) {
+      throw new WorkflowError('The policy enables auto-decision but no decision-maker was provided');
     }
     this.options = options;
     this.clock = options.clock ?? (() => new Date());
@@ -272,7 +279,7 @@ export class Orchestrator {
   }
 
   private context(): DecisionContext {
-    return { runId: this.runId, tasksStarted: this.tasksStarted, reviewsThisRun: this.reviewsThisRun };
+    return { runId: this.runId, tasksStarted: this.tasksStarted, reviewsThisRun: this.reviewsThisRun, decisionsThisRun: this.decisionsThisRun };
   }
 
   /** Performs exactly one action. Expected refusals become a stop on the step; nothing is retried here. */
@@ -304,6 +311,8 @@ export class Orchestrator {
           return await this.executeTask(action, state, base);
         case 'review':
           return await this.review(action.taskId, base);
+        case 'decide':
+          return await this.decide(action.taskId, base);
         case 'commit':
           return await this.commit(action.taskId, base);
         case 'apply-approval':
@@ -397,7 +406,8 @@ export class Orchestrator {
     if (action.kind === 'repair') {
       let current = state;
       if (action.reopen) {
-        // Explicit, human-configured policy (not the reviewer) decides remediation; recorded as such.
+        // Explicit, human-configured policy (not the reviewer) decides remediation; recorded as such,
+        // with the blocking findings as the structured requirements the repair must satisfy.
         current = await store.update((latest) =>
           decideReview(
             latest,
@@ -406,6 +416,7 @@ export class Orchestrator {
             `Forge orchestration policy: repair on blocking review (run ${this.runId.slice(0, 8)})`,
             this.clock(),
             'policy',
+            { requirements: blockingRequirements(latest, action.reviewId) },
           ),
         );
       }
@@ -499,6 +510,43 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Asks the AI decision-maker to judge the task's latest review. Forge's
+   * rules decide the effect: acceptance (the run continues to the safe
+   * commit), remediation (the next decision repairs the task), or
+   * escalation (the next decision stops for a human). Never retried within
+   * the same step.
+   */
+  private async decide(taskId: string, base: StepResult): Promise<StepResult> {
+    const { project, runner, store, policy, signal } = this.options;
+    try {
+      const { decision } = await decideTask({
+        project,
+        runner,
+        provider: this.options.decisionMaker!,
+        task: taskId,
+        timeoutMs: policy.decision.timeoutMs,
+        maxRepairs: policy.repair.maxPerTask,
+        store,
+        clock: this.clock,
+        ...(this.options.generateId === undefined ? {} : { generateId: this.options.generateId }),
+        ...(signal === undefined ? {} : { signal }),
+      });
+      this.decisionsThisRun.add(decision.id);
+      this.counters = { ...this.counters, decisions: this.counters.decisions + 1 };
+      const outcome = decision.effect === 'accepted' ? 'ai-accepted' : decision.effect === 'remediation-required' ? 'ai-rejected' : 'ai-escalated';
+      const verdict = decision.status === 'decided' ? `${decision.verdict}, confidence ${decision.confidence}` : `no usable answer (${decision.status})`;
+      const why = decision.policyNote ?? decision.humanReason ?? decision.reason ?? decision.diagnostic ?? '';
+      const step: StepResult = { ...base, attempt: decision.attempt, outcome, detail: `AI decision ${decision.id.slice(0, 8)}: ${verdict}${why === '' ? '' : ` — ${why}`}` };
+      return signal?.aborted === true ? { ...step, stop: { reason: 'cancelled', detail: 'Interrupted by the user during the AI decision', taskId } } : step;
+    } catch (error) {
+      if (error instanceof IntegrityError) {
+        return { ...base, outcome: 'discarded', detail: describe(error), stop: { reason: 'integrity-violation', detail: describe(error), taskId } };
+      }
+      throw error;
+    }
+  }
+
   private async commit(taskId: string, base: StepResult): Promise<StepResult> {
     try {
       const outcome = await this.options.engine.commitTask(taskId);
@@ -540,6 +588,16 @@ export class Orchestrator {
   private async view(): Promise<WorkflowView> {
     return deriveWorkflow(await this.options.store.load(), this.liveness);
   }
+}
+
+/** A policy remediation's requirements: the review's blocking findings (their suggested remediation, else their title). */
+function blockingRequirements(state: ProjectState, reviewId: string | null): string[] {
+  const review = state.taskReviews.find((candidate) => candidate.id === reviewId);
+  const blocking = review?.findings.filter((finding) => finding.severity === 'error' || finding.severity === 'critical') ?? [];
+  const requirements = blocking
+    .slice(0, AI_LIMITS.remediationRequirements)
+    .map((finding) => `${finding.title}${finding.remediation === null ? '' : `: ${finding.remediation}`}`.slice(0, AI_LIMITS.requirementText));
+  return requirements.length > 0 ? requirements : ['Resolve the blocking review findings'];
 }
 
 function describe(error: unknown): string {

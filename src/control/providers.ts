@@ -4,9 +4,9 @@ import type { ProjectSettings } from '../config/index.ts';
 import type { WorkerRegistry } from '../workers/index.ts';
 
 /**
- * Provider health by ROLE. Forge has three AI roles, each filled by a
+ * Provider health by ROLE. Forge has four AI roles, each filled by a
  * provider chosen by a human (project configuration or CLI option): the
- * planner and reviewer come from the AI-provider registry, the implementer
+ * planner, reviewer and decision-maker come from the AI-provider registry, the implementer
  * from the worker registry. Today all are Claude-backed; nothing here
  * assumes they stay that way or that the roles share a provider.
  *
@@ -14,13 +14,14 @@ import type { WorkerRegistry } from '../workers/index.ts';
  * call is made and no project state is touched.
  */
 
-export const PROVIDER_ROLES = ['planner', 'implementer', 'reviewer'] as const;
+export const PROVIDER_ROLES = ['planner', 'implementer', 'reviewer', 'decision-maker'] as const;
 export type ProviderRole = (typeof PROVIDER_ROLES)[number];
 
 const ROLE_SETTING = {
   planner: 'providers.planner',
   implementer: 'providers.implementer',
   reviewer: 'providers.reviewer',
+  'decision-maker': 'providers.decisionMaker',
 } as const;
 
 export interface RoleHealth {

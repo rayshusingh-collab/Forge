@@ -464,6 +464,22 @@ Implemented (Milestone 9, `src/workers/codex/`, `src/ai/codex-provider.ts`): the
 
 
 
+Implemented (auto-decision, `src/decision/`, state schema 9): an optional fourth AI role, the **decision-maker**, judges completed reviews that would otherwise stop a run for a human. It reuses the provider registry (`providers.decisionMaker`, health in preflight, no fallback) and the read-only guard, like the reviewer.
+
+- **Where it sits.** `decideNext` emits a `decide` action only from the review gate, and only when the policy's `decision.enabled` is set: reviews with concerns, blocking concerns when policy repair is off, or (in auto mode) a clear review of an attempt answering open human/AI remediation. It is reached only for a succeeded task whose latest attempt is `validated`, so validation failures, integrity and scope violations, exhausted budgets and interruptions are decided earlier by the existing rules and never reach it.
+- **Pipeline** (`decideTask`): bounded evidence packet (`packet.ts`, sharing `presentChanges` with the reviewer) → one provider call under `runReadOnly` → strict parser (`decider.ts`) → deterministic rules (`rules.ts`) → one atomic write (`transitions.ts`) recording an `AiDecisionRecord` and applying its effect through `decideReview(..., by: 'ai', { aiDecisionId })`. That is the same transition humans use, so there is no parallel success path.
+- **Rules.** They can only make an effect more conservative.
+  - Acceptance needs high confidence, passed required validation, no critical finding, blocking findings assessed resolved or not applicable, no unresolved warning, every outstanding requirement satisfied, and attributed changes since each requirement.
+  - Rejection needs medium or high confidence and remaining repair or attempt budget.
+  - Everything else, including invalid or missing answers, escalates to the existing review-acceptance approval gate (stop reasons `decision-escalated` and `decision-maker-unavailable`). Re-asking after a provider failure is bounded: once per later run, at most 3 per review.
+- **Remediation.** Every `remediation-required` review decision (human, policy or AI) creates a `RemediationRecord` with structured requirements. It is open until a later attempt's review is accepted. Every later worker request receives the open requirements (`tasks/remediation.ts`, also for manual runs), and so do the reviewer and the decision-maker. A validated manual attempt answering open remediation is reviewed by `forge run` when review is on.
+- **Invariants.** They tie the records together.
+  - Each remediation decision has exactly one remediation record, with the same task, attempt and decider.
+  - A satisfied remediation names a later, accepted review of the same task.
+  - Each `ai` review decision names an AI decision whose effect is exactly that decision.
+  - An AI decision's effect never exceeds its verdict.
+- **Migration 8→9.** Existing remediation decisions become remediation records (open, or satisfied by a later accepted review). Review decisions gain `aiDecisionId: null`. Stored policies gain a disabled `decision` section, and run counters gain `decisions: 0`.
+
 Implemented (Milestone 9, `src/execution/process-runner.ts`): on Windows, a timeout or cancellation terminates the child's whole process tree (`taskkill /T /F`, fixed absolute program, no shell) before killing the child itself, so an agent CLI's descendants (e.g. the commands a Codex worker runs) cannot keep changing files after Forge records the outcome.
 
 

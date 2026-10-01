@@ -88,6 +88,7 @@ export function scriptedWorker(root: string, scripts: readonly WorkerScript[], o
 
 export interface OrchestratorExtras {
   readonly reviewer?: AiProvider | null;
+  readonly decisionMaker?: AiProvider | null;
   readonly signal?: AbortSignal;
   readonly reporter?: OrchestrationReporter;
   readonly liveness?: ExecutorLiveness;
@@ -103,6 +104,7 @@ export function makeOrchestrator(setup: OrchestrationSetup, worker: FakeWorker, 
     runner,
     worker,
     reviewer,
+    decisionMaker: extras.decisionMaker ?? null,
     policy,
     ...(extras.signal === undefined ? {} : { signal: extras.signal }),
     ...(extras.reporter === undefined ? {} : { reporter: extras.reporter }),

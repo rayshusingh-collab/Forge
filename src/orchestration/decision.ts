@@ -1,4 +1,5 @@
-import type { ApprovalType, OrchestrationPolicy, ProjectState, RepairTrigger, StopReason, TaskReview } from '../state/index.ts';
+import { AI_LIMITS } from '../state/index.ts';
+import type { AiDecisionRecord, ApprovalType, OrchestrationPolicy, ProjectState, RepairTrigger, StopReason, TaskReview } from '../state/index.ts';
 import { taskApprovalBinding } from '../approvals/index.ts';
 import { commitEligibility, repairsUsed } from '../tasks/index.ts';
 import type { TaskView, WorkflowView } from '../tasks/index.ts';
@@ -17,7 +18,9 @@ import type { TaskView, WorkflowView } from '../tasks/index.ts';
  * Order of precedence:
  *   1. unsafe or human-owned conditions anywhere (interrupted, running,
  *      awaiting manual validation) stop the run;
- *   2. follow-up of work this orchestration produced: review, then commit;
+ *   2. follow-up of work this orchestration produced (or any validated
+ *      attempt answering an open remediation): review, AI decision when
+ *      auto-decision is enabled, then commit (orchestrated work only);
  *   3. completing a milestone the existing rules say is complete;
  *   4. the first runnable task in milestone/task order: execute it, or
  *      repair it when policy permits and budget remains;
@@ -36,6 +39,7 @@ export type NextAction =
       readonly reopen: boolean;
     }
   | { readonly kind: 'review'; readonly taskId: string; readonly attempt: number }
+  | { readonly kind: 'decide'; readonly taskId: string; readonly attempt: number; readonly reviewId: string }
   | { readonly kind: 'commit'; readonly taskId: string; readonly attempt: number }
   | { readonly kind: 'complete-milestone'; readonly milestoneId: string }
   | { readonly kind: 'apply-approval'; readonly approvalId: string; readonly approvalType: ApprovalType; readonly taskId: string }
@@ -68,6 +72,8 @@ export interface DecisionContext {
   readonly tasksStarted: ReadonlySet<string>;
   /** Reviews recorded by this run; a failed review is not retried within the same run. */
   readonly reviewsThisRun: ReadonlySet<string>;
+  /** AI decisions recorded by this run; a failed decision is not retried within the same run. */
+  readonly decisionsThisRun?: ReadonlySet<string>;
 }
 
 const COMPLETED_REVIEW = new Set(['clear', 'concerns', 'blocking-concerns']);
@@ -134,9 +140,12 @@ function globalStop(state: ProjectState, view: WorkflowView): NextAction | null 
 }
 
 /**
- * Review and commit for a succeeded task whose latest attempt this
- * orchestration produced and deterministic validation passed. Tasks run
- * manually (`forge task run`) are left to their human operator.
+ * Review and commit for a succeeded task whose latest attempt passed
+ * deterministic validation and was produced by an orchestration. A manual
+ * attempt (`forge task run`) is left to its human operator, except that an
+ * attempt answering OPEN remediation is always reviewed when review is
+ * enabled: remediation is only verified by a review decision, never by the
+ * worker saying it is done. Only orchestrated work is ever auto-committed.
  */
 function followUpAction(state: ProjectState, task: TaskView, policy: OrchestrationPolicy, context: DecisionContext): NextAction | null {
   const attempt = task.lastAttempt;
@@ -144,10 +153,13 @@ function followUpAction(state: ProjectState, task: TaskView, policy: Orchestrati
     task.task.status !== 'succeeded' ||
     attempt === undefined ||
     attempt.outcome !== 'validated' ||
-    attempt.origin === null ||
     task.milestone.status === 'completed' ||
     task.milestone.status === 'cancelled'
   ) {
+    return null;
+  }
+  const remediationOpen = hasOpenRemediation(state, task.task.id);
+  if (attempt.origin === null && !(policy.review.enabled && remediationOpen)) {
     return null;
   }
 
@@ -158,6 +170,9 @@ function followUpAction(state: ProjectState, task: TaskView, policy: Orchestrati
     }
   }
 
+  if (attempt.origin === null) {
+    return null;
+  }
   // Work from this run, or orchestrated work from an earlier run that nothing has run after since
   // (e.g. it waited for a human review decision). The M5 safe-commit rules re-verify it live.
   const ownWork = attempt.origin.runId === context.runId || nothingStartedSince(state, attempt.finishedAt);
@@ -193,21 +208,34 @@ function reviewGate(state: ProjectState, task: TaskView, attempt: number, policy
     // A failure from an earlier run: this new run is the retry.
     return { kind: 'review', taskId: task.task.id, attempt };
   }
-  if (review.status === 'clear' || review.decision?.kind === 'accepted') {
+  if (review.decision?.kind === 'accepted') {
+    return null;
+  }
+  // In auto-decision mode, a clear review does not by itself confirm remediation a human or the
+  // decision-maker required: the decision-maker must judge it against the evidence.
+  const unconfirmed = policy.decision.enabled && review.status === 'clear' && hasOpenRemediation(state, task.task.id, ['human', 'ai']);
+  if (review.status === 'clear' && !unconfirmed) {
     return null;
   }
   const count = (severities: readonly string[]): number => review.findings.filter((finding) => severities.includes(finding.severity)).length;
   const evidence = reviewEvidence(task, review);
   const accept = 'Accept the implementation despite the review (recorded as a human review decision); the run then continues.';
-  if (review.status === 'concerns') {
-    return policy.review.onConcerns === 'continue'
-      ? null
-      : gate(state, 'review-acceptance', task, stop('review-decision-required', `Review of task ${task.key} raised ${count(['warning'])} concern(s); a human decision is required`, task), evidence, accept);
+  const humanGate = (detail: string, reason: StopReason = 'review-decision-required', extra: readonly string[] = []): NextAction =>
+    gate(state, 'review-acceptance', task, stop(reason, detail, task), [...evidence, ...extra], accept);
+  if (review.status === 'concerns' && policy.review.onConcerns === 'continue') {
+    return null;
   }
-  // blocking-concerns
   const blocking = `Review of task ${task.key} raised ${count(['error', 'critical'])} blocking concern(s)`;
+  // Policy-driven repair of blocking concerns (the conservative direction) keeps precedence over auto-decision.
+  const policyRepair = review.status === 'blocking-concerns' && policy.repair.onBlockingReview;
+  if (policy.decision.enabled && !policyRepair) {
+    return decisionGate(state, task, review, context, humanGate);
+  }
+  if (review.status === 'concerns') {
+    return humanGate(`Review of task ${task.key} raised ${count(['warning'])} concern(s); a human decision is required`);
+  }
   if (!policy.repair.onBlockingReview) {
-    return gate(state, 'review-acceptance', task, stop('review-decision-required', `${blocking}; a human decision is required`, task), evidence, accept);
+    return humanGate(`${blocking}; a human decision is required`);
   }
   const problem = repairProblem(task, policy) ?? reopenProblem(state, task);
   if (problem !== null) {
@@ -259,7 +287,9 @@ function runnableAction(state: ProjectState, task: TaskView, policy: Orchestrati
     const review = state.taskReviews.find(
       (candidate) => candidate.taskId === task.task.id && candidate.attempt === last.number && candidate.decision?.kind === 'remediation-required',
     );
-    if (!policy.repair.onBlockingReview || review === undefined) {
+    // Remediation decided by the AI decision-maker is repaired automatically in an auto-decision run (budget permitting).
+    const permitted = policy.repair.onBlockingReview || (policy.decision.enabled && review?.decision?.by === 'ai');
+    if (!permitted || review === undefined) {
       return gate(state, 'task-retry', task, stop('review-remediation-required', `Task ${task.key} was reopened for remediation after a review`, task), evidence, retry, overLimit);
     }
     const problem = repairProblem(task, policy);
@@ -400,6 +430,55 @@ function explainIdle(state: ProjectState, view: WorkflowView): NextAction {
     };
   }
   return { kind: 'stop', reason: 'no-runnable-task', detail: 'No task is runnable', taskId: null };
+}
+
+/**
+ * Auto-decision for a review that would otherwise stop for a human:
+ *   no decision yet                  -> ask the decision-maker
+ *   decided, but escalated           -> stop for a human (its reason is evidence)
+ *   no usable answer, earlier run    -> ask again (bounded per review)
+ *   no usable answer, this run / cap -> stop for a human; never treated as acceptance
+ * Accepted and remediation-required effects never reach here: they decided the review.
+ */
+function decisionGate(
+  state: ProjectState,
+  task: TaskView,
+  review: TaskReview,
+  context: DecisionContext,
+  humanGate: (detail: string, reason: StopReason, extra: readonly string[]) => NextAction,
+): NextAction {
+  const tries = state.aiDecisions.filter((decision) => decision.reviewId === review.id);
+  const last = tries.at(-1);
+  const ask: NextAction = { kind: 'decide', taskId: task.task.id, attempt: review.attempt, reviewId: review.id };
+  if (last === undefined) {
+    return ask;
+  }
+  if (last.status === 'decided') {
+    const why = last.humanReason ?? last.policyNote ?? last.reason ?? 'no reason given';
+    return humanGate(`The AI decision-maker escalated review of task ${task.key} (${last.verdict}, confidence ${last.confidence}): ${why}`, 'decision-escalated', decisionEvidence(last));
+  }
+  if ((context.decisionsThisRun?.has(last.id) ?? false) || tries.length >= AI_LIMITS.aiDecisionsPerReview) {
+    return humanGate(
+      `The AI decision-maker gave no usable answer for task ${task.key} (${last.status}${last.diagnostic === null ? '' : `: ${last.diagnostic}`}); a human decision is required`,
+      'decision-maker-unavailable',
+      decisionEvidence(last),
+    );
+  }
+  return ask;
+}
+
+/** Bounded evidence lines from an AI decision, for the human approval request. */
+function decisionEvidence(decision: AiDecisionRecord): string[] {
+  return [
+    `AI decision ${decision.id.slice(0, 8)} by ${decision.call.provider}: ${decision.status === 'decided' ? `${decision.verdict} (confidence ${decision.confidence}) -> ${decision.effect}` : decision.status}`,
+    ...(decision.policyNote === null ? [] : [`Forge rule: ${decision.policyNote}`]),
+    ...(decision.humanReason === null ? [] : [`needs a human because: ${decision.humanReason}`]),
+  ];
+}
+
+/** Whether the task has open remediation (optionally only from the given deciders). */
+function hasOpenRemediation(state: ProjectState, taskId: string, sources?: readonly string[]): boolean {
+  return state.remediations.some((remediation) => remediation.taskId === taskId && remediation.status === 'open' && (sources === undefined || sources.includes(remediation.source)));
 }
 
 export function latestReview(state: ProjectState, taskId: string, attempt: number): TaskReview | undefined {

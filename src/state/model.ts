@@ -26,8 +26,12 @@
  *     human control events (migrated from 6 as empty / not paused).
  * 8 — Human repair of exhausted tasks: tasks gain `humanRepair` (migrated
  *     from 7 as null).
+ * 9 — Auto-decision: structured `remediations` (rebuilt from existing
+ *     remediation decisions), `aiDecisions`, review decisions gain
+ *     `aiDecisionId`, stored policies gain `decision` (disabled) and run
+ *     counters `decisions` (migrated from 8).
  */
-export const STATE_SCHEMA_VERSION = 8;
+export const STATE_SCHEMA_VERSION = 9;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -450,6 +454,15 @@ export const AI_LIMITS = {
   reviewsPerTask: 20,
   reason: 1_000,
   diagnostic: 500,
+  /** Requirements per remediation record, and length of each. */
+  remediationRequirements: 10,
+  requirementText: 1_000,
+  /** AI decisions retained per task (oldest escalated ones are dropped first; applied ones are kept). */
+  aiDecisionsPerTask: 40,
+  /** Decision attempts on one review before Forge stops asking and leaves it to a human. */
+  aiDecisionsPerReview: 3,
+  decisionReason: 2_000,
+  assessmentNote: 500,
 } as const;
 
 export interface PlanMilestone {
@@ -567,11 +580,12 @@ export const REVIEW_DECISIONS = ['accepted', 'remediation-required'] as const;
 export type ReviewDecisionKind = (typeof REVIEW_DECISIONS)[number];
 
 /**
- * Who decided: a human (`forge task review-accept|review-reject`), or
- * Forge applying an explicit, human-configured orchestration policy
- * (review-driven repair). Never the reviewer itself.
+ * Who decided: a human (`forge task review-accept|review-reject`), Forge
+ * applying an explicit, human-configured orchestration policy (review-driven
+ * repair), or the AI decision-maker in a human-enabled auto-decision run
+ * (`ai`, always linked to its `AiDecisionRecord`). Never the reviewer itself.
  */
-export const REVIEW_DECIDERS = ['human', 'policy'] as const;
+export const REVIEW_DECIDERS = ['human', 'policy', 'ai'] as const;
 export type ReviewDecider = (typeof REVIEW_DECIDERS)[number];
 
 export interface ReviewDecision {
@@ -579,6 +593,97 @@ export interface ReviewDecision {
   readonly reason: string;
   readonly decidedAt: string;
   readonly by: ReviewDecider;
+  /** The AI decision this applies; set exactly when `by` is `ai`. */
+  readonly aiDecisionId: string | null;
+}
+
+/**
+ * Structured remediation required by a `remediation-required` review
+ * decision (one record per such decision). It stays `open` across attempts
+ * and restarts until a later attempt's review is accepted, and every later
+ * worker attempt, review and AI decision is given its requirements.
+ */
+export const REMEDIATION_STATUSES = ['open', 'satisfied'] as const;
+export type RemediationStatus = (typeof REMEDIATION_STATUSES)[number];
+
+export interface RemediationRecord {
+  readonly id: string;
+  readonly taskId: string;
+  /** The attempt whose review required it. */
+  readonly fromAttempt: number;
+  readonly reviewId: string;
+  readonly source: ReviewDecider;
+  /** What must be observably true of a later attempt. */
+  readonly requirements: readonly string[];
+  readonly createdAt: string;
+  readonly status: RemediationStatus;
+  readonly resolvedAt: string | null;
+  /** The later review whose acceptance satisfied it. */
+  readonly resolvedByReviewId: string | null;
+}
+
+/** What the AI decision-maker answered. */
+export const AI_DECISION_VERDICTS = ['accept', 'reject', 'escalate'] as const;
+export type AiDecisionVerdict = (typeof AI_DECISION_VERDICTS)[number];
+
+/** Whether a usable answer was obtained (`decided`) or why not. Anything but `decided` escalates. */
+export const AI_DECISION_STATUSES = ['decided', 'unavailable', 'failed', 'timeout', 'cancelled', 'invalid-output'] as const;
+export type AiDecisionStatus = (typeof AI_DECISION_STATUSES)[number];
+
+/**
+ * What Forge did with it, after applying its own rules: the review was
+ * accepted, remediation was required (task reopened), or a human was asked.
+ */
+export const AI_DECISION_EFFECTS = ['accepted', 'remediation-required', 'escalated'] as const;
+export type AiDecisionEffect = (typeof AI_DECISION_EFFECTS)[number];
+
+export const FINDING_ASSESSMENTS = ['resolved', 'unresolved', 'not-applicable', 'acceptable'] as const;
+export type FindingAssessmentStatus = (typeof FINDING_ASSESSMENTS)[number];
+
+export const REQUIREMENT_ASSESSMENTS = ['satisfied', 'unsatisfied', 'unverifiable'] as const;
+export type RequirementAssessmentStatus = (typeof REQUIREMENT_ASSESSMENTS)[number];
+
+export interface FindingAssessment {
+  /** 1-based index into the review's findings. */
+  readonly finding: number;
+  readonly status: FindingAssessmentStatus;
+  readonly note: string;
+}
+
+export interface RequirementAssessment {
+  /** Label of an open requirement as presented (`R1`, `R2`, …). */
+  readonly requirement: string;
+  readonly status: RequirementAssessmentStatus;
+  readonly evidence: string;
+}
+
+/**
+ * One AI decision-maker judgment on a completed review. Advisory input to
+ * Forge, never authority: `effect` records what Forge actually did after its
+ * deterministic rules (which may escalate a verdict, never upgrade one).
+ */
+export interface AiDecisionRecord {
+  readonly id: string;
+  readonly taskId: string;
+  readonly attempt: number;
+  readonly reviewId: string;
+  readonly status: AiDecisionStatus;
+  readonly verdict: AiDecisionVerdict | null;
+  readonly confidence: ReviewConfidence | null;
+  readonly reason: string | null;
+  /** Remediation the decision-maker required (reject only). */
+  readonly requiredActions: readonly string[];
+  /** Why a human must decide (escalate only). */
+  readonly humanReason: string | null;
+  readonly findingAssessments: readonly FindingAssessment[];
+  readonly requirementAssessments: readonly RequirementAssessment[];
+  readonly effect: AiDecisionEffect;
+  /** Why Forge's rules changed the verdict's effect (e.g. low-confidence acceptance escalated), if they did. */
+  readonly policyNote: string | null;
+  readonly call: AiCallMetadata;
+  readonly context: ContextSummary;
+  readonly diagnostic: string | null;
+  readonly createdAt: string;
 }
 
 /** An advisory AI review of one validated task attempt. Never a validation result. */
@@ -653,6 +758,17 @@ export interface OrchestrationPolicy {
     readonly onConcerns: ReviewConcernPolicy;
     readonly onFailure: ReviewFailurePolicy;
   };
+  /**
+   * Auto-decision: when a completed review would otherwise stop for a human
+   * decision, the AI decision-maker judges it and Forge applies the verdict
+   * under its own stricter rules (see `src/decision/`). Off by default.
+   */
+  readonly decision: {
+    readonly enabled: boolean;
+    /** Provider ID for the decision-maker role, when enabled. */
+    readonly provider: string | null;
+    readonly timeoutMs: number;
+  };
   /** Create local commits of validated tasks' own changes (M5 safe-commit rules). Never pushes. */
   readonly autoCommit: boolean;
 }
@@ -668,7 +784,7 @@ export type OrchestrationRunMode = (typeof ORCHESTRATION_RUN_MODES)[number];
 export const ORCHESTRATION_RUN_STATUSES = ['running', 'stopped', 'interrupted'] as const;
 export type OrchestrationRunStatus = (typeof ORCHESTRATION_RUN_STATUSES)[number];
 
-export const ORCHESTRATION_ACTIONS = ['execute', 'repair', 'review', 'commit', 'complete-milestone', 'apply-approval', 'stop'] as const;
+export const ORCHESTRATION_ACTIONS = ['execute', 'repair', 'review', 'decide', 'commit', 'complete-milestone', 'apply-approval', 'stop'] as const;
 export type OrchestrationAction = (typeof ORCHESTRATION_ACTIONS)[number];
 
 /** Why an orchestration run stopped. Labels, categories and guidance live in `src/orchestration/stop-reason.ts`. */
@@ -691,6 +807,8 @@ export const STOP_REASONS = [
   'review-decision-required',
   'review-remediation-required',
   'reviewer-unavailable',
+  'decision-escalated',
+  'decision-maker-unavailable',
   'commit-refused',
   'unsafe-git-state',
   'provider-unavailable',
@@ -725,6 +843,8 @@ export interface OrchestrationCounters {
   readonly tasks: number;
   readonly repairs: number;
   readonly reviews: number;
+  /** AI decision-maker calls. */
+  readonly decisions: number;
   readonly commits: number;
   readonly milestones: number;
 }
@@ -866,6 +986,10 @@ export interface ProjectState {
   readonly pause: PauseState | null;
   /** Human control actions (pause, resume, lease recovery, config changes), oldest first (bounded). */
   readonly controlEvents: readonly ControlEvent[];
+  /** Structured remediation required by review decisions; never deleted. */
+  readonly remediations: readonly RemediationRecord[];
+  /** AI decision-maker judgments, oldest first (bounded per task; applied ones are kept). */
+  readonly aiDecisions: readonly AiDecisionRecord[];
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -888,6 +1012,8 @@ export function createInitialState(projectId: string, now: Date): ProjectState {
     approvals: [],
     pause: null,
     controlEvents: [],
+    remediations: [],
+    aiDecisions: [],
     createdAt: timestamp,
     updatedAt: timestamp,
   };

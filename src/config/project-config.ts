@@ -35,6 +35,7 @@ export const SETTINGS = {
   'providers.implementer': { type: 'provider', default: 'claude', description: 'Implementer (worker) for task attempts' },
   'providers.planner': { type: 'provider', default: 'claude', description: 'AI planner for `forge plan create`' },
   'providers.reviewer': { type: 'provider', default: 'claude', description: 'AI reviewer for `forge task review` and `forge run --review`' },
+  'providers.decisionMaker': { type: 'provider', default: 'claude', description: 'AI decision-maker for `forge run --auto-decide`' },
   'run.allowEdits': { type: 'boolean', default: false, description: 'Implementer may modify files during `forge run`' },
   'run.maxTasks': { type: 'integer', min: 1, max: ORCHESTRATION_LIMITS.maxTasks, default: 5, description: 'Distinct tasks per run' },
   'run.maxSteps': { type: 'integer', min: 1, max: ORCHESTRATION_LIMITS.maxSteps, default: 30, description: 'Workflow steps per run' },
@@ -44,9 +45,11 @@ export const SETTINGS = {
   'run.review': { type: 'boolean', default: false, description: 'Advisory AI review of every validated task' },
   'run.continueOnConcerns': { type: 'boolean', default: false, description: 'Do not stop for review warnings' },
   'run.continueWithoutReview': { type: 'boolean', default: false, description: 'Continue unreviewed when the reviewer is unavailable' },
+  'run.autoDecide': { type: 'boolean', default: false, description: 'Let the AI decision-maker accept, reject or escalate review concerns (requires run.review)' },
   'run.autoCommit': { type: 'boolean', default: false, description: 'Commit validated tasks locally (never pushes)' },
   'run.workerTimeoutSeconds': { type: 'integer', min: 1, max: 86_400, default: null, description: 'Implementer timeout per attempt (default: FORGE_WORKER_TIMEOUT_MS)' },
   'run.reviewTimeoutSeconds': { type: 'integer', min: 1, max: 86_400, default: null, description: 'Reviewer timeout (default: the worker timeout)' },
+  'run.decisionTimeoutSeconds': { type: 'integer', min: 1, max: 86_400, default: null, description: 'Decision-maker timeout (default: the reviewer timeout)' },
 } as const satisfies Readonly<Record<string, SettingSpec>>;
 
 export type SettingKey = keyof typeof SETTINGS;

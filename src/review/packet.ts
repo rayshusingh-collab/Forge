@@ -5,7 +5,7 @@ import { dataBlock } from '../ai/envelope.ts';
 import { classifyPath, looksBinary } from '../context/index.ts';
 import { fingerprintPath } from '../git/index.ts';
 import type { GitClient } from '../git/index.ts';
-import type { ContextSummary, FileChange, ProjectState, TaskAttempt, TaskRecord } from '../state/index.ts';
+import type { ChangeSummary, ContextSummary, FileChange, ProjectState, TaskAttempt, TaskRecord } from '../state/index.ts';
 import type { ValidationProfile } from '../validation/index.ts';
 
 /**
@@ -70,7 +70,48 @@ export async function buildReviewPacket(input: ReviewPacketInput): Promise<Revie
   if (previous !== undefined) {
     blocks.push(dataBlock('previous-review', `attempt ${previous.attempt}: ${previous.status}${previous.summary === null ? '' : ` — ${previous.summary}`}`));
   }
+  const open = input.state.remediations.filter((remediation) => remediation.taskId === task.id && remediation.status === 'open');
+  if (open.length > 0) {
+    blocks.push(
+      dataBlock(
+        'outstanding-remediation',
+        [
+          'Remediation required by an earlier review decision and not yet accepted. Check whether THIS attempt observably satisfies it:',
+          ...open.flatMap((remediation) => remediation.requirements.map((requirement) => `- (from attempt ${remediation.fromAttempt}, decided by ${remediation.source}) ${requirement}`)),
+        ].join('\n'),
+      ),
+    );
+  }
 
+  const presented = await presentChanges(input.git, changes, limits);
+  blocks.push(...presented.blocks);
+  blocks.unshift(
+    dataBlock(
+      'review-notes',
+      [
+        `changed files: ${presented.changedFiles}; shown with content: ${presented.summary.files}`,
+        presented.summary.truncated ? 'the evidence is TRUNCATED; do not assume unseen code is correct or incorrect' : 'the evidence is complete within the limits',
+      ].join('\n'),
+    ),
+  );
+
+  return { text: blocks.join('\n\n'), summary: presented.summary, files: presented.files };
+}
+
+export interface PresentedChanges {
+  /** `changed-files` listing followed by one `change` block per presented file. */
+  readonly blocks: readonly string[];
+  readonly files: ReviewPacket['files'];
+  readonly summary: ContextSummary;
+  readonly changedFiles: number;
+}
+
+/**
+ * The bounded presentation of an attempt's attributed changes (listing,
+ * diffs or new-file content), shared by the reviewer and the decision-maker.
+ */
+export async function presentChanges(git: GitClient, changes: ChangeSummary | null, limits: ReviewPacketLimits): Promise<PresentedChanges> {
+  const blocks: string[] = [];
   const files: ReviewPacket['files'][number][] = [];
   let bytes = 0;
   let truncated = false;
@@ -87,7 +128,7 @@ export async function buildReviewPacket(input: ReviewPacketInput): Promise<Revie
       truncated = true;
       continue;
     }
-    const presented = await presentFile(input.git, changes?.baseline.head ?? null, file, Math.min(limits.maxFileBytes, limits.maxBytes - bytes));
+    const presented = await presentFile(git, changes?.baseline.head ?? null, file, Math.min(limits.maxFileBytes, limits.maxBytes - bytes));
     files.push({ path: file.path, presentation: presented.presentation });
     bytes += Buffer.byteLength(presented.body);
     truncated ||= presented.truncated;
@@ -96,20 +137,11 @@ export async function buildReviewPacket(input: ReviewPacketInput): Promise<Revie
   if (changes?.truncated === true || changes?.baseline.truncated === true) {
     truncated = true;
   }
-  blocks.unshift(
-    dataBlock(
-      'review-notes',
-      [
-        `changed files: ${sorted.length}; shown with content: ${files.filter((f) => f.presentation === 'diff' || f.presentation === 'content').length}`,
-        truncated ? 'the evidence is TRUNCATED; do not assume unseen code is correct or incorrect' : 'the evidence is complete within the limits',
-      ].join('\n'),
-    ),
-  );
-
   return {
-    text: blocks.join('\n\n'),
-    summary: { files: files.filter((f) => f.presentation === 'diff' || f.presentation === 'content').length, bytes, truncated },
+    blocks,
     files,
+    summary: { files: files.filter((f) => f.presentation === 'diff' || f.presentation === 'content').length, bytes, truncated },
+    changedFiles: sorted.length,
   };
 }
 

@@ -80,6 +80,11 @@ Early development. Implemented so far:
 - provider health per role, no silent fallback, provider identity recorded in runs, plans, reviews and the audit
 - timeouts and Ctrl+C now terminate the whole process tree on Windows, so a provider's child processes cannot keep editing files
 
+**Auto-decision (optional)**
+
+- an AI **decision-maker** role (`providers.decisionMaker`) judges reviews that would otherwise stop for a human, and Forge applies its verdict (accept / remediate / escalate) under stricter deterministic rules: see [Auto-decision](#auto-decision)
+- structured, persistent **remediation requirements** follow a task across attempts and restarts; every later attempt receives them, including manual `forge task run` retries
+
 Nothing autonomous happens unless you run `forge run`, and it does only what its printed policy allows. It never pushes.
 
 > **Planner proposes. Worker implements. Validator proves deterministic checks. Reviewer critiques. Orchestrator coordinates. Forge state machine decides. Human approves consequential exceptions.**
@@ -199,6 +204,7 @@ forge run [--allow-edits] [--worker <name>] [--timeout <seconds>]
           [--repair] [--repair-review] [--max-repairs <n>]
           [--review] [--reviewer <name>] [--review-timeout <seconds>]
           [--continue-on-concerns] [--continue-without-review]
+          [--auto-decide] [--decision-maker <name>] [--decision-timeout <seconds>]
           [--auto-commit] [--dry-run]
 forge run step [same options]
 forge run status
@@ -215,7 +221,7 @@ forge approval reject <id> --reason <text>
 forge pause --reason <text>
 forge resume --reason <text>
 forge config show | get <key> | set <key> <value> | reset <key> | validate
-forge provider list | check [--role planner|implementer|reviewer] [<provider>]
+forge provider list | check [--role planner|implementer|reviewer|decision-maker] [<provider>]
 ```
 
 Exit codes: `0` success, `1` failure, `2` usage error.
@@ -314,13 +320,14 @@ Forge never passes `--dangerously-bypass-approvals-and-sandbox`, `danger-full-ac
 
 ## Provider roles
 
-Forge has three AI roles and two providers. Each role is configured independently, with the M8 precedence (command line > project configuration > default `claude`):
+Forge has four AI roles and two providers. Each role is configured independently, with the M8 precedence (command line > project configuration > default `claude`):
 
 | Role | Setting | CLI option | Providers |
 | --- | --- | --- | --- |
 | implementer | `providers.implementer` | `--worker` | `claude` (Claude Code), `codex` |
 | planner | `providers.planner` | `--planner` | `claude`, `codex` |
 | reviewer | `providers.reviewer` | `--reviewer` | `claude`, `codex` |
+| decision-maker | `providers.decisionMaker` | `--decision-maker` | `claude` (recommended), `codex`; only used with `--auto-decide` |
 
 - `forge config set providers.<role> <name>` refuses names the role's registry does not know.
 - **Mixed providers are supported**: any combination runs through the same tasks, attempts, changeset attribution, validation, review, approvals and safe commit. The provider never changes Forge's workflow semantics.
@@ -590,7 +597,81 @@ Values outside the limits are **refused, never clamped**; there is no "0 means u
 
 **History.** `state.json` keeps the last 50 runs, each with at most 200 events (action, task, attempt, outcome code, a detail of at most 300 characters), counters, the policy and its hash, and the stop reason. Prompts, diffs, validation output, worker claims and provider text are never stored there.
 
-**Manual vs autonomous.** Every manual command (`forge task run|validate|review|review-accept|review-reject|commit`, `forge plan …`, `forge validation …`) works exactly as before. Manually started attempts carry no orchestration origin, so `forge run` never auto-reviews or auto-commits them. It does include them in selection and repair decisions based on their recorded outcome.
+**Manual vs autonomous.** Every manual command (`forge task run|validate|review|review-accept|review-reject|commit`, `forge plan …`, `forge validation …`) works exactly as before. Manually started attempts carry no orchestration origin, so `forge run` never auto-commits them and does not auto-review them, with one exception: a validated attempt that answers OPEN remediation is reviewed (and, with `--auto-decide`, decided) when review is enabled, because remediation is only ever confirmed by a review decision. It does include them in selection and repair decisions based on their recorded outcome.
+
+## Auto-decision
+
+Without it, review concerns stop the run for a human (`REVIEW DECISION REQUIRED`), exactly as before. With `--auto-decide` (or `forge config set run.autoDecide true`), a separate AI role, the **decision-maker**, judges those reviews so long builds don't stop for routine engineering calls.
+
+```
+forge config set providers.decisionMaker claude      # default; any AI provider works, never a fallback
+forge run --allow-edits --review --auto-decide --repair --repair-review --max-repairs 3 --auto-commit
+forge run --review --auto-decide --decision-maker codex --decision-timeout 600 ...
+```
+
+Settings: `run.autoDecide` (requires `run.review`), `providers.decisionMaker`, `run.decisionTimeoutSeconds`. Naming a decision-maker on the command line enables it; naming one only in the project configuration does not.
+
+**Roles stay separate.** The reviewer finds problems. The decision-maker judges, from Forge's evidence, whether the work should be accepted, sent back, or handed to a human. It is told to evaluate each finding itself, not to echo the reviewer's recommendation.
+
+**When it is consulted.** Only where the run would otherwise stop for a human review decision: a review with concerns, or blocking concerns when `--repair-review` is off (with it, policy repair keeps precedence). It only ever sees attempts that passed required deterministic validation. In auto mode, a clear review of an attempt that answers open human- or AI-required remediation is also decided, because a clear review alone does not prove the remediation happened.
+
+**Evidence it receives** (bounded, deterministic, fenced as data):
+- the task and its instruction, with attempt and repair counts;
+- the validation results and the configured checks, with the program each one runs;
+- Forge's scope, integrity, attribution and safe-commit status;
+- the worker's summary, labelled **UNTRUSTED CLAIM**;
+- the review, with numbered findings and the reviewer's (advisory) recommendation;
+- outstanding remediation requirements, with which attributed files changed since each was made;
+- earlier attempts, reviews and AI decisions;
+- the attributed diffs (secret-like, protected and binary files withheld).
+
+Nothing else from the repository.
+
+**Evidence hierarchy.** Forge's deterministic evidence (checks it ran, attributed changes) > reviewer findings (advisory) > worker claims (never evidence). "Tests pass" with no check that runs tests, or "added tests" with no test file in the changes, is not proven.
+
+**Contract.** One JSON object with:
+- `decision`: accept, reject or escalate;
+- `confidence`: low, medium or high;
+- `reason`;
+- an assessment of every warning-or-worse finding and every outstanding requirement (R1, R2, …);
+- `requiredActions`, given exactly for reject;
+- `humanReason`, given exactly for escalate.
+
+Anything else (prose, extra fields, a missing assessment) is invalid and escalates. It never becomes acceptance.
+
+**Forge's rules (acceptance needs stronger evidence than rejection).**
+
+| Verdict | Applied when | Otherwise |
+| --- | --- | --- |
+| accept | high confidence, required validation passed, no critical finding, every blocking finding assessed resolved / not applicable, no warning left unresolved, every outstanding requirement assessed satisfied, and attributed files actually changed since each requirement was made | escalate |
+| reject | medium or high confidence, and a repair is still possible (repair budget and attempts left) | escalate |
+| escalate, no answer, invalid answer, timeout, Ctrl+C | — | stop for a human |
+
+- **ACCEPT** records an `accepted` review decision `by: ai` (the same transition as `forge task review-accept`) and resolves the task's open remediation. The run then continues; with `--auto-commit` the normal safe-commit rules decide whether to commit. An AI acceptance never bypasses them.
+- **REJECT** records a `remediation-required` decision `by: ai`, persists `requiredActions` as a remediation record, and reopens the task. The next step repairs it with the review evidence and the outstanding requirements (repair budget and attempt limits apply), validates, reviews and decides again.
+- **ESCALATE** (and every failure) stops with `AI DECISION ESCALATED` or `DECISION-MAKER UNAVAILABLE` and a review-acceptance approval request carrying the reason. Decide with `forge approval approve|reject` or `forge task review-accept|review-reject`. An escalation is never re-asked; a provider failure is retried once per later run, at most 3 times per review.
+
+**Hard boundaries the decision-maker never reaches or changes:**
+- integrity and scope violations (never acknowledged);
+- failed or missing required validation (the normal repair path applies; validation is never overridden);
+- unsafe Git attribution (safe-commit refuses), a moved HEAD, and merge conflicts;
+- exhausted attempts or repair budgets (it cannot add or reset any);
+- interrupted or concurrent tasks, and paused projects;
+- approval gates and lease recovery;
+- provider authentication.
+
+Its instructions also tell it to escalate product ambiguity, major scope expansion, and anything security-, credential- or destructive-operation-related.
+
+**Remediation tracking.** Every remediation-required review decision (human, policy or AI) creates a structured remediation record. It survives restarts and appears in `forge task show`, `forge status` and `forge audit`. It stays open until a later attempt's review is accepted. Every later worker attempt receives the open requirements, including a manual `forge task run`. The reviewer and the decision-maker are shown them too.
+
+**Provider health.** With auto-decision on, the decision-maker's health is a critical preflight check: if it is unavailable or logged out, `forge run` refuses to start. If it fails during a run, Forge records the failure and stops for a human. It never switches provider and never treats the failure as acceptance.
+
+**Visibility.**
+- `forge status`: whether auto-decision is configured and was active in the last run, plus open remediation.
+- `forge task show`: remediation and AI decisions.
+- `forge task review-show`: each decision with its reason, Forge's rule and required actions.
+- `forge explain`: what the decision-maker decided during the last run, and why Forge stopped.
+- `forge audit`: each AI decision (provider, model when known, verdict, confidence, effect, reason, review), and each remediation required and satisfied.
 
 ## Human control
 

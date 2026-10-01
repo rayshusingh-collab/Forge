@@ -40,11 +40,17 @@ const USAGE = [
   '  --review-timeout <seconds> Reviewer timeout',
   '  --continue-on-concerns     Do not stop for review warnings (blocking concerns still stop)',
   '  --continue-without-review  Continue unreviewed when the reviewer is unavailable (default: stop)',
+  '  --auto-decide              Let the AI decision-maker accept, reject (repair) or escalate reviews',
+  '                             that would otherwise stop for a human (requires --review)',
+  '  --decision-maker <name>    Decision-maker provider (implies --auto-decide; default: providers.decisionMaker)',
+  '  --decision-timeout <seconds> Decision-maker timeout',
   '  --auto-commit              Commit each validated task\'s own changes locally (never pushes)',
   '',
   'Precedence: hard limits > command-line option > project configuration > default.',
   'Values above the hard maximums are refused, not clamped. Forge never pushes, never',
   'overrides validation, and never acknowledges violations or approves anything on its own.',
+  'Auto-decision only judges reviews of validated work: accepting needs high confidence and',
+  'evidence; low confidence, malformed answers and provider failures stop for a human.',
 ].join('\n');
 
 const POLICY_OPTIONS = {
@@ -61,6 +67,9 @@ const POLICY_OPTIONS = {
   'review-timeout': { type: 'string' },
   'continue-on-concerns': { type: 'boolean' },
   'continue-without-review': { type: 'boolean' },
+  'auto-decide': { type: 'boolean' },
+  'decision-maker': { type: 'string' },
+  'decision-timeout': { type: 'string' },
   'auto-commit': { type: 'boolean' },
 } as const;
 
@@ -119,11 +128,12 @@ async function execute(mode: 'run' | 'step', args: readonly string[], context: C
 
   const worker = createWorker(policy.worker, context);
   const reviewer = policy.review.enabled ? createAiProvider(policy.review.reviewer!, 'reviewer', context) : null;
-  if (worker === undefined || reviewer === undefined) {
+  const decisionMaker = policy.decision.enabled ? createAiProvider(policy.decision.provider!, 'decision-maker', context) : null;
+  if (worker === undefined || reviewer === undefined || decisionMaker === undefined) {
     return ExitCode.Usage;
   }
 
-  context.stdout.write(formatPolicyHeader(project.project.name, mode, policy, worker, reviewer, resolution.sources));
+  context.stdout.write(formatPolicyHeader(project.project.name, mode, policy, worker, reviewer, resolution.sources, decisionMaker));
   const engine = new TaskEngine({ project, store, runner });
   const orchestrator = new Orchestrator({
     project,
@@ -132,6 +142,7 @@ async function execute(mode: 'run' | 'step', args: readonly string[], context: C
     runner,
     worker,
     reviewer,
+    decisionMaker,
     policy,
     reporter: { onStep: (step) => context.stdout.write(formatStep(step)) },
     ...(context.signal === undefined ? {} : { signal: context.signal }),
@@ -243,6 +254,8 @@ function parsePolicy(command: string, parsed: ParsedArgs, context: CliContext, w
   const allowEdits = optionalBoolean(parsed, 'allow-edits');
   const reviewer = stringOption(parsed, 'reviewer');
   const review = optionalBoolean(parsed, 'review') ?? (reviewer === undefined ? undefined : true);
+  const decisionMaker = stringOption(parsed, 'decision-maker');
+  const autoDecide = optionalBoolean(parsed, 'auto-decide') ?? (decisionMaker === undefined ? undefined : true);
   const cli: PolicyOptions = {
     ...optional<'access', 'edit' | 'read-only'>('access', allowEdits === undefined ? undefined : allowEdits ? 'edit' : 'read-only'),
     ...optional('worker', stringOption(parsed, 'worker')),
@@ -257,6 +270,9 @@ function parsePolicy(command: string, parsed: ParsedArgs, context: CliContext, w
     ...optional('reviewTimeoutMs', seconds('review-timeout')),
     ...optional('continueOnConcerns', optionalBoolean(parsed, 'continue-on-concerns')),
     ...optional('continueWithoutReview', optionalBoolean(parsed, 'continue-without-review')),
+    ...optional('autoDecide', autoDecide),
+    ...optional('decisionMaker', decisionMaker),
+    ...optional('decisionTimeoutMs', seconds('decision-timeout')),
     ...optional('autoCommit', optionalBoolean(parsed, 'auto-commit')),
   };
   if (problems.length === 0) {

@@ -58,6 +58,7 @@ export function explain(input: ExplainInput): string[] {
 
 function explainRun(state: ProjectState, view: WorkflowView, run: OrchestrationRun): string[] {
   const lines = [`Last run ${run.id.slice(0, 8)} (${run.mode}) started ${run.startedAt}${run.finishedAt === null ? '' : `, ended ${run.finishedAt}`}: ${run.counters.steps} step(s), ${run.counters.tasks} task(s), ${run.counters.repairs} repair(s), ${run.counters.commits} commit(s).`];
+  lines.push(...decisionsDuringRun(state, view, run));
   if (run.status === 'running') {
     lines.push('It is still recorded as running (or crashed without recording a stop). `forge run status` shows whether its process is alive.');
     return lines;
@@ -81,6 +82,7 @@ function explainRun(state: ProjectState, view: WorkflowView, run: OrchestrationR
       `AI review: ${!run.policy.review.enabled ? 'disabled for that run' : review === undefined ? 'NOT REVIEWED' : review.status.toUpperCase().replace('-', ' ')}${review === undefined ? '' : ` (review ${review.id.slice(0, 8)})`}`,
       `Automatic repair: ${repairOn ? `enabled (${repairsUsed(task.task)}/${run.policy.repair.maxPerTask} used)` : 'disabled'}`,
     );
+    lines.push(...explainDecision(state, task, run.policy));
   }
   const approval = relatedApproval(state, stop.taskId);
   if (approval !== undefined) {
@@ -95,6 +97,53 @@ function explainRun(state: ProjectState, view: WorkflowView, run: OrchestrationR
     }
   } else {
     lines.push(`  ${withKey(info.action, key) ?? 'none'}`);
+  }
+  return lines;
+}
+
+/** What the AI decision-maker decided during the run, so an automatic acceptance or rejection is never silent. */
+function decisionsDuringRun(state: ProjectState, view: WorkflowView, run: OrchestrationRun): string[] {
+  const end = run.finishedAt ?? '9999';
+  const decisions = state.aiDecisions.filter((decision) => decision.createdAt >= run.startedAt && decision.createdAt <= end);
+  if (decisions.length === 0) {
+    return [];
+  }
+  const count = (effect: string): number => decisions.filter((decision) => decision.effect === effect).length;
+  return [
+    `AI decisions during this run: ${decisions.length} (${count('accepted')} accepted, ${count('remediation-required')} remediation, ${count('escalated')} escalated)`,
+    ...decisions.slice(-5).map((decision) => {
+      const answer = decision.status === 'decided' ? `${decision.verdict}, ${decision.confidence} confidence` : `no usable answer (${decision.status})`;
+      const why = decision.policyNote ?? decision.humanReason ?? decision.reason ?? decision.diagnostic ?? '';
+      return `  task ${view.task(decision.taskId)?.key ?? decision.taskId.slice(0, 8)} attempt ${decision.attempt}: ${decision.effect.toUpperCase()} — ${answer}${why === '' ? '' : `: ${why}`}`;
+    }),
+  ];
+}
+
+/** The task's latest AI decision and outstanding remediation, when auto-decision or remediation is involved. */
+function explainDecision(state: ProjectState, task: TaskView, policy: OrchestrationPolicy): string[] {
+  const lines: string[] = [];
+  const decision = state.aiDecisions.filter((candidate) => candidate.taskId === task.task.id).at(-1);
+  if (decision !== undefined) {
+    const answer = decision.status === 'decided' ? `${decision.verdict} with ${decision.confidence} confidence` : `no usable answer (${decision.status})`;
+    lines.push(`AI decision: ${decision.effect.toUpperCase()} — the decision-maker (${decision.call.provider}) answered ${answer} on attempt ${decision.attempt}`);
+    if (decision.reason !== null) {
+      lines.push(`  Its reason: ${decision.reason}`);
+    }
+    if (decision.policyNote !== null) {
+      lines.push(`  Forge's rule: ${decision.policyNote}`);
+    }
+    if (decision.humanReason !== null) {
+      lines.push(`  Needs a human because: ${decision.humanReason}`);
+    }
+    if (decision.diagnostic !== null) {
+      lines.push(`  Problem: ${decision.diagnostic}`);
+    }
+  } else if (policy.decision.enabled) {
+    lines.push('AI decision: none recorded for this task yet');
+  }
+  const open = state.remediations.filter((remediation) => remediation.taskId === task.task.id && remediation.status === 'open');
+  for (const remediation of open) {
+    lines.push(`Outstanding remediation (from attempt ${remediation.fromAttempt}, by ${remediation.source}): ${remediation.requirements.join('; ')}`);
   }
   return lines;
 }
@@ -127,6 +176,10 @@ function sentence(reason: StopReason, task: TaskView | undefined, state: Project
       return `protected Forge state changed during ${name.toLowerCase()}'s execution.`;
     case 'scope-acknowledgement-required':
       return `${name} changed things outside its permitted scope.`;
+    case 'decision-escalated':
+      return `the AI decision-maker escalated ${name.toLowerCase()}'s review to a human instead of deciding it.`;
+    case 'decision-maker-unavailable':
+      return `the AI decision-maker gave no usable answer for ${name.toLowerCase()} (never treated as acceptance).`;
     case 'reviewer-unavailable':
       return `the AI reviewer did not produce a usable review of ${name.toLowerCase()} (never treated as clear).`;
     case 'commit-refused':
@@ -150,6 +203,8 @@ function describeAction(kind: string): string {
       return 'repair';
     case 'review':
       return 'review';
+    case 'decide':
+      return 'ask the AI decision-maker to judge the review of';
     case 'commit':
       return 'commit';
     case 'apply-approval':

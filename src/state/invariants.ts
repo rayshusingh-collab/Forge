@@ -125,6 +125,7 @@ export function checkWorkflowInvariants(state: ProjectState): void {
 
   checkPlanProposals(state, milestoneIds, taskIds);
   checkTaskReviews(state);
+  checkRemediationsAndAiDecisions(state);
   checkRepairs(state);
   checkOrchestrationRuns(state);
   checkApprovals(state, taskIds);
@@ -285,6 +286,78 @@ function checkTaskReviews(state: ProjectState): void {
       }
     });
   }
+}
+
+/**
+ * Remediation and AI decision records must agree with the review decisions
+ * they explain:
+ * - every `remediation-required` decision has exactly one remediation record
+ *   (same task, attempt and decider), and every record has such a decision;
+ * - a satisfied remediation names a later, accepted review of the same task;
+ * - every `ai` decision names an AI decision whose effect is exactly that
+ *   decision, and every applied AI decision is named by its review.
+ */
+function checkRemediationsAndAiDecisions(state: ProjectState): void {
+  uniqueIds(state.remediations, 'remediations');
+  uniqueIds(state.aiDecisions, 'aiDecisions');
+  const reviews = new Map(state.taskReviews.map((review) => [review.id, review]));
+  const tasks = new Map(state.tasks.map((task) => [task.id, task]));
+  const decisions = new Map(state.aiDecisions.map((decision) => [decision.id, decision]));
+
+  const remediationByReview = new Map<string, number>();
+  state.remediations.forEach((remediation, index) => {
+    const path = `remediations[${index}]`;
+    const review = reviews.get(remediation.reviewId);
+    if (review === undefined || review.decision?.kind !== 'remediation-required') {
+      throw new SchemaViolation(`${path}.reviewId`, 'must reference a review whose decision required remediation');
+    }
+    if (review.taskId !== remediation.taskId || review.attempt !== remediation.fromAttempt || review.decision.by !== remediation.source) {
+      throw new SchemaViolation(path, 'disagrees with the review decision it records (task, attempt, or decider)');
+    }
+    remediationByReview.set(remediation.reviewId, (remediationByReview.get(remediation.reviewId) ?? 0) + 1);
+    if (remediation.resolvedByReviewId !== null) {
+      const resolver = reviews.get(remediation.resolvedByReviewId);
+      if (resolver === undefined || resolver.taskId !== remediation.taskId || resolver.attempt <= remediation.fromAttempt || resolver.decision?.kind !== 'accepted') {
+        throw new SchemaViolation(`${path}.resolvedByReviewId`, 'must reference a later, accepted review of the same task');
+      }
+    }
+  });
+  for (const review of state.taskReviews) {
+    if (review.decision?.kind === 'remediation-required' && remediationByReview.get(review.id) !== 1) {
+      throw new SchemaViolation('remediations', `must contain exactly one record for the remediation decision on review "${review.id}"`);
+    }
+  }
+
+  const perTask = new Map<string, number>();
+  state.aiDecisions.forEach((decision, index) => {
+    const path = `aiDecisions[${index}]`;
+    const task = tasks.get(decision.taskId);
+    if (task === undefined || task.attempts[decision.attempt - 1] === undefined) {
+      throw new SchemaViolation(`${path}.taskId`, 'references an unknown task or attempt');
+    }
+    const review = reviews.get(decision.reviewId);
+    if (review !== undefined && (review.taskId !== decision.taskId || review.attempt !== decision.attempt)) {
+      throw new SchemaViolation(`${path}.reviewId`, 'refers to a review of a different task or attempt');
+    }
+    if (decision.effect !== 'escalated' && (review?.decision?.aiDecisionId !== decision.id || review.decision.kind !== decision.effect)) {
+      throw new SchemaViolation(`${path}.effect`, 'is not the decision recorded on its review');
+    }
+    perTask.set(decision.taskId, (perTask.get(decision.taskId) ?? 0) + 1);
+  });
+  for (const [taskId, count] of perTask) {
+    if (count > AI_LIMITS.aiDecisionsPerTask) {
+      throw new SchemaViolation('aiDecisions', `contain more than ${AI_LIMITS.aiDecisionsPerTask} decisions for task "${taskId}"`);
+    }
+  }
+  state.taskReviews.forEach((review, index) => {
+    const id = review.decision?.aiDecisionId ?? null;
+    if (id !== null) {
+      const decision = decisions.get(id);
+      if (decision === undefined || decision.reviewId !== review.id || decision.effect !== review.decision!.kind) {
+        throw new SchemaViolation(`taskReviews[${index}].decision.aiDecisionId`, 'must reference the AI decision whose effect it records');
+      }
+    }
+  });
 }
 
 function sameIds(a: readonly string[], b: readonly string[]): boolean {

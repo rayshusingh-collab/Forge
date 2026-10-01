@@ -143,8 +143,25 @@ function populatedState(): ProjectState {
   };
 }
 
-/** Removes fields introduced in schema version 8, for documents of older versions. */
+/** Removes fields introduced in schema version 9, for documents of older versions. */
+function stripV9(doc: Record<string, unknown>): Record<string, unknown> {
+  delete doc['remediations'];
+  delete doc['aiDecisions'];
+  for (const review of (doc['taskReviews'] as Record<string, unknown>[] | undefined) ?? []) {
+    if (review['decision'] !== null && typeof review['decision'] === 'object') {
+      delete (review['decision'] as Record<string, unknown>)['aiDecisionId'];
+    }
+  }
+  for (const run of (doc['orchestrationRuns'] as Record<string, unknown>[] | undefined) ?? []) {
+    delete (run['policy'] as Record<string, unknown>)['decision'];
+    delete (run['counters'] as Record<string, unknown>)['decisions'];
+  }
+  return doc;
+}
+
+/** Removes fields introduced in schema versions 8 and 9, for documents of older versions. */
 function stripV8(doc: Record<string, unknown>): Record<string, unknown> {
+  stripV9(doc);
   for (const task of (doc['tasks'] as Record<string, unknown>[] | undefined) ?? []) {
     delete task['humanRepair'];
   }
@@ -506,6 +523,7 @@ describe('StateStore: rejecting bad data', () => {
       workerTimeoutMs: 600_000,
       repair: { onValidationFailure: false, onBlockingReview: false, maxPerTask: 2 },
       review: { enabled: false, reviewer: null, timeoutMs: 600_000, onConcerns: 'stop', onFailure: 'stop' },
+      decision: { enabled: false, provider: null, timeoutMs: 600_000 },
       autoCommit: false,
     };
     const run = (fields: Record<string, unknown>) => ({
@@ -517,7 +535,7 @@ describe('StateStore: rejecting bad data', () => {
       finishedAt: T0.toISOString(),
       policy,
       policyHash: 'a'.repeat(64),
-      counters: { steps: 0, tasks: 0, repairs: 0, reviews: 0, commits: 0, milestones: 0 },
+      counters: { steps: 0, tasks: 0, repairs: 0, reviews: 0, decisions: 0, commits: 0, milestones: 0 },
       events: [],
       eventsDropped: 0,
       stop: { reason: 'complete', detail: null, taskId: null },
@@ -587,13 +605,13 @@ describe('StateStore: rejecting bad data', () => {
 
     it('rejects a decision on a review that did not complete', () =>
       expectLoadError(
-        { ...valid(), taskReviews: [review({ status: 'invalid-output', decision: { kind: 'accepted', reason: 'x', decidedAt: T0.toISOString(), by: 'human' } })] },
+        { ...valid(), taskReviews: [review({ status: 'invalid-output', decision: { kind: 'accepted', reason: 'x', decidedAt: T0.toISOString(), by: 'human', aiDecisionId: null } })] },
         /only allowed on a completed review/,
       ));
 
     it('rejects a remediation decision whose attempt was not reopened', () =>
       expectLoadError(
-        { ...valid(), taskReviews: [review({ decision: { kind: 'remediation-required', reason: 'x', decidedAt: T0.toISOString(), by: 'human' } })] },
+        { ...valid(), taskReviews: [review({ decision: { kind: 'remediation-required', reason: 'x', decidedAt: T0.toISOString(), by: 'human', aiDecisionId: null } })] },
         /requires remediation, but the attempt was not reopened/,
       ));
 

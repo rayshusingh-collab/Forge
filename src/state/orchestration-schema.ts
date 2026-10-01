@@ -97,8 +97,8 @@ function decodeOwner(value: unknown, path: string): AttemptExecutor {
 
 /** Decodes a policy and enforces the hard limits, so stored policy can never exceed them. */
 export function decodeOrchestrationPolicy(value: unknown, path: string): OrchestrationPolicy {
-  const r = new ObjectReader(value, path, ['maxTasks', 'maxSteps', 'access', 'worker', 'workerTimeoutMs', 'repair', 'review', 'autoCommit']);
-  return {
+  const r = new ObjectReader(value, path, ['maxTasks', 'maxSteps', 'access', 'worker', 'workerTimeoutMs', 'repair', 'review', 'decision', 'autoCommit']);
+  const policy: OrchestrationPolicy = {
     maxTasks: r.integer('maxTasks', { min: 1, max: ORCHESTRATION_LIMITS.maxTasks }),
     maxSteps: r.integer('maxSteps', { min: 1, max: ORCHESTRATION_LIMITS.maxSteps }),
     access: r.oneOf('access', WORKER_ACCESS_MODES),
@@ -126,17 +126,35 @@ export function decodeOrchestrationPolicy(value: unknown, path: string): Orchest
       }
       return decoded;
     }),
+    decision: r.field('decision', (item, itemPath) => {
+      const decision = new ObjectReader(item, itemPath, ['enabled', 'provider', 'timeoutMs']);
+      const decoded = {
+        enabled: decision.field('enabled', decodeBoolean),
+        provider: decision.nullableString('provider', PROVIDER_RULES),
+        timeoutMs: decision.integer('timeoutMs', { min: 1, max: MAX_TIMEOUT_MS }),
+      };
+      if (decoded.enabled !== (decoded.provider !== null)) {
+        throw new SchemaViolation(`${itemPath}.provider`, 'must be set exactly when auto-decision is enabled');
+      }
+      return decoded;
+    }),
     autoCommit: r.field('autoCommit', decodeBoolean),
   };
+  // The decision-maker judges completed reviews, so it is meaningless (and refused) without review.
+  if (policy.decision.enabled && !policy.review.enabled) {
+    throw new SchemaViolation(`${path}.decision`, 'auto-decision requires AI review to be enabled');
+  }
+  return policy;
 }
 
 function decodeCounters(value: unknown, path: string): OrchestrationCounters {
-  const r = new ObjectReader(value, path, ['steps', 'tasks', 'repairs', 'reviews', 'commits', 'milestones']);
+  const r = new ObjectReader(value, path, ['steps', 'tasks', 'repairs', 'reviews', 'decisions', 'commits', 'milestones']);
   return {
     steps: r.integer('steps', { min: 0, max: ORCHESTRATION_LIMITS.maxSteps }),
     tasks: r.integer('tasks', { min: 0, max: ORCHESTRATION_LIMITS.maxTasks }),
     repairs: r.integer('repairs', { min: 0 }),
     reviews: r.integer('reviews', { min: 0 }),
+    decisions: r.integer('decisions', { min: 0 }),
     commits: r.integer('commits', { min: 0 }),
     milestones: r.integer('milestones', { min: 0 }),
   };
