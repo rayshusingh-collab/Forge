@@ -326,7 +326,11 @@ function checkTask(
     }
   });
 
-  const implied = statusImpliedByAttempts(task.attempts);
+  if (task.humanRepair !== null) {
+    checkHumanRepair(task, `${path}.humanRepair`);
+  }
+  // An accepted human repair is the only way a task succeeds after its attempts all failed.
+  const implied = task.humanRepair === null ? statusImpliedByAttempts(task.attempts) : 'succeeded';
   if (task.status === 'cancelled') {
     if (implied !== 'pending' && implied !== 'failed') {
       throw new SchemaViolation(`${path}.status`, 'cannot be cancelled while its latest attempt is unfinished or successful');
@@ -340,6 +344,27 @@ function checkTask(
   // A task can only have been executed once all of its dependencies succeeded, and succeeded tasks are terminal.
   if (task.attempts.length > 0 && task.dependsOn.some((id) => statusById.get(id) !== 'succeeded')) {
     throw new SchemaViolation(`${path}.dependsOn`, 'includes a task that has not succeeded, but this task has been executed');
+  }
+}
+
+/**
+ * A human repair is accepted only for an exhausted task whose attempts all
+ * failed, after required validation passed; its record must say exactly that.
+ */
+function checkHumanRepair(task: TaskRecord, path: string): void {
+  const repair = task.humanRepair!;
+  const last = task.attempts.at(-1);
+  if (last === undefined || task.attempts.length < task.maxAttempts || repair.afterAttempt !== last.number) {
+    throw new SchemaViolation(`${path}.afterAttempt`, 'must be the last attempt of a task that used all its attempts');
+  }
+  if (!FAILED_ATTEMPT_OUTCOMES.includes(last.outcome)) {
+    throw new SchemaViolation(`${path}.afterAttempt`, `follows attempt outcome "${last.outcome}", but only a failed task can be repaired by a human`);
+  }
+  if (repair.validation.status !== 'passed' || !repair.validation.checks.some((check) => check.required && check.status === 'passed')) {
+    throw new SchemaViolation(`${path}.validation`, 'must be a passed validation of at least one required check');
+  }
+  if (repair.acknowledgedViolation !== (last.outcome === 'integrity-violation' || last.outcome === 'scope-violation')) {
+    throw new SchemaViolation(`${path}.acknowledgedViolation`, 'must be set exactly when the last attempt ended in an integrity or scope violation');
   }
 }
 

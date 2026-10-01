@@ -6,16 +6,20 @@ import type {
   AttemptOrigin,
   AttemptOutcome,
   RepairRecord,
+  ChangeSummary,
   CommitRecord,
+  HumanRepairRecord,
   MilestoneRecord,
   MilestoneStatus,
   ProjectState,
   TaskAttempt,
   TaskRecord,
   TaskStatus,
+  ValidationRecord,
   WorkerRunRecord,
   WorkerRunStatus,
 } from '../state/index.ts';
+import { scopeProblem } from './decision.ts';
 import type { PostExecution } from './decision.ts';
 import { deriveWorkflow } from './view.ts';
 import type { ExecutorLiveness, TaskView } from './view.ts';
@@ -35,7 +39,8 @@ export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]
   pending: ['running', 'cancelled'],
   running: ['succeeded', 'awaiting-validation', 'failed'],
   'awaiting-validation': ['succeeded', 'failed'],
-  failed: ['running', 'cancelled'],
+  // `succeeded` only via an accepted human repair of an exhausted task (acceptHumanRepair).
+  failed: ['running', 'cancelled', 'succeeded'],
   // Only via an explicit human remediation decision after an AI review (reopenForRemediation).
   succeeded: ['failed'],
   cancelled: [],
@@ -186,6 +191,7 @@ export function addTask(state: ProjectState, input: NewTask, now: Date): Project
     maxAttempts: input.maxAttempts,
     attempts: [],
     cancelReason: null,
+    humanRepair: null,
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -366,6 +372,97 @@ export function recordCommit(state: ProjectState, taskId: string, attemptNumber:
   return replaceTask(state, { ...withLastAttempt(task, { commit }), updatedAt: now.toISOString() });
 }
 
+export interface HumanRepairInput {
+  /** The last attempt the caller saw; a mismatch means the task changed meanwhile. */
+  readonly afterAttempt: number;
+  readonly reason: string;
+  readonly acknowledgeIntegrityViolation: boolean;
+  /** Changeset Forge just measured against the task's recorded baseline. */
+  readonly changes: ChangeSummary;
+  /** Validation Forge just ran. */
+  readonly validation: ValidationRecord;
+}
+
+/**
+ * Checks that a human repair of the task could be accepted, before any
+ * evidence is gathered. Only an EXHAUSTED task qualifies: a task with
+ * attempts left is retried, not hand-accepted.
+ */
+export function assertCanAcceptHumanRepair(
+  state: ProjectState,
+  taskId: string,
+  options: { readonly acknowledgeIntegrityViolation: boolean; readonly liveness: ExecutorLiveness },
+): TaskView {
+  findTask(state, taskId);
+  const view = deriveWorkflow(state, options.liveness).task(taskId)!;
+  if (view.condition !== 'exhausted') {
+    const hints: Partial<Record<string, string>> = {
+      retryable: `; it still has ${view.attemptsRemaining} attempt(s): retry it with \`forge task run ${view.key}\``,
+      'awaiting-validation': `; use \`forge task validate ${view.key}\``,
+      interrupted: `; run \`forge task recover ${view.key}\` first`,
+    };
+    throw new WorkflowError(
+      `Task ${view.key} is ${view.condition}; only an exhausted task (all attempts used and failed) can be accepted after a human repair${hints[view.condition] ?? ''}`,
+    );
+  }
+  if (view.requiresIntegrityAcknowledgement && !options.acknowledgeIntegrityViolation) {
+    throw new WorkflowError(
+      `Task ${view.key}'s last attempt ended in a ${view.lastAttempt?.outcome} (${view.lastAttempt?.note ?? 'protected state or scope was violated'}). ` +
+        'Inspect the project and .forge/, then accept the repair with --acknowledge-integrity-violation.',
+    );
+  }
+  return view;
+}
+
+/**
+ * failed (exhausted) -> succeeded, as an explicit, audited human decision
+ * backed by Forge's own fresh evidence: required validation passed and the
+ * changeset is attributable and in scope. The attempts are not touched
+ * (each keeps its failed outcome); the repair is recorded on the task.
+ */
+export function acceptHumanRepair(state: ProjectState, taskId: string, input: HumanRepairInput, liveness: ExecutorLiveness, now: Date): ProjectState {
+  assertNotPaused(state, 'accept a human repair');
+  const view = assertCanAcceptHumanRepair(state, taskId, { acknowledgeIntegrityViolation: input.acknowledgeIntegrityViolation, liveness });
+  if (view.lastAttempt?.number !== input.afterAttempt) {
+    throw new WorkflowError(`Task ${view.key} changed while its repair was being checked; nothing was recorded`);
+  }
+  const reason = requireText(input.reason, 'Repair reason', TASK_LIMITS.note);
+  const { changes, validation } = input;
+  if (validation.status !== 'passed' || !validation.checks.some((check) => check.required && check.status === 'passed')) {
+    throw new WorkflowError(`Task ${view.key}: required validation did not pass (${validation.status}); the repair cannot be accepted`);
+  }
+  const problem = scopeProblem(changes);
+  if (problem !== null) {
+    throw new WorkflowError(`Task ${view.key}: ${problem}; the repair cannot be accepted`);
+  }
+  if (changes.truncated || changes.baseline.truncated) {
+    throw new WorkflowError(`Task ${view.key}: too many changed paths to attribute safely; the repair cannot be accepted`);
+  }
+  if (changes.files.length === 0) {
+    throw new WorkflowError(`Task ${view.key}: nothing has changed since the task began; there is no repair to accept`);
+  }
+  const humanRepair: HumanRepairRecord = {
+    afterAttempt: input.afterAttempt,
+    reason,
+    by: 'human',
+    acceptedAt: now.toISOString(),
+    acknowledgedViolation: view.requiresIntegrityAcknowledgement,
+    changes,
+    validation,
+    commit: null,
+  };
+  return replaceTask(state, withStatus(view.task, 'succeeded', now, { humanRepair }));
+}
+
+/** Records the local commit Forge created for an accepted human repair. */
+export function recordHumanRepairCommit(state: ProjectState, taskId: string, commit: CommitRecord, now: Date): ProjectState {
+  const task = findTask(state, taskId);
+  if (task.status !== 'succeeded' || task.humanRepair === null || task.humanRepair.commit !== null) {
+    throw new WorkflowError(`Task "${task.title}" changed before its commit could be recorded`);
+  }
+  return replaceTask(state, { ...task, humanRepair: { ...task.humanRepair, commit }, updatedAt: now.toISOString() });
+}
+
 /** awaiting-validation -> failed. The attempt stays consumed; a retry must be requested explicitly. */
 export function rejectTask(state: ProjectState, taskId: string, reason: string, now: Date): ProjectState {
   const task = findTask(state, taskId);
@@ -531,7 +628,7 @@ function explainNotRunnable(view: TaskView, state: ProjectState): string {
     case 'blocked':
       return `blocked because ${view.blockingDependencies.map(label).join(', ')} can no longer succeed`;
     case 'exhausted':
-      return `all ${view.task.maxAttempts} attempts have been used`;
+      return `all ${view.task.maxAttempts} attempts have been used (after repairing it by hand: \`forge task accept-repair ${view.key} --reason "..."\`)`;
     case 'running':
       return 'it is already running';
     case 'interrupted':

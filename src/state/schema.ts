@@ -51,6 +51,7 @@ import type {
   CommitRecord,
   FileChange,
   GitBaseline,
+  HumanRepairRecord,
   TaskRecord,
   ValidationRecord,
   WorkerRunRecord,
@@ -173,6 +174,17 @@ export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
     }
     return { ...document, schemaVersion: 7, approvals: [], pause: null, controlEvents: [] };
   },
+  // 7 -> 8: human repair of exhausted tasks. No task had been accepted that way before.
+  7: (document) => ({
+    ...document,
+    schemaVersion: 8,
+    tasks: arrayOfObjects(document['tasks'], 'tasks').map((task, taskIndex) => {
+      if (Object.hasOwn(task, 'humanRepair')) {
+        throw new SchemaViolation(`tasks[${taskIndex}].humanRepair`, 'is not a recognised field in schema version 7');
+      }
+      return { ...task, humanRepair: null };
+    }),
+  }),
 };
 
 function arrayOfObjects(value: unknown, path: string): Record<string, unknown>[] {
@@ -262,6 +274,7 @@ function decodeTask(value: unknown, path: string): TaskRecord {
     'maxAttempts',
     'attempts',
     'cancelReason',
+    'humanRepair',
     'createdAt',
     'updatedAt',
   ]);
@@ -277,8 +290,23 @@ function decodeTask(value: unknown, path: string): TaskRecord {
     maxAttempts: r.integer('maxAttempts', { min: 1, max: TASK_LIMITS.maxAttempts }),
     attempts: r.array('attempts', decodeAttempt, TASK_LIMITS.maxAttempts),
     cancelReason: r.nullableString('cancelReason', NOTE_RULES),
+    humanRepair: r.nullable('humanRepair', decodeHumanRepair),
     createdAt: r.timestamp('createdAt'),
     updatedAt: r.timestamp('updatedAt'),
+  };
+}
+
+function decodeHumanRepair(value: unknown, path: string): HumanRepairRecord {
+  const r = new ObjectReader(value, path, ['afterAttempt', 'reason', 'by', 'acceptedAt', 'acknowledgedViolation', 'changes', 'validation', 'commit']);
+  return {
+    afterAttempt: r.integer('afterAttempt', { min: 1 }),
+    reason: r.string('reason', NOTE_RULES),
+    by: r.oneOf('by', ['human'] as const),
+    acceptedAt: r.timestamp('acceptedAt'),
+    acknowledgedViolation: r.field('acknowledgedViolation', decodeBoolean),
+    changes: r.field('changes', decodeChangeSummary),
+    validation: r.field('validation', decodeValidationRecord),
+    commit: r.nullable('commit', decodeCommit),
   };
 }
 

@@ -1,4 +1,4 @@
-import { TaskEngine, resolveTaskReference } from '../../tasks/index.ts';
+import { TaskEngine, acceptedWork, resolveTaskReference } from '../../tasks/index.ts';
 import type { TaskRunOutcome, TaskView, WorkflowView } from '../../tasks/index.ts';
 import type { Worker } from '../../workers/index.ts';
 import { booleanOption, expectPositionals, listOption, parseCommandArgs, requireProject, stringOption } from '../args.ts';
@@ -27,6 +27,9 @@ const USAGE = [
   '                                  Execute ONE attempt of ONE task, validate it, then stop',
   '  validate <task>                 Re-run deterministic validation for a task awaiting validation',
   '  override <task> --reason <text> Accept a task awaiting validation WITHOUT validation (audited)',
+  '  accept-repair <task> --reason <text> [--acknowledge-integrity-violation]',
+  '                                  Accept an EXHAUSTED task you repaired by hand: re-runs the required',
+  '                                  checks now and records it as a human repair only if they pass',
   '  reject <task> --reason <text>   Reject a task awaiting validation',
   '  commit <task>                   Commit a validated task\'s own changes locally (never pushes)',
   '  cancel <task> [--reason <text>] Cancel a pending or failed task',
@@ -61,6 +64,7 @@ const SUBCOMMANDS: Readonly<Record<string, Subcommand>> = {
   run,
   validate,
   override,
+  'accept-repair': acceptRepair,
   accept,
   reject,
   commit,
@@ -259,6 +263,52 @@ async function override(args: readonly string[], context: CliContext, engine: Ta
   return ExitCode.Success;
 }
 
+async function acceptRepair(args: readonly string[], context: CliContext, engine: TaskEngine): Promise<ExitCodeValue> {
+  const parsed = parseCommandArgs('task accept-repair', args, context, {
+    reason: { type: 'string' },
+    'acknowledge-integrity-violation': { type: 'boolean' },
+  });
+  const positionals = parsed === undefined ? undefined : expectPositionals('task accept-repair', parsed, ['task'], context);
+  if (parsed === undefined || positionals === undefined) {
+    return ExitCode.Usage;
+  }
+  const reason = stringOption(parsed, 'reason');
+  if (reason === undefined || reason.trim() === '') {
+    context.stderr.write('forge task accept-repair: --reason <text> is required; human repairs are recorded\n');
+    return ExitCode.Usage;
+  }
+  const outcome = await engine.acceptRepair(positionals[0]!, {
+    reason,
+    acknowledgeIntegrityViolation: booleanOption(parsed, 'acknowledge-integrity-violation'),
+    ...(context.signal === undefined ? {} : { signal: context.signal }),
+  });
+  const lines = [
+    `Task ${outcome.task.key}: ${outcome.task.task.title}`,
+    formatChanges(outcome.changes).trimEnd(),
+    'Validation (run now):',
+    formatValidation(outcome.validation).trimEnd(),
+  ];
+  if (!outcome.accepted) {
+    lines.push(
+      `Forge decision: REFUSED — required validation ${outcome.validation.status}. Nothing was recorded; the task stays exhausted.`,
+      'Fix the failing checks, then run accept-repair again.',
+    );
+    context.stdout.write(`${lines.join('\n')}\n`);
+    return ExitCode.Failure;
+  }
+  const work = acceptedWork(outcome.task.task);
+  lines.push(
+    `Forge decision: SUCCEEDED (HUMAN REPAIR after attempt ${outcome.task.task.humanRepair!.afterAttempt}; not a worker success). Recorded with your reason.`,
+    'The changes above are everything changed since the task began (worker attempts plus your repair).',
+    work.eligibility.ok
+      ? `Commit: not committed. Optional, local only: forge task commit ${outcome.task.key}`
+      : `Commit: not committed; Forge will not commit it (${work.eligibility.reason})`,
+    (await newlyRunnable(engine)).trimEnd(),
+  );
+  context.stdout.write(`${lines.join('\n')}\n`);
+  return ExitCode.Success;
+}
+
 async function commit(args: readonly string[], context: CliContext, engine: TaskEngine): Promise<ExitCodeValue> {
   const reference = singleReference('task commit', args, context);
   if (reference === undefined) {
@@ -402,7 +452,11 @@ function decisionLabel(task: TaskView | undefined): string {
   }
   switch (task.task.status) {
     case 'succeeded':
-      return task.lastAttempt?.outcome === 'overridden' ? 'SUCCEEDED (human override)' : 'SUCCEEDED';
+      return task.task.humanRepair !== null
+        ? 'SUCCEEDED (human repair)'
+        : task.lastAttempt?.outcome === 'overridden'
+          ? 'SUCCEEDED (human override)'
+          : 'SUCCEEDED';
     case 'awaiting-validation':
       return 'AWAITING VALIDATION';
     case 'failed':

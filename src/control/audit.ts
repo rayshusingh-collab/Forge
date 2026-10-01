@@ -56,6 +56,16 @@ export function deriveAudit(state: ProjectState, view: WorkflowView): AuditEvent
       }
     }
   }
+  for (const task of state.tasks) {
+    const repair = task.humanRepair;
+    if (repair !== null) {
+      const subject = `${key(task.id)} (human repair)`;
+      add(repair.acceptedAt, 'human repair accepted', subject, `by a human after attempt ${repair.afterAttempt}; validation ${repair.validation.status}; ${repair.changes.files.length} file(s)${repair.acknowledgedViolation ? '; violation acknowledged' : ''} — ${repair.reason}`);
+      if (repair.commit !== null) {
+        add(repair.commit.committedAt, 'commit', subject, `${repair.commit.sha.slice(0, 12)} (${repair.commit.paths} file(s), local)`);
+      }
+    }
+  }
   for (const milestone of state.milestones) {
     if (milestone.status === 'completed' || milestone.status === 'cancelled') {
       add(milestone.updatedAt, `milestone ${milestone.status}`, `milestone ${milestone.order}`, milestone.title);

@@ -57,7 +57,7 @@ export const STOP_REASON_INFO: Readonly<Record<StopReason, StopReasonInfo>> = {
     category: 'human',
     action: 'Inspect the task; retry it manually with `forge task run <task>`, or cancel it.',
   },
-  'retry-exhausted': { label: 'RETRY EXHAUSTED', category: 'human', action: 'A task used all its attempts; cancel it or add a follow-up task.' },
+  'retry-exhausted': { label: 'RETRY EXHAUSTED', category: 'human', action: 'A task used all its attempts; repair it by hand and run `forge task accept-repair <task> --reason "..."` (required checks must pass), or cancel it, or add a follow-up task.' },
   'worker-failed': {
     label: 'WORKER FAILED',
     category: 'human',

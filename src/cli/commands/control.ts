@@ -5,7 +5,7 @@ import { deriveAudit, explain, pauseProject, resumeProject, runPreflight, withKe
 import { describeStop, previewRun, resolvePolicy } from '../../orchestration/index.ts';
 import { openStateStore } from '../../projects/index.ts';
 import type { LoadedProject } from '../../projects/index.ts';
-import { deriveWorkflow } from '../../tasks/index.ts';
+import { acceptedWork, deriveWorkflow } from '../../tasks/index.ts';
 import { booleanOption, expectPositionals, parseCommandArgs, requireProject, stringOption } from '../args.ts';
 import { formatAudit, formatPreflight, preflightSummary } from '../control-format.ts';
 import { createRunner, loadProjectSettings, requireConfig, resolveRegistries } from '../runtime.ts';
@@ -138,7 +138,7 @@ export const statusCommand = projectCommand(
     const interrupted = view.tasks.filter((task) => task.condition === 'interrupted');
     const pending = state.approvals.filter((approval) => approval.status === 'pending');
     const uncommitted = view.tasks.filter(
-      (task) => task.task.status === 'succeeded' && task.lastAttempt?.commit === null && (task.lastAttempt?.changes?.files.length ?? 0) > 0,
+      (task) => task.task.status === 'succeeded' && acceptedWork(task.task).commit === null && (acceptedWork(task.task).changes?.files.length ?? 0) > 0,
     );
     const run = state.orchestrationRuns.at(-1);
     lines.push(

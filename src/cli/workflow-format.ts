@@ -1,5 +1,5 @@
 import type { ChangeSummary, ProjectState, WorkerRunRecord } from '../state/index.ts';
-import { TASK_CONDITIONS, commitEligibility, shortId } from '../tasks/index.ts';
+import { TASK_CONDITIONS, acceptedWork, shortId } from '../tasks/index.ts';
 import { formatValidation } from './commands/validation.ts';
 import type { MilestoneView, TaskCondition, TaskView, WorkflowView } from '../tasks/index.ts';
 
@@ -75,20 +75,32 @@ export function formatTask(task: TaskView, view: WorkflowView, state: ProjectSta
     lines.push('  Context:', indent(excerptBlock(task.task.context, 1_000)));
   }
   const last = task.lastAttempt;
-  if (last?.changes !== null && last?.changes !== undefined) {
-    lines.push(indent(formatChanges(last.changes).trimEnd()));
-  }
-  if (last?.validation !== null && last?.validation !== undefined) {
-    lines.push(`  Validation (${last.validation.status}, ${last.validation.finishedAt}):`, formatValidation(last.validation).trimEnd());
+  const repair = task.task.humanRepair;
+  if (repair !== null) {
+    lines.push(
+      `  HUMAN REPAIR: accepted ${repair.acceptedAt} after attempt ${repair.afterAttempt} (no worker; the attempts below keep their outcomes)`,
+      `  Reason:      ${oneLine(repair.reason, 300)}`,
+      ...(repair.acknowledgedViolation ? ['  Note:        the last attempt\'s integrity/scope violation was acknowledged by the human'] : []),
+      indent(formatChanges(repair.changes).trimEnd()),
+      `  Validation at acceptance (${repair.validation.status}, ${repair.validation.finishedAt}):`,
+      formatValidation(repair.validation).trimEnd(),
+    );
+  } else {
+    if (last?.changes !== null && last?.changes !== undefined) {
+      lines.push(indent(formatChanges(last.changes).trimEnd()));
+    }
+    if (last?.validation !== null && last?.validation !== undefined) {
+      lines.push(`  Validation (${last.validation.status}, ${last.validation.finishedAt}):`, formatValidation(last.validation).trimEnd());
+    }
   }
   if (task.task.status === 'succeeded') {
-    const eligibility = commitEligibility(last);
+    const work = acceptedWork(task.task);
     lines.push(
-      last?.commit !== null && last?.commit !== undefined
-        ? `  Commit:      ${last.commit.sha} (${last.commit.paths} file(s))`
-        : eligibility.ok
+      work.commit !== null
+        ? `  Commit:      ${work.commit.sha} (${work.commit.paths} file(s))`
+        : work.eligibility.ok
           ? `  Commit:      not committed; eligible — forge task commit ${task.key}`
-          : `  Commit:      not committed; ${eligibility.reason}`,
+          : `  Commit:      not committed; ${work.eligibility.reason}`,
     );
   }
   const review = state.taskReviews.filter((candidate) => candidate.taskId === task.task.id).at(-1);

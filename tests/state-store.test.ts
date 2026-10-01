@@ -103,6 +103,7 @@ function populatedState(): ProjectState {
           { number: 2, runId: 'r2', outcome: 'running', executor, startedAt: at, finishedAt: null, note: null, changes: null, validation: null, commit: null, origin: null },
         ],
         cancelReason: null,
+        humanRepair: null,
         createdAt: at,
         updatedAt: at,
       },
@@ -118,6 +119,7 @@ function populatedState(): ProjectState {
         maxAttempts: 3,
         attempts: [],
         cancelReason: null,
+        humanRepair: null,
         createdAt: at,
         updatedAt: at,
       },
@@ -141,8 +143,17 @@ function populatedState(): ProjectState {
   };
 }
 
-/** Removes fields introduced in schema version 7, for documents of older versions. */
+/** Removes fields introduced in schema version 8, for documents of older versions. */
+function stripV8(doc: Record<string, unknown>): Record<string, unknown> {
+  for (const task of (doc['tasks'] as Record<string, unknown>[] | undefined) ?? []) {
+    delete task['humanRepair'];
+  }
+  return doc;
+}
+
+/** Removes fields introduced in schema versions 7 and 8, for documents of older versions. */
 function stripV7(doc: Record<string, unknown>): Record<string, unknown> {
+  stripV8(doc);
   delete doc['approvals'];
   delete doc['pause'];
   delete doc['controlEvents'];
@@ -404,6 +415,19 @@ describe('StateStore: rejecting bad data', () => {
 
   it('refuses version 6 state that already contains version 7 fields', () =>
     expectLoadError({ ...valid(), schemaVersion: 6 }, /approvals is not a recognised field in schema version 6/));
+
+  it('migrates version 7 state: no task has a human repair; attempts are untouched', async () => {
+    const v7 = stripV8(valid());
+    v7['schemaVersion'] = 7;
+    await writeRaw(f.stateFile, v7);
+    const loaded = await f.store.load();
+    assert.equal(loaded.schemaVersion, STATE_SCHEMA_VERSION);
+    assert.ok(loaded.tasks.every((task) => task.humanRepair === null));
+    assert.deepEqual(loaded.tasks, populatedState().tasks, 'everything else is preserved');
+  });
+
+  it('refuses version 7 state that already contains version 8 fields', () =>
+    expectLoadError({ ...valid(), schemaVersion: 7 }, /humanRepair is not a recognised field in schema version 7/));
 
   it('rejects inconsistent approval records and duplicate open approvals', async () => {
     const approval = (fields: Record<string, unknown>) => ({

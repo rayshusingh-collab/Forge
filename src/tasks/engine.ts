@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { lstat } from 'node:fs/promises';
 import { hostname } from 'node:os';
 
 import { assertNotPaused } from '../control/pause.ts';
@@ -14,6 +15,7 @@ import type {
   ChangeSummary,
   CommitRecord,
   GitBaseline,
+  HumanRepairRecord,
   MilestoneRecord,
   ProjectState,
   StateStore,
@@ -25,7 +27,7 @@ import { ValidationProfileStore, runValidation } from '../validation/index.ts';
 import type { ValidationProfile } from '../validation/index.ts';
 import { prepareWorkerRequest, runRecordedWorker } from '../workers/index.ts';
 import type { RecordedRun, Worker, WorkerHealth } from '../workers/index.ts';
-import { commitEligibility, decideBeforeValidation, decideFromValidation } from './decision.ts';
+import { commitEligibility, decideBeforeValidation, decideFromValidation, humanRepairCommitEligibility, scopeProblem } from './decision.ts';
 import type { PostExecution } from './decision.ts';
 import { resolveMilestoneReference, resolveTaskReference } from './references.ts';
 import * as transitions from './transitions.ts';
@@ -76,6 +78,22 @@ export interface TaskRunOutcome {
 export interface ValidateTaskOutcome {
   readonly post: PostExecution;
   readonly task: TaskView | undefined;
+}
+
+export interface AcceptRepairOptions {
+  /** Why the human considers the task repaired; recorded. */
+  readonly reason: string;
+  /** Required when the last attempt ended in an integrity or scope violation. */
+  readonly acknowledgeIntegrityViolation?: boolean;
+  readonly signal?: AbortSignal;
+}
+
+export interface AcceptRepairOutcome {
+  /** False when required validation did not pass; nothing was recorded then. */
+  readonly accepted: boolean;
+  readonly task: TaskView;
+  readonly changes: ChangeSummary;
+  readonly validation: ValidationRecord;
 }
 
 export interface CommitOutcome {
@@ -363,6 +381,78 @@ export class TaskEngine {
   }
 
   /**
+   * Accepts a human's repair of an EXHAUSTED task, as an audited human
+   * decision backed by fresh evidence. Under the state lease (so no worker
+   * run, validation or commit can interleave) and with no orchestration run
+   * in control, it:
+   *   1. re-checks the task is exhausted (and any violation acknowledged);
+   *   2. measures the changeset against the task's own recorded baseline,
+   *      refusing out-of-scope changes or a moved HEAD/branch;
+   *   3. runs every required validation check now (optional checks never count);
+   *   4. verifies `.forge/` was not changed meanwhile;
+   *   5. records `humanRepair` and marks the task succeeded, but only if
+   *      required validation passed. Otherwise nothing is recorded.
+   * Never invokes a worker, consumes or edits an attempt, or commits.
+   */
+  async acceptRepair(reference: string, options: AcceptRepairOptions): Promise<AcceptRepairOutcome> {
+    const acknowledgeIntegrityViolation = options.acknowledgeIntegrityViolation === true;
+    const lease = await this.store.acquireLease();
+    try {
+      const state = await this.store.load();
+      assertNotPaused(state, 'accept a human repair');
+      const taskId = resolveTaskReference(state, reference);
+      const view = transitions.assertCanAcceptHumanRepair(state, taskId, { acknowledgeIntegrityViolation, liveness: this.liveness });
+      await refuseActiveOrchestration(this.project);
+      if (options.reason.trim() === '') {
+        throw new WorkflowError('A reason is required; it is recorded in the task history');
+      }
+      const profile = await this.profiles.load();
+      if (requiredCount(profile) === 0) {
+        throw new WorkflowError(
+          'No required validation checks are configured, so Forge cannot verify the repair. Add required checks (`forge validation add ... --required`) first; optional checks do not count.',
+        );
+      }
+      // The latest recorded baseline already treats earlier attempts' edits as the task's (see carryForwardBaseline).
+      const recorded = [...view.task.attempts].reverse().find((attempt) => attempt.changes !== null);
+      if (recorded === undefined) {
+        throw new WorkflowError(`Task ${view.key} has no recorded Git baseline (no edit-enabled attempt), so its changes cannot be attributed; add a follow-up task instead`);
+      }
+      const scope = state.workerRuns.find((run) => run.id === recorded.runId)?.workingDirectory ?? '.';
+      const git = await this.gitClient();
+      await refuseUnmergedPaths(git);
+
+      const snapshot = await snapshotControlState(this.project.layout, 'full');
+      const changes = await captureChanges(git, recorded.changes!.baseline, scope, this.clock());
+      const problem = scopeProblem(changes);
+      if (problem !== null) {
+        throw new WorkflowError(`Task ${view.key}: ${problem}; the repair cannot be accepted (nothing was validated or recorded)`);
+      }
+      const validation = await this.validate(profile, options.signal);
+      const integrity = await verifyControlState(this.project, snapshot);
+      if (!integrity.ok) {
+        throw new IntegrityError(
+          `Forge control state changed during validation (${describeIntegrityChanges(integrity)}); nothing was recorded. Inspect .forge/.`,
+        );
+      }
+      if (validation.status !== 'passed') {
+        return { accepted: false, task: view, changes, validation };
+      }
+      await lease.update((current) =>
+        transitions.acceptHumanRepair(
+          current,
+          taskId,
+          { afterAttempt: view.lastAttempt!.number, reason: options.reason, acknowledgeIntegrityViolation, changes, validation },
+          this.liveness,
+          this.clock(),
+        ),
+      );
+      return { accepted: true, task: (await this.view()).task(taskId)!, changes, validation };
+    } finally {
+      await lease.release();
+    }
+  }
+
+  /**
    * Creates one local commit containing exactly the validated task's
    * attributed changes, after re-verifying them against the live
    * repository. Never stages unrelated files, never includes `.forge/` or
@@ -376,18 +466,20 @@ export class TaskEngine {
       const taskId = resolveTaskReference(state, reference);
       const view = deriveWorkflow(state, this.liveness).task(taskId)!;
       const attempt = view.lastAttempt;
+      const repair = view.task.humanRepair;
       if (view.task.status !== 'succeeded') {
         throw new WorkflowError(`Task ${view.key} is ${view.task.status}; only a validated, succeeded task can be committed`);
       }
-      const eligibility = commitEligibility(attempt);
+      // An accepted human repair is committed from its own evidence, under exactly the same rules.
+      const eligibility = repair === null ? commitEligibility(attempt) : humanRepairCommitEligibility(repair);
       if (!eligibility.ok) {
         throw new WorkflowError(`Task ${view.key} cannot be committed: ${eligibility.reason}`);
       }
-      const changes = attempt!.changes!;
+      const changes = repair === null ? attempt!.changes! : repair.changes;
       const git = await this.gitClient();
       const paths = await verifyCommittable(git, changes);
 
-      const message = commitMessage(view, attempt!.number, attempt!.validation);
+      const message = repair === null ? commitMessage(view, attempt!.number, attempt!.validation) : humanRepairCommitMessage(view, repair);
       const added = changes.files.filter((file) => file.change === 'added').map((file) => file.path);
       await git.addPaths(added);
       let sha: string;
@@ -402,7 +494,11 @@ export class TaskEngine {
       const committed = new Set(await git.commitPaths(sha));
       const parent = await git.parentOf(sha);
       const commit: CommitRecord = { sha, paths: paths.length, committedAt: this.clock().toISOString() };
-      await lease.update((current) => transitions.recordCommit(current, taskId, attempt!.number, commit, this.clock()));
+      await lease.update((current) =>
+        repair === null
+          ? transitions.recordCommit(current, taskId, attempt!.number, commit, this.clock())
+          : transitions.recordHumanRepairCommit(current, taskId, commit, this.clock()),
+      );
       if (parent !== changes.head || committed.size !== paths.length || paths.some((path) => !committed.has(path))) {
         throw new GitError(
           `Commit ${sha.slice(0, 12)} was created but does not match the expected change (a repository hook may have altered it); inspect it with \`git show ${sha.slice(0, 12)}\``,
@@ -511,6 +607,37 @@ export function commitMessage(view: TaskView, attempt: number, validation: Valid
     `Forge-Validation: passed (${checks.join(', ')})`,
     '',
   ].join('\n');
+}
+
+/** Commit message for an accepted human repair: says plainly that a human, not a worker, completed it. */
+export function humanRepairCommitMessage(view: TaskView, repair: HumanRepairRecord): string {
+  const title = view.task.title.replace(/\s+/g, ' ').trim();
+  const subject = `forge: complete task ${view.key} - ${title} (human repair)`;
+  const checks = repair.validation.checks.filter((check) => check.status === 'passed').map((check) => check.id);
+  return [
+    subject.length <= 100 ? subject : `${subject.slice(0, 99)}…`,
+    '',
+    `Forge-Task: ${view.task.id}`,
+    `Forge-Human-Repair: after attempt ${repair.afterAttempt}`,
+    `Forge-Validation: passed (${checks.join(', ')})`,
+    '',
+  ].join('\n');
+}
+
+/**
+ * Refuses while a `forge run` holds the orchestration lease: a human decision
+ * must not change the workflow underneath an active run. (A stale lease is
+ * left for a human to remove, as everywhere else.)
+ */
+async function refuseActiveOrchestration(project: LoadedProject): Promise<void> {
+  try {
+    await lstat(project.layout.orchestrationLockFile);
+  } catch {
+    return;
+  }
+  throw new WorkflowError(
+    'An orchestration run (`forge run`) controls this project; stop it first. If none is running, check `forge status` for a stale lease.',
+  );
 }
 
 function describe(error: unknown): string {

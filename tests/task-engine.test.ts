@@ -251,7 +251,8 @@ describe('runnability', () => {
       pending: ['running', 'cancelled'],
       running: ['succeeded', 'awaiting-validation', 'failed'],
       'awaiting-validation': ['succeeded', 'failed'],
-      failed: ['running', 'cancelled'],
+      // failed -> succeeded only through an accepted human repair of an exhausted task.
+      failed: ['running', 'cancelled', 'succeeded'],
       succeeded: ['failed'],
       cancelled: [],
     });

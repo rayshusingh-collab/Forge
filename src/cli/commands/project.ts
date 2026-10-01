@@ -4,7 +4,7 @@ import { discoverProject, openStateStore, registerProject } from '../../projects
 import type { LoadedProject, ProjectRecord } from '../../projects/index.ts';
 import { MILESTONE_STATUSES } from '../../state/index.ts';
 import type { ProjectState } from '../../state/index.ts';
-import { commitEligibility, deriveWorkflow } from '../../tasks/index.ts';
+import { acceptedWork, deriveWorkflow } from '../../tasks/index.ts';
 import type { ExecutorLiveness, TaskCondition, WorkflowView } from '../../tasks/index.ts';
 import { ValidationProfileStore } from '../../validation/index.ts';
 import type { ValidationProfile } from '../../validation/index.ts';
@@ -203,13 +203,16 @@ function formatValidationSummary(profile: ValidationProfile | undefined): string
 
 /** Succeeded tasks whose attributed changes Forge has not committed. */
 function formatUncommitted(view: WorkflowView): string {
-  const pending = view.tasks.filter((task) => task.task.status === 'succeeded' && task.lastAttempt?.changes != null && task.lastAttempt.commit === null && task.lastAttempt.changes.files.length > 0);
+  const pending = view.tasks.filter((task) => {
+    const work = acceptedWork(task.task);
+    return task.task.status === 'succeeded' && work.commit === null && (work.changes?.files.length ?? 0) > 0;
+  });
   if (pending.length === 0) {
     return 'none';
   }
   return pending
     .map((task) => {
-      const eligibility = commitEligibility(task.lastAttempt);
+      const { eligibility } = acceptedWork(task.task);
       return `${task.key} (${eligibility.ok ? 'committable' : 'commit refused'})`;
     })
     .join(', ');

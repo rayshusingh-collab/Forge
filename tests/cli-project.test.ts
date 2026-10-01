@@ -145,6 +145,7 @@ describe('forge project show / status', () => {
       maxAttempts: 3,
       attempts: [],
       cancelReason: null,
+      humanRepair: null,
       createdAt: at,
       updatedAt: at,
     });

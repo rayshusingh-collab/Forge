@@ -24,8 +24,10 @@
  *     decided, and bounded orchestration run history (migrated from 5).
  * 7 — Milestone 8: human control — approval requests, project pause, and
  *     human control events (migrated from 6 as empty / not paused).
+ * 8 — Human repair of exhausted tasks: tasks gain `humanRepair` (migrated
+ *     from 7 as null).
  */
-export const STATE_SCHEMA_VERSION = 7;
+export const STATE_SCHEMA_VERSION = 8;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -52,6 +54,8 @@ export type MilestoneStatus = (typeof MILESTONE_STATUSES)[number];
  *   awaiting-validation -> succeeded             (validation passed on re-run, or audited human override)
  *   awaiting-validation -> failed                (validation failed on re-run, or rejected)
  *   failed              -> running               (retry, while attempts remain)
+ *   failed              -> succeeded             (exhausted, repaired by a human, fresh required validation
+ *                                                 passed; recorded in `humanRepair`, never as an attempt)
  *   failed              -> cancelled
  * `succeeded` and `cancelled` are terminal.
  */
@@ -351,6 +355,30 @@ export interface TaskAttempt {
   readonly origin: AttemptOrigin | null;
 }
 
+/**
+ * A human repaired an exhausted task by hand and Forge accepted it
+ * (`forge task accept-repair`). It is NOT an attempt: no worker ran, the
+ * attempt budget is untouched, and every attempt keeps its original outcome.
+ * Acceptance rests on Forge's own evidence, gathered at acceptance time:
+ * a fresh run of the required validation checks that passed, and the
+ * changeset measured against the task's recorded Git baseline.
+ */
+export interface HumanRepairRecord {
+  /** The attempt after which the human repaired the task (always its last attempt). */
+  readonly afterAttempt: number;
+  readonly reason: string;
+  readonly by: 'human';
+  readonly acceptedAt: string;
+  /** The last attempt ended in an integrity or scope violation, which the human explicitly acknowledged. */
+  readonly acknowledgedViolation: boolean;
+  /** Everything changed since the task's baseline: the workers' attempts plus the human repair. */
+  readonly changes: ChangeSummary;
+  /** The validation Forge ran at acceptance; always `passed`. */
+  readonly validation: ValidationRecord;
+  /** The local commit `forge task commit` created for these changes, if any. */
+  readonly commit: CommitRecord | null;
+}
+
 export interface TaskRecord {
   readonly id: string;
   readonly milestoneId: string;
@@ -367,6 +395,8 @@ export interface TaskRecord {
   readonly attempts: readonly TaskAttempt[];
   /** Why the task was cancelled, if it was. */
   readonly cancelReason: string | null;
+  /** Set only when a human-repaired exhausted task was accepted; the task is then succeeded. */
+  readonly humanRepair: HumanRepairRecord | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

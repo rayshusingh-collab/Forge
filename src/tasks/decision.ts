@@ -1,4 +1,4 @@
-import type { ChangeSummary, TaskAttempt, ValidationRecord, WorkerAccessMode } from '../state/index.ts';
+import type { ChangeSummary, CommitRecord, HumanRepairRecord, TaskAttempt, TaskRecord, ValidationRecord, WorkerAccessMode } from '../state/index.ts';
 
 /**
  * Forge's decision after a successful worker invocation. Deterministic and
@@ -86,10 +86,40 @@ export function commitEligibility(attempt: TaskAttempt | undefined): { readonly 
   if (attempt === undefined || attempt.outcome !== 'validated') {
     return { ok: false, reason: 'only a task whose latest attempt passed deterministic validation can be committed' };
   }
-  if (attempt.commit !== null) {
-    return { ok: false, reason: `already committed as ${attempt.commit.sha.slice(0, 12)}` };
+  return changesEligibility(attempt.changes, attempt.commit);
+}
+
+/**
+ * Commit eligibility of an accepted human repair: the same rules as for a
+ * validated attempt, applied to the changeset Forge measured at acceptance.
+ */
+export function humanRepairCommitEligibility(repair: HumanRepairRecord | null): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+  if (repair === null || repair.validation.status !== 'passed') {
+    return { ok: false, reason: 'only an accepted human repair with passing validation can be committed' };
   }
-  const changes = attempt.changes;
+  return changesEligibility(repair.changes, repair.commit);
+}
+
+/**
+ * The work a succeeded task is committed from: its accepted human repair
+ * when it has one, otherwise its latest attempt.
+ */
+export function acceptedWork(task: TaskRecord): {
+  readonly changes: ChangeSummary | null;
+  readonly commit: CommitRecord | null;
+  readonly eligibility: { readonly ok: true } | { readonly ok: false; readonly reason: string };
+} {
+  if (task.humanRepair !== null) {
+    return { changes: task.humanRepair.changes, commit: task.humanRepair.commit, eligibility: humanRepairCommitEligibility(task.humanRepair) };
+  }
+  const last = task.attempts.at(-1);
+  return { changes: last?.changes ?? null, commit: last?.commit ?? null, eligibility: commitEligibility(last) };
+}
+
+function changesEligibility(changes: ChangeSummary | null, commit: CommitRecord | null): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+  if (commit !== null) {
+    return { ok: false, reason: `already committed as ${commit.sha.slice(0, 12)}` };
+  }
   if (changes === null || changes.files.length === 0) {
     return { ok: false, reason: 'the task produced no attributed changes' };
   }

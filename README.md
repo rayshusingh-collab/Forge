@@ -175,6 +175,7 @@ forge task run <task> [--worker claude] [--timeout <seconds>] [--allow-edits]
       [--acknowledge-integrity-violation]
 forge task validate <task>
 forge task override <task> --reason <text>
+forge task accept-repair <task> --reason <text> [--acknowledge-integrity-violation]
 forge task reject <task> --reason <text>
 forge task commit <task>
 
@@ -407,6 +408,14 @@ Forge never starts another task and never retries on its own.
 - `forge task override --reason` marks the task succeeded without validation. This is an explicit human decision: the reason is recorded, and the task shows as `overridden`.
 - `forge task reject --reason` fails the task.
 - A task whose validation **failed** is `failed`, never awaiting validation, so it can't be overridden. The Milestone 4 `forge task accept` has been removed.
+
+**Repairing an exhausted task by hand.** `forge task accept-repair <task> --reason <text>` accepts a task that used all its attempts after you fixed it yourself. It is not an override: Forge accepts it only on its own fresh evidence, and records nothing unless all of the following hold.
+- The task is `exhausted`. A task with attempts left is retried instead; interrupted or running tasks are refused.
+- No orchestration run controls the project, the project is not paused, and no other Forge operation holds the state lock (it runs under the same lease as `task validate`).
+- At least one **required** validation check is configured, and all required checks pass when Forge runs them now. Optional checks never count. `.forge/` must be unchanged while they run.
+- The changes are measured against the task's own recorded Git baseline. HEAD and the branch must not have moved, nothing may be out of scope, and something must have changed. If the last attempt ended in an integrity or scope violation, you must add `--acknowledge-integrity-violation`.
+
+The task becomes `succeeded` and its dependents unblock. Every attempt keeps its original (failed) outcome and the budget is not touched; the repair is recorded separately with your reason, the validation evidence and the changeset, and appears in `forge task show` and `forge audit` as a human repair. Nothing is committed. `forge task commit <task>` applies the usual safe-commit rules to the repair's changeset: files that already had uncommitted changes before the task began (for example another task's uncommitted work) are `mixed` and are never committed by Forge. Auto-commit in `forge run` never commits a human repair.
 
 **Crash recovery.**
 - Before invoking the worker, Forge records which Forge process (process ID and host) is executing the attempt.

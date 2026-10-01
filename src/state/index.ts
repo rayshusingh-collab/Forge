@@ -95,6 +95,7 @@ export type {
   ProjectPhase,
   ProjectState,
   TaskAttempt,
+  HumanRepairRecord,
   TaskRecord,
   TaskStatus,
   BaselineEntry,
