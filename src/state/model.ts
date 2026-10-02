@@ -33,8 +33,13 @@
  * 10 — Review decisions record the human approval they came through
  *     (`approvalId`, migrated from 9 as null), so a rejected
  *     review-acceptance approval can become traceable remediation.
+ * 11 — Hands-off autonomous completion: recovery attempts (repair triggers
+ *     `timeout` and `worker-failure`), reviews record their evidence round
+ *     (`evidenceRound`, migrated as 0), stored policies gain `autonomous`
+ *     (false) and a `recovery` section (all budgets 0: no recovery), and run
+ *     counters gain recovery counts (0) (migrated from 10).
  */
-export const STATE_SCHEMA_VERSION = 10;
+export const STATE_SCHEMA_VERSION = 11;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -317,9 +322,28 @@ export interface AttemptExecutor {
   readonly host: string;
 }
 
-/** What caused Forge to run a repair attempt. */
-export const REPAIR_TRIGGERS = ['validation', 'review'] as const;
+/**
+ * What caused Forge to run another attempt of a task:
+ * - `validation`, `review`: an IMPLEMENTATION REPAIR of completed work that
+ *   failed deterministic validation or review (the shared repair budget);
+ * - `timeout`: a TIMEOUT RECOVERY that continues an attempt whose worker
+ *   timed out, keeping its safely attributable partial work;
+ * - `worker-failure`: a PROVIDER RETRY after the worker invocation failed
+ *   (process failure, unavailable, unusable output).
+ * Recovery attempts continue an unfinished implementation attempt, so they
+ * do not count against `maxAttempts`; each kind has its own hard budget.
+ */
+export const REPAIR_TRIGGERS = ['validation', 'review', 'timeout', 'worker-failure'] as const;
 export type RepairTrigger = (typeof REPAIR_TRIGGERS)[number];
+
+/** Triggers of recovery attempts (continuations), as opposed to implementation repairs. */
+export const RECOVERY_TRIGGERS: readonly RepairTrigger[] = ['timeout', 'worker-failure'];
+
+/** Attempt outcomes a recovery of each kind may follow. */
+export const RECOVERABLE_OUTCOMES: Readonly<Record<'timeout' | 'worker-failure', readonly AttemptOutcome[]>> = {
+  timeout: ['timeout'],
+  'worker-failure': ['failed', 'unavailable', 'invalid-output'],
+};
 
 /**
  * A repair attempt: Forge re-ran the task's implementer with bounded
@@ -711,6 +735,12 @@ export interface TaskReview {
   readonly diagnostic: string | null;
   readonly createdAt: string;
   readonly decision: ReviewDecision | null;
+  /**
+   * 0 for a normal review; N for the Nth re-review of the same attempt with
+   * expanded evidence (larger packet limits), made because an earlier
+   * decision was limited by observably truncated evidence.
+   */
+  readonly evidenceRound: number;
 }
 
 /**
@@ -721,6 +751,14 @@ export const ORCHESTRATION_LIMITS = {
   maxTasks: 50,
   maxSteps: 200,
   maxRepairsPerTask: 5,
+  /** Timeout recoveries per task (continuations of timed-out attempts). */
+  maxTimeoutRecoveries: 5,
+  /** Provider retries: per task for the implementer, per review/decision for the AI roles. */
+  maxProviderRetries: 5,
+  /** Evidence-expansion re-reviews per attempt. */
+  maxEvidenceReviews: 3,
+  /** Longest wait between provider retries. */
+  maxRetryBackoffMs: 60_000,
   retainedRuns: 50,
   eventsPerRun: 200,
   eventDetail: 300,
@@ -780,6 +818,28 @@ export interface OrchestrationPolicy {
   };
   /** Create local commits of validated tasks' own changes (M5 safe-commit rules). Never pushes. */
   readonly autoCommit: boolean;
+  /**
+   * Hands-off mode (`forge run --autonomous`): recoverable engineering events
+   * are handled within the `recovery` budgets. It never relaxes a hard stop.
+   */
+  readonly autonomous: boolean;
+  /** Bounded recovery budgets; all 0 means "stop for a human" (the conservative default). */
+  readonly recovery: RecoveryPolicy;
+}
+
+export interface RecoveryPolicy {
+  /** Continuations of a timed-out attempt per task (0 = a timeout stops for a human). */
+  readonly timeoutRecoveries: number;
+  /** Added to the worker timeout for each successive timeout recovery... */
+  readonly timeoutIncreaseMs: number;
+  /** ...up to this hard cap (never below the normal worker timeout). */
+  readonly maxWorkerTimeoutMs: number;
+  /** Retries after a transient provider failure: per task (implementer) or per review/decision (AI roles). */
+  readonly providerRetries: number;
+  /** Wait before the Nth provider retry: N × this. */
+  readonly retryBackoffMs: number;
+  /** Re-reviews with expanded evidence per attempt when a decision was limited by truncated evidence. */
+  readonly evidenceReviews: number;
 }
 
 export const ORCHESTRATION_RUN_MODES = ['run', 'step'] as const;
@@ -835,6 +895,12 @@ export const STOP_REASONS = [
   'paused',
   'approval-rejected',
   'review-rejection-blocked',
+  'validation-repair-exhausted',
+  'review-repair-exhausted',
+  'timeout-recovery-exhausted',
+  'provider-retry-exhausted',
+  'evidence-review-exhausted',
+  'unsafe-partial-work',
 ] as const;
 export type StopReason = (typeof STOP_REASONS)[number];
 
@@ -854,12 +920,21 @@ export interface OrchestrationEvent {
 export interface OrchestrationCounters {
   readonly steps: number;
   readonly tasks: number;
+  /** Implementation repairs (validation and review). */
   readonly repairs: number;
   readonly reviews: number;
   /** AI decision-maker calls. */
   readonly decisions: number;
   readonly commits: number;
   readonly milestones: number;
+  /** Continuations of timed-out attempts. */
+  readonly timeoutRecoveries: number;
+  /** Retries after transient implementer, reviewer or decision-maker failures. */
+  readonly providerRetries: number;
+  /** Re-reviews with expanded evidence. */
+  readonly evidenceReviews: number;
+  /** Human approvals this run applied (each one a human intervention). */
+  readonly humanInterventions: number;
 }
 
 export interface OrchestrationStop {

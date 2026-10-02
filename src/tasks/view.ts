@@ -1,5 +1,6 @@
 import { hostname } from 'node:os';
 
+import { implementationAttempts } from '../state/index.ts';
 import type { MilestoneRecord, ProjectState, TaskAttempt, TaskRecord } from '../state/index.ts';
 
 /**
@@ -136,8 +137,9 @@ export function deriveWorkflow(state: ProjectState, liveness: ExecutorLiveness =
         key: `${milestone.order}.${task.order}`,
         condition,
         runnable: condition === 'ready' || condition === 'retryable',
-        attemptsUsed: task.attempts.length,
-        attemptsRemaining: Math.max(0, task.maxAttempts - task.attempts.length),
+        // Implementation attempts only: recovery continuations have their own budgets.
+        attemptsUsed: implementationAttempts(task),
+        attemptsRemaining: Math.max(0, task.maxAttempts - implementationAttempts(task)),
         unmetDependencies: dependencyConditions.filter(([, c]) => c !== 'succeeded').map(([id]) => id),
         blockingDependencies: dependencyConditions.filter(([, c]) => isPermanentlyUnsatisfied(c)).map(([id]) => id),
         requiresIntegrityAcknowledgement:
@@ -186,7 +188,7 @@ function computeCondition(
     }
     case 'failed':
       // A failed task has run, so its dependencies had all succeeded (terminal).
-      return task.attempts.length < task.maxAttempts ? 'retryable' : 'exhausted';
+      return implementationAttempts(task) < task.maxAttempts ? 'retryable' : 'exhausted';
     case 'pending': {
       const dependencies = task.dependsOn.map(dependencyCondition);
       if (dependencies.some(isPermanentlyUnsatisfied)) {

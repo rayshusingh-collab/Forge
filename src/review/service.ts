@@ -13,7 +13,7 @@ import { AI_LIMITS } from '../state/index.ts';
 import type { StateStore, TaskReview } from '../state/index.ts';
 import { resolveTaskReference } from '../tasks/index.ts';
 import { ValidationProfileStore } from '../validation/index.ts';
-import { DEFAULT_REVIEW_LIMITS, buildReviewPacket } from './packet.ts';
+import { DEFAULT_REVIEW_LIMITS, buildReviewPacket, expandedLimits } from './packet.ts';
 import type { ReviewPacket, ReviewPacketLimits } from './packet.ts';
 import { buildReviewerRequest, deriveReviewStatus, parseReviewResponse } from './reviewer.ts';
 import { recordReview } from './transitions.ts';
@@ -29,6 +29,11 @@ export interface ReviewTaskOptions {
   readonly clock?: () => Date;
   readonly generateId?: () => string;
   readonly limits?: ReviewPacketLimits;
+  /**
+   * 0 (default) for a normal review; N > 0 re-reviews the same attempt with
+   * evidence expanded N times (see `expandedLimits`). Explicit `limits` win.
+   */
+  readonly evidenceRound?: number;
 }
 
 export interface ReviewTaskResult {
@@ -63,7 +68,8 @@ export async function reviewTask(options: ReviewTaskOptions): Promise<ReviewTask
 
   const git = await GitClient.create({ runner: options.runner, root: options.project.layout.root });
   const profile = await new ValidationProfileStore(options.project.layout).load();
-  const packet = await buildReviewPacket({ git, state, task, attempt, profile, limits: options.limits ?? DEFAULT_REVIEW_LIMITS });
+  const evidenceRound = options.evidenceRound ?? 0;
+  const packet = await buildReviewPacket({ git, state, task, attempt, profile, limits: options.limits ?? expandedLimits(DEFAULT_REVIEW_LIMITS, evidenceRound) });
 
   const requestId = generateId();
   const response = await runReadOnly(options.project, options.runner, () =>
@@ -89,6 +95,7 @@ export async function reviewTask(options: ReviewTaskOptions): Promise<ReviewTask
         diagnostic: null,
         createdAt: clock().toISOString(),
         decision: null,
+        evidenceRound,
       }
     : {
         id: requestId,
@@ -104,6 +111,7 @@ export async function reviewTask(options: ReviewTaskOptions): Promise<ReviewTask
         diagnostic: redactSecrets(parsed.diagnostic, secretValues(process.env)).slice(0, AI_LIMITS.diagnostic),
         createdAt: clock().toISOString(),
         decision: null,
+        evidenceRound,
       };
 
   await store.update((current) => recordReview(current, review));

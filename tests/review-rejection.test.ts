@@ -276,7 +276,7 @@ describe('rejected review-acceptance approval: unsafe cases stop and name the bl
   it('G: repair budget exhausted', async () => {
     const { setup, run, approvalId, reviewId, commits } = await rejectedReviewAcceptance();
     const result = await run({ ...AUTO, maxRepairsPerTask: 1 });
-    await assertBlocked(setup, approvalId, reviewId, result, /repair budget is used up \(1\/1\)/);
+    await assertBlocked(setup, approvalId, reviewId, result, /repair budget is used up \(1\/1: 0 validation, 1 review\)/);
     assert.equal(await commitCount(setup.root), commits, 'the rejected work is not committed either');
   });
 
@@ -339,10 +339,24 @@ describe('schema 10: review decisions record the approval they came through', ()
     const doc = await rawState(setup);
     const reviews = doc['taskReviews'] as Record<string, Record<string, unknown> | null>[];
     // A version 9 document as the previous Forge wrote it (no approval links).
-    const v9 = { ...doc, schemaVersion: 9, taskReviews: reviews.map((review) => (review!['decision'] === null ? review : { ...review, decision: { ...(review!['decision'] as object), approvalId: undefined } })) };
+    const runs = doc['orchestrationRuns'] as Record<string, Record<string, unknown>>[];
+    const v9 = {
+      ...doc,
+      schemaVersion: 9,
+      // As the version 9 Forge wrote it: no approval links (v10), no evidence rounds or recovery policy/counters (v11).
+      taskReviews: reviews.map((review) => {
+        const { evidenceRound: _round, ...rest } = review as Record<string, unknown>;
+        return rest['decision'] === null ? rest : { ...rest, decision: { ...(rest['decision'] as object), approvalId: undefined } };
+      }),
+      orchestrationRuns: runs.map((run) => {
+        const { autonomous: _autonomous, recovery: _recovery, ...policy } = run['policy']!;
+        const { timeoutRecoveries: _t, providerRetries: _p, evidenceReviews: _e, humanInterventions: _h, ...counters } = run['counters']!;
+        return { ...run, policy, counters };
+      }),
+    };
     await writeState(setup, JSON.parse(JSON.stringify(v9)) as Record<string, unknown>);
     const migrated = await openStateStore(setup.project).load();
-    assert.equal(migrated.schemaVersion, 10);
+    assert.equal(migrated.schemaVersion, 11, 'migrated through version 10 to the current version');
     assert.ok(migrated.taskReviews.every((review) => review.decision === null || review.decision.approvalId === null));
 
     await writeState(setup, { ...doc, schemaVersion: 9 });

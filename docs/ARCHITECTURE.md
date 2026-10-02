@@ -487,6 +487,40 @@ Implemented (auto-decision, `src/decision/`, state schema 9): an optional fourth
   - An AI decision's effect never exceeds its verdict.
 - **Migration 8→9.** Existing remediation decisions become remediation records (open, or satisfied by a later accepted review). Review decisions gain `aiDecisionId: null`. Stored policies gain a disabled `decision` section, and run counters gain `decisions: 0`.
 
+Implemented (hands-off autonomous completion, state schema 11): `forge run --autonomous` handles recoverable engineering events inside the existing state machine. It is not a separate loop and not a CLI conditional.
+- **Policy.** `OrchestrationPolicy` gains `autonomous` and a `recovery` section: `timeoutRecoveries`, `timeoutIncreaseMs`, `maxWorkerTimeoutMs`, `providerRetries`, `retryBackoffMs`, `evidenceReviews`.
+  - `buildPolicy` fills unset options from `AUTONOMOUS_DEFAULTS`, so explicit options still win.
+  - Without `autonomous` every recovery budget is 0, which is the previous behavior.
+  - Hard limits (`ORCHESTRATION_LIMITS`) are enforced by the same decoder that guards stored policies.
+  - `workerTimeoutFor` gives a timeout recovery's worker timeout: the normal timeout plus N increases, capped.
+- **Attempt kinds** (`state/attempts.ts`). Repair triggers gain the recovery kinds `timeout` and `worker-failure`.
+  - *Implementation attempts* are attempts that are not recoveries. They are the only ones bounded by `maxAttempts` (in views, invariants and human repair).
+  - Implementation repairs (`validation`, `review`) share one numbering and the repair budget.
+  - Each recovery kind has its own numbering and its own hard limit.
+  - A recovery may start when no implementation attempt remains (`assertTaskCanStart({ recovery })`), but only after an outcome it may follow (`RECOVERABLE_OUTCOMES`).
+  - Every counter (`tasks/budgets.ts`) is derived from stored attempts and reviews, so restarts never reset or double-count.
+- **Recovery decisions** (`decideNext`). A failed task whose last attempt timed out or failed is selected like a runnable task (`recoveryKindFor`), even when its implementation attempts are used up.
+  - `recoveryAction` first applies `partialWorkProblem`: the same attribution rules as safe commit (`attributionProblem` in `tasks/decision.ts`), plus "measured at all". Unsafe partial work stops with `unsafe-partial-work`.
+  - Next it checks the budget, stopping with `timeout-recovery-exhausted` or `provider-retry-exhausted` when it is used up.
+  - Otherwise it returns a `repair` action with the recovery trigger.
+  - Integrity violations (including a timed-out run that touched `.forge/`), scope violations and cancellations are never recovery candidates.
+  - The engine never reverts anything: `carryForwardBaseline` keeps the timed-out attempt's edits attributed to the task.
+  - The continuation's evidence (`buildRepairEvidence` → `continuationEvidence`) states the facts and asks the worker to continue, not restart.
+- **Provider retries.**
+  - A worker unavailable before an attempt is retried inside the step (no attempt recorded), with backoff.
+  - Failed AI reviews and unusable decision answers in the same run are retried while `providerRetries` allows (decisions also stay within `aiDecisionsPerReview`).
+  - Backoff is an action field (`backoffMs`); the orchestrator waits, and Ctrl+C ends the wait.
+- **Evidence expansion.** `decisionGate` checks `evidenceLimited`: an `accept` verdict below high confidence while the review's or decision's recorded `context.truncated` is true.
+  - When it holds, `decisionGate` returns a `review` action with the next `evidenceRound`. `expandedLimits` grows files ×2, total bytes ×3 and bytes per file ×4 per round, and stays bounded.
+  - The new review records `evidenceRound`. The decision packet for it uses equally expanded limits.
+  - Beyond the budget, the run stops with `evidence-review-exhausted`. Complete evidence never triggers an expansion.
+  - No attempt or repair is used (no code changed).
+- **Exhaustion reasons.** `repairProblem` now names the kind of repair needed (`validation-repair-exhausted` / `review-repair-exhausted`). The old `repair-budget-exhausted` remains decodable for stored runs.
+- **Counters and output.** Run counters gain `timeoutRecoveries`, `providerRetries`, `evidenceReviews` and `humanInterventions` (approvals applied). Steps carry the attempt's timeout and partial-work size. `forge task show`, `forge explain` and the run summary show the separate budgets.
+- **Crash resume.** In autonomous mode the CLI first performs `recoverOrchestrationLease({ force: false })`: only a provably dead local owner of a known run, recorded as a control event. It never forces. Interrupted attempts (changes never measured) still stop for a human.
+- **Decision-maker.** Its instructions separate product decisions (escalate) from engineering choices (decide).
+- **Migration 10→11.** Reviews gain `evidenceRound: 0`. Stored policies gain `autonomous: false` and an all-zero `recovery` section (with `maxWorkerTimeoutMs` = the worker timeout). Run counters gain zero recovery counts.
+
 Implemented (Milestone 9, `src/execution/process-runner.ts`): on Windows, a timeout or cancellation terminates the child's whole process tree (`taskkill /T /F`, fixed absolute program, no shell) before killing the child itself, so an agent CLI's descendants (e.g. the commands a Codex worker runs) cannot keep changing files after Forge records the outcome.
 
 

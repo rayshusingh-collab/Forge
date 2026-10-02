@@ -1,4 +1,4 @@
-import { StateConflictError, ValidationError } from '../../core/errors.ts';
+import { StateConflictError, ValidationError, WorkflowError } from '../../core/errors.ts';
 import { runPreflight } from '../../control/index.ts';
 import { Orchestrator, previewRun, recoverOrchestrationLease, resolvePolicy } from '../../orchestration/index.ts';
 import type { PolicyOptions, PolicyResolution } from '../../orchestration/index.ts';
@@ -25,6 +25,19 @@ const USAGE = [
   'forge run recover --reason <text> [--force]',
   '                                 Remove a crashed run\'s orchestration lock (owner must be provably gone;',
   '                                 --force requests a human approval instead)',
+  '',
+  'Hands-off mode:',
+  '  --autonomous               Handle recoverable engineering events automatically, within bounded budgets:',
+  '                             edits, AI review, auto-decision, validation and review repairs, safe local',
+  '                             commits, timeout recovery (continue safe partial work with a longer timeout),',
+  '                             provider retries, and evidence re-review. Hard safety stops never change.',
+  '                             Every option below still overrides it (e.g. --autonomous --no-auto-commit).',
+  `  --timeout-recoveries <n>   Continuations of a timed-out attempt per task (autonomous 2, max ${ORCHESTRATION_LIMITS.maxTimeoutRecoveries})`,
+  '  --timeout-increase <seconds>  Worker timeout added per timeout recovery (autonomous: half the timeout)',
+  '  --max-worker-timeout <seconds> Hard cap on a recovery\'s worker timeout (autonomous: twice the timeout)',
+  `  --provider-retries <n>     Retries after transient provider failures (autonomous 2, max ${ORCHESTRATION_LIMITS.maxProviderRetries})`,
+  `  --retry-backoff <seconds>  Wait before the Nth provider retry: N x this (autonomous 5, max ${ORCHESTRATION_LIMITS.maxRetryBackoffMs / 1000})`,
+  `  --evidence-reviews <n>     Re-reviews with expanded evidence per attempt (autonomous 1, max ${ORCHESTRATION_LIMITS.maxEvidenceReviews})`,
   '',
   'Policy options override the project configuration (`forge config`); --no-<option> turns one off:',
   '  --allow-edits              Let the implementer modify files (required for real progress)',
@@ -71,6 +84,13 @@ const POLICY_OPTIONS = {
   'decision-maker': { type: 'string' },
   'decision-timeout': { type: 'string' },
   'auto-commit': { type: 'boolean' },
+  autonomous: { type: 'boolean' },
+  'timeout-recoveries': { type: 'string' },
+  'timeout-increase': { type: 'string' },
+  'max-worker-timeout': { type: 'string' },
+  'provider-retries': { type: 'string' },
+  'retry-backoff': { type: 'string' },
+  'evidence-reviews': { type: 'string' },
 } as const;
 
 export const runCommand: CliCommand = {
@@ -119,6 +139,10 @@ async function execute(mode: 'run' | 'step', args: readonly string[], context: C
     return ExitCode.Success;
   }
 
+  if (policy.autonomous) {
+    await recoverProvablyDeadLease(project, store, context);
+  }
+
   // The same safety checks `forge preflight` reports; any critical failure refuses the run before anything starts.
   const preflight = await runPreflight({ project, store, runner, policy, registries: resolveRegistries(context) });
   if (!preflight.runnable) {
@@ -159,6 +183,31 @@ async function execute(mode: 'run' | 'step', args: readonly string[], context: C
   }
   context.stdout.write(formatRunResult(result));
   return ['complete', 'no-work', 'step-done', 'limit-steps', 'limit-tasks'].includes(result.stop.reason) && result.recorded ? ExitCode.Success : ExitCode.Failure;
+}
+
+/**
+ * Hands-off continuation after a crash: an autonomous run removes the
+ * orchestration lock (and state lock) of a previous run ONLY when Forge can
+ * prove its owner is gone — a process on this machine that no longer exists,
+ * running a run this project's state knows. This is exactly
+ * `forge run recover` without `--force`, recorded as a control event.
+ * Anything unprovable is left alone and the run refuses as usual; a forced
+ * recovery always needs a human.
+ */
+async function recoverProvablyDeadLease(project: LoadedProject, store: ReturnType<typeof openStateStore>, context: CliContext): Promise<void> {
+  try {
+    const result = await recoverOrchestrationLease({ project, store, reason: 'autonomous run: the previous owner provably no longer exists', force: false });
+    if (result.kind === 'recovered') {
+      context.stdout.write(
+        `Recovered the stale orchestration lease${result.owner === null ? '' : ` of crashed run ${result.owner.runId.slice(0, 8)} (pid ${result.owner.pid}, which no longer exists)`}; continuing from the recorded state.\n`,
+      );
+    }
+  } catch (error) {
+    if (!(error instanceof WorkflowError)) {
+      throw error;
+    }
+    // Not provably stale (a live owner, another host, an unknown run): never taken over here.
+  }
 }
 
 async function status(args: readonly string[], context: CliContext): Promise<ExitCodeValue> {
@@ -251,6 +300,17 @@ function parsePolicy(command: string, parsed: ParsedArgs, context: CliContext, w
     }
     return value === undefined ? undefined : value * 1000;
   };
+  const seconds0 = (name: string, maxSeconds: number): number | undefined => {
+    const text = stringOption(parsed, name);
+    if (text === undefined) {
+      return undefined;
+    }
+    if (!/^\d{1,6}$/.test(text.trim()) || Number(text.trim()) > maxSeconds) {
+      problems.push(`--${name} must be a whole number of seconds between 0 and ${maxSeconds}`);
+      return undefined;
+    }
+    return Number(text.trim()) * 1000;
+  };
   const allowEdits = optionalBoolean(parsed, 'allow-edits');
   const reviewer = stringOption(parsed, 'reviewer');
   const review = optionalBoolean(parsed, 'review') ?? (reviewer === undefined ? undefined : true);
@@ -274,6 +334,13 @@ function parsePolicy(command: string, parsed: ParsedArgs, context: CliContext, w
     ...optional('decisionMaker', decisionMaker),
     ...optional('decisionTimeoutMs', seconds('decision-timeout')),
     ...optional('autoCommit', optionalBoolean(parsed, 'auto-commit')),
+    ...optional('autonomous', optionalBoolean(parsed, 'autonomous')),
+    ...optional('timeoutRecoveries', count('timeout-recoveries')),
+    ...optional('timeoutIncreaseMs', seconds0('timeout-increase', MAX_TIMEOUT_SECONDS)),
+    ...optional('maxWorkerTimeoutMs', seconds('max-worker-timeout')),
+    ...optional('providerRetries', count('provider-retries')),
+    ...optional('retryBackoffMs', seconds0('retry-backoff', ORCHESTRATION_LIMITS.maxRetryBackoffMs / 1000)),
+    ...optional('evidenceReviews', count('evidence-reviews')),
   };
   if (problems.length === 0) {
     try {

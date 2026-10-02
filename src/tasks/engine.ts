@@ -9,7 +9,7 @@ import type { ProcessExecutor } from '../execution/index.ts';
 import { GitClient, captureChanges, carryForwardBaseline, fingerprintPath, inScope, takeSnapshot } from '../git/index.ts';
 import { describeIntegrityChanges, openStateStore, snapshotControlState, verifyControlState } from '../projects/index.ts';
 import type { LoadedProject } from '../projects/index.ts';
-import { TASK_LIMITS } from '../state/index.ts';
+import { TASK_LIMITS, isRecoveryTrigger } from '../state/index.ts';
 import type {
   AttemptOrigin,
   ChangeSummary,
@@ -249,7 +249,12 @@ export class TaskEngine {
     const acknowledgeIntegrityViolation = options.acknowledgeIntegrityViolation === true;
     const state = await this.store.load();
     const taskId = resolveTaskReference(state, reference);
-    const view = transitions.assertTaskCanStart(state, taskId, { acknowledgeIntegrityViolation, liveness: this.liveness });
+    const trigger = options.origin?.repair?.trigger;
+    const view = transitions.assertTaskCanStart(state, taskId, {
+      acknowledgeIntegrityViolation,
+      liveness: this.liveness,
+      recovery: trigger !== undefined && isRecoveryTrigger(trigger),
+    });
     if ((options.repairEvidence !== undefined) !== (options.origin?.repair != null)) {
       throw new WorkflowError('Repair evidence and a repair record must be supplied together');
     }

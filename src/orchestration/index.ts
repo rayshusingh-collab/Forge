@@ -6,7 +6,7 @@ export { acquireOrchestrationLease, readLeaseStatus } from './lease.ts';
 export type { LeaseOwner, LeaseStatus, OrchestrationLease } from './lease.ts';
 export { Orchestrator } from './orchestrator.ts';
 export type { OrchestrationReporter, OrchestratorOptions, RunResult, StepResult } from './orchestrator.ts';
-export { ALWAYS_STOP_CONDITIONS, POLICY_DEFAULTS, buildPolicy, describeLimits, describePolicy, policyHash, requiresCleanReview } from './policy.ts';
+export { ALWAYS_STOP_CONDITIONS, AUTONOMOUS_DEFAULTS, POLICY_DEFAULTS, buildPolicy, describeLimits, describePolicy, policyHash, requiresCleanReview, workerTimeoutFor } from './policy.ts';
 export type { PolicyOptions } from './policy.ts';
 export { buildRepairEvidence } from './repair.ts';
 export type { RepairEvidence } from './repair.ts';

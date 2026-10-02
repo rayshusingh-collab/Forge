@@ -21,7 +21,7 @@ import type {
   StateStore,
   ValidationStatus,
 } from '../state/index.ts';
-import { AI_LIMITS, ORCHESTRATION_LIMITS } from '../state/index.ts';
+import { AI_LIMITS, ORCHESTRATION_LIMITS, RECOVERABLE_OUTCOMES, attemptsWithTrigger, implementationAttempts, isRecoveryTrigger, nextRepairNumber } from '../state/index.ts';
 import { TaskEngine, deriveWorkflow, processLiveness, recoverTask, repairsUsed } from '../tasks/index.ts';
 import type { ExecutorLiveness, WorkflowView } from '../tasks/index.ts';
 import type { Worker } from '../workers/index.ts';
@@ -30,7 +30,7 @@ import type { DecisionContext, NextAction } from './decision.ts';
 import { EMPTY_COUNTERS, beginRun, finishRun, recordEvent } from './history.ts';
 import { acquireOrchestrationLease } from './lease.ts';
 import type { OrchestrationLease } from './lease.ts';
-import { policyHash } from './policy.ts';
+import { policyHash, workerTimeoutFor } from './policy.ts';
 import { buildRepairEvidence } from './repair.ts';
 
 /**
@@ -90,7 +90,12 @@ export interface StepResult {
   readonly worker: { readonly id: string; readonly outcome: string } | null;
   readonly validation: ValidationStatus | null;
   readonly review: ReviewStatus | null;
+  /** Implementation repair or recovery continuation; `max` is that kind's budget. */
   readonly repair: { readonly number: number; readonly max: number; readonly trigger: RepairTrigger } | null;
+  /** Worker timeout used for this attempt (adaptive for timeout recoveries). */
+  readonly timeoutMs?: number;
+  /** For a timed-out or failed worker: what Forge measured of its partial work. */
+  readonly partialWork?: { readonly files: number } | null;
   readonly commit: string | null;
   /** Set when this step itself ended the run (e.g. an integrity violation). */
   readonly stop: OrchestrationStop | null;
@@ -285,6 +290,10 @@ export class Orchestrator {
   /** Performs exactly one action. Expected refusals become a stop on the step; nothing is retried here. */
   private async perform(action: Exclude<NextAction, { kind: 'stop' }>, state: ProjectState, view: WorkflowView): Promise<StepResult> {
     this.counters = { ...this.counters, steps: this.counters.steps + 1 };
+    if ('backoffMs' in action && action.backoffMs !== undefined && action.backoffMs > 0) {
+      // A provider retry waits first (bounded by policy; Ctrl+C ends the wait).
+      await this.wait(action.backoffMs);
+    }
     const taskId = 'taskId' in action ? action.taskId : null;
     const task = taskId === null ? undefined : view.task(taskId);
     const base: StepResult = {
@@ -310,9 +319,9 @@ export class Orchestrator {
         case 'repair':
           return await this.executeTask(action, state, base);
         case 'review':
-          return await this.review(action.taskId, base);
+          return await this.review(action, base);
         case 'decide':
-          return await this.decide(action.taskId, base);
+          return await this.decide(action, base);
         case 'commit':
           return await this.commit(action.taskId, base);
         case 'apply-approval':
@@ -334,6 +343,7 @@ export class Orchestrator {
    * single action it authorizes happens through the normal services.
    */
   private async applyApproval(action: Extract<NextAction, { kind: 'apply-approval' }>, base: StepResult): Promise<StepResult> {
+    this.counters = { ...this.counters, humanInterventions: this.counters.humanInterventions + 1 };
     if (action.resolution === 'rejected') {
       return this.applyReviewRejection(action, base);
     }
@@ -381,12 +391,17 @@ export class Orchestrator {
           (review) => review.taskId === task.id && review.attempt === last.number && review.decision?.kind === 'remediation-required',
         );
         const canRepair = repairsUsed(task) < ORCHESTRATION_LIMITS.maxRepairsPerTask;
+        // A task whose implementation attempts are used up can only continue its unfinished
+        // (timed-out or failed) attempt, as a recovery within the hard limits.
+        const recovery = implementationAttempts(task) >= task.maxAttempts ? hardRecoveryFor(task) : null;
         const execution: Extract<NextAction, { kind: 'execute' | 'repair' }> =
           canRepair && last.outcome === 'validation-failed'
             ? { kind: 'repair', taskId: task.id, trigger: 'validation', fromAttempt: last.number, reviewId: null, reopen: false }
             : canRepair && last.outcome === 'review-rejected' && remediation !== undefined
               ? { kind: 'repair', taskId: task.id, trigger: 'review', fromAttempt: last.number, reviewId: remediation.id, reopen: false }
-              : { kind: 'execute', taskId: task.id };
+              : recovery !== null
+                ? { kind: 'repair', taskId: task.id, trigger: recovery, fromAttempt: last.number, reviewId: null, reopen: false }
+                : { kind: 'execute', taskId: task.id };
         const step = await this.executeTask(execution, after, base);
         return { ...step, detail: `Approval ${id} used (one more attempt)${step.detail === null ? '' : `; ${step.detail}`}` };
       }
@@ -426,48 +441,68 @@ export class Orchestrator {
         );
       }
       const task = current.tasks.find((candidate) => candidate.id === action.taskId)!;
-      const evidence = buildRepairEvidence(current, task, action.trigger, action.fromAttempt, action.reviewId);
-      const number = repairsUsed(task) + 1;
+      const evidence = buildRepairEvidence(current, task, action.trigger, action.fromAttempt, action.reviewId, policy);
+      const number = nextRepairNumber(task, action.trigger);
       origin = { runId: this.runId, repair: { number, trigger: action.trigger, fromAttempt: action.fromAttempt, reviewId: action.reviewId, evidence: evidence.summary } };
       repairEvidence = evidence.text;
-      repair = { number, max: policy.repair.maxPerTask, trigger: action.trigger };
+      repair = { number, max: budgetFor(policy, action.trigger), trigger: action.trigger };
     }
+    const timeoutMs = workerTimeoutFor(policy, action.kind === 'repair' && action.trigger === 'timeout' ? repair!.number : null);
 
     let outcome;
-    try {
-      outcome = await engine.runTask(action.taskId, {
-        worker,
-        access: policy.access,
-        timeoutMs: policy.workerTimeoutMs,
-        origin,
-        acknowledgeIntegrityViolation,
-        ...(repairEvidence === undefined ? {} : { repairEvidence }),
-        ...(signal === undefined ? {} : { signal }),
-      });
-    } catch (error) {
-      const health = await worker.healthCheck().catch(() => undefined);
-      if (health !== undefined && !health.available) {
-        return { ...base, repair, outcome: 'refused', detail: describe(error), stop: { reason: 'provider-unavailable', detail: describe(error), taskId: base.taskId } };
+    let unavailableRetries = 0;
+    for (;;) {
+      try {
+        outcome = await engine.runTask(action.taskId, {
+          worker,
+          access: policy.access,
+          timeoutMs,
+          origin,
+          acknowledgeIntegrityViolation,
+          ...(repairEvidence === undefined ? {} : { repairEvidence }),
+          ...(signal === undefined ? {} : { signal }),
+        });
+        break;
+      } catch (error) {
+        const health = await worker.healthCheck().catch(() => undefined);
+        if (health === undefined || health.available) {
+          throw error;
+        }
+        // The worker was unavailable before an attempt was recorded (nothing was consumed):
+        // a transient outage is retried within the provider-retry budget, after a backoff.
+        if (unavailableRetries >= policy.recovery.providerRetries || signal?.aborted === true) {
+          const reason = policy.recovery.providerRetries > 0 ? 'provider-retry-exhausted' : 'provider-unavailable';
+          const detail = `${describe(error)}${unavailableRetries > 0 ? ` (after ${unavailableRetries} provider retr${unavailableRetries === 1 ? 'y' : 'ies'})` : ''}`;
+          return { ...base, repair, outcome: 'refused', detail, stop: { reason, detail, taskId: base.taskId } };
+        }
+        unavailableRetries += 1;
+        this.counters = { ...this.counters, providerRetries: this.counters.providerRetries + 1 };
+        await this.wait(Math.min(ORCHESTRATION_LIMITS.maxRetryBackoffMs, policy.recovery.retryBackoffMs * unavailableRetries));
       }
-      throw error;
     }
 
     this.tasksStarted.add(action.taskId);
+    const trigger = action.kind === 'repair' ? action.trigger : null;
     this.counters = {
       ...this.counters,
       tasks: this.tasksStarted.size,
-      repairs: this.counters.repairs + (repair === null ? 0 : 1),
+      repairs: this.counters.repairs + (trigger === 'validation' || trigger === 'review' ? 1 : 0),
+      timeoutRecoveries: this.counters.timeoutRecoveries + (trigger === 'timeout' ? 1 : 0),
+      providerRetries: this.counters.providerRetries + (trigger === 'worker-failure' ? 1 : 0),
     };
     const after = outcome.task;
     const last = after?.lastAttempt;
+    const finished = outcome.run.result.outcome;
     const step: StepResult = {
       ...base,
       repair,
+      timeoutMs,
       attempt: outcome.attempt,
-      worker: { id: worker.id, outcome: outcome.run.result.outcome },
+      worker: { id: worker.id, outcome: finished },
       validation: outcome.run.post?.validation?.status ?? null,
       outcome: last?.outcome ?? outcome.run.status,
       detail: last?.note ?? null,
+      partialWork: finished === 'success' ? null : last?.changes == null ? null : { files: last.changes.files.length },
     };
     if (outcome.run.persistenceError !== undefined) {
       const detail = `The outcome was not recorded: ${outcome.run.persistenceError.message}`;
@@ -485,8 +520,9 @@ export class Orchestrator {
     return step;
   }
 
-  private async review(taskId: string, base: StepResult): Promise<StepResult> {
+  private async review(action: Extract<NextAction, { kind: 'review' }>, base: StepResult): Promise<StepResult> {
     const { project, runner, store, policy, signal } = this.options;
+    const taskId = action.taskId;
     try {
       const { review } = await reviewTask({
         project,
@@ -495,16 +531,29 @@ export class Orchestrator {
         task: taskId,
         timeoutMs: policy.review.timeoutMs,
         store,
+        evidenceRound: action.evidenceRound,
         ...(signal === undefined ? {} : { signal }),
       });
       this.reviewsThisRun.add(review.id);
-      this.counters = { ...this.counters, reviews: this.counters.reviews + 1 };
+      this.counters = {
+        ...this.counters,
+        reviews: this.counters.reviews + 1,
+        evidenceReviews: this.counters.evidenceReviews + (action.purpose === 'expand' ? 1 : 0),
+        providerRetries: this.counters.providerRetries + (action.purpose === 'retry' ? 1 : 0),
+      };
+      const why =
+        action.purpose === 'expand'
+          ? `evidence re-review ${action.evidenceRound} (expanded evidence: ${review.context.files} file(s), ${review.context.bytes} bytes${review.context.truncated ? ', still truncated' : ', complete'})`
+          : action.purpose === 'retry'
+            ? 'reviewer retry after a failed review'
+            : null;
+      const found = review.diagnostic ?? (review.findings.length === 0 ? null : `${review.findings.length} finding(s)`);
       const step: StepResult = {
         ...base,
         attempt: review.attempt,
         outcome: review.status,
         review: review.status,
-        detail: review.diagnostic ?? (review.findings.length === 0 ? null : `${review.findings.length} finding(s)`),
+        detail: [why, found].filter((part) => part !== null).join('; ') || null,
       };
       return signal?.aborted === true ? { ...step, stop: { reason: 'cancelled', detail: 'Interrupted by the user during the review', taskId } } : step;
     } catch (error) {
@@ -564,8 +613,12 @@ export class Orchestrator {
    * escalation (the next decision stops for a human). Never retried within
    * the same step.
    */
-  private async decide(taskId: string, base: StepResult): Promise<StepResult> {
+  private async decide(action: Extract<NextAction, { kind: 'decide' }>, base: StepResult): Promise<StepResult> {
     const { project, runner, store, policy, signal } = this.options;
+    const taskId = action.taskId;
+    if (action.retry) {
+      this.counters = { ...this.counters, providerRetries: this.counters.providerRetries + 1 };
+    }
     try {
       const { decision } = await decideTask({
         project,
@@ -619,6 +672,23 @@ export class Orchestrator {
     };
   }
 
+  /** Waits (for a provider retry's backoff); Ctrl+C ends the wait early. */
+  private wait(ms: number): Promise<void> {
+    const { signal } = this.options;
+    if (ms <= 0 || signal?.aborted === true) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, ms);
+      function done(): void {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', done);
+        resolve();
+      }
+      signal?.addEventListener('abort', done, { once: true });
+    });
+  }
+
   /** Conditions under which no worker may run: unresolved merge conflicts. */
   private async unsafeGitState(): Promise<string | null> {
     if (this.options.policy.access !== 'edit') {
@@ -649,6 +719,37 @@ function blockingRequirements(state: ProjectState, reviewId: string | null): str
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** The budget of each kind of repair or recovery, for display. */
+function budgetFor(policy: OrchestrationPolicy, trigger: RepairTrigger): number {
+  switch (trigger) {
+    case 'timeout':
+      return policy.recovery.timeoutRecoveries;
+    case 'worker-failure':
+      return policy.recovery.providerRetries;
+    default:
+      return policy.repair.maxPerTask;
+  }
+}
+
+/**
+ * The recovery a human-approved retry of an exhausted task must take: it can
+ * only continue an unfinished (timed-out or failed) attempt, within the hard
+ * recovery limits. Null when none applies.
+ */
+function hardRecoveryFor(task: ProjectState['tasks'][number]): 'timeout' | 'worker-failure' | null {
+  const last = task.attempts.at(-1);
+  if (last === undefined) {
+    return null;
+  }
+  for (const kind of ['timeout', 'worker-failure'] as const) {
+    const limit = kind === 'timeout' ? ORCHESTRATION_LIMITS.maxTimeoutRecoveries : ORCHESTRATION_LIMITS.maxProviderRetries;
+    if (RECOVERABLE_OUTCOMES[kind].includes(last.outcome) && attemptsWithTrigger(task, kind) < limit && isRecoveryTrigger(kind)) {
+      return kind;
+    }
+  }
+  return null;
 }
 
 /** A review decision reason within the state bound (an approval reason may already use all of it). */

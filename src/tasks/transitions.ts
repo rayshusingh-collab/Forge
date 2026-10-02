@@ -1,6 +1,6 @@
 import { assertNotPaused } from '../control/pause.ts';
 import { WorkflowError } from '../core/errors.ts';
-import { TASK_LIMITS, describeDependencyProblem, findDependencyProblem } from '../state/index.ts';
+import { RECOVERABLE_OUTCOMES, TASK_LIMITS, attemptsWithTrigger, describeDependencyProblem, findDependencyProblem, isRecoveryTrigger, nextRepairNumber } from '../state/index.ts';
 import type {
   AttemptExecutor,
   AttemptOrigin,
@@ -223,11 +223,21 @@ export interface StartAttemptInput {
 export function assertTaskCanStart(
   state: ProjectState,
   taskId: string,
-  options: { readonly acknowledgeIntegrityViolation: boolean; readonly liveness: ExecutorLiveness },
+  options: {
+    readonly acknowledgeIntegrityViolation: boolean;
+    readonly liveness: ExecutorLiveness;
+    /**
+     * A recovery attempt (timeout or worker-failure continuation) continues an
+     * unfinished attempt, so it may start when no implementation attempts
+     * remain; its own budget is enforced by the orchestrator and the invariants.
+     */
+    readonly recovery?: boolean;
+  },
 ): TaskView {
   findTask(state, taskId);
   const view = deriveWorkflow(state, options.liveness).task(taskId)!;
-  if (!view.runnable) {
+  const recoverable = options.recovery === true && view.condition === 'exhausted';
+  if (!view.runnable && !recoverable) {
     throw new WorkflowError(`Task ${view.key} "${view.task.title}" is not runnable: ${explainNotRunnable(view, state)}`);
   }
   if (view.requiresIntegrityAcknowledgement && !options.acknowledgeIntegrityViolation) {
@@ -242,7 +252,8 @@ export function assertTaskCanStart(
 /** pending|failed -> running: records a new attempt linked to its worker run. */
 export function startAttempt(state: ProjectState, input: StartAttemptInput, now: Date): ProjectState {
   assertNotPaused(state, 'start a task attempt');
-  const view = assertTaskCanStart(state, input.taskId, input);
+  const trigger = input.origin?.repair?.trigger;
+  const view = assertTaskCanStart(state, input.taskId, { ...input, recovery: trigger !== undefined && isRecoveryTrigger(trigger) });
   const task = view.task;
   if (task.attempts.length + 1 !== input.attemptNumber) {
     throw new WorkflowError(`Task ${view.key} was started by another Forge process; reload and check its status`);
@@ -522,9 +533,13 @@ export function recoverTask(
   return { ...next, workerRuns: runs };
 }
 
-/** Number of repair attempts already made for the task (the per-task repair budget is counted across runs). */
+/**
+ * Implementation repairs (validation and review) already made for the task:
+ * the per-task repair budget, counted across runs. Recovery continuations
+ * (timeout, worker failure) have their own budgets and are not counted.
+ */
 export function repairsUsed(task: TaskRecord): number {
-  return task.attempts.filter((attempt) => attempt.origin?.repair != null).length;
+  return attemptsWithTrigger(task, 'validation') + attemptsWithTrigger(task, 'review');
 }
 
 /**
@@ -533,12 +548,14 @@ export function repairsUsed(task: TaskRecord): number {
  */
 function assertRepairMatches(task: TaskRecord, repair: RepairRecord): void {
   const last = task.attempts.at(-1);
-  const expected = repair.trigger === 'validation' ? 'validation-failed' : 'review-rejected';
-  if (task.status !== 'failed' || last === undefined || last.number !== repair.fromAttempt || last.outcome !== expected) {
-    throw new WorkflowError(`Task "${task.title}" changed: its latest attempt is no longer the ${expected} attempt ${repair.fromAttempt} being repaired`);
+  const expected: readonly AttemptOutcome[] =
+    repair.trigger === 'validation' ? ['validation-failed'] : repair.trigger === 'review' ? ['review-rejected'] : RECOVERABLE_OUTCOMES[repair.trigger];
+  if (task.status !== 'failed' || last === undefined || last.number !== repair.fromAttempt || !expected.includes(last.outcome)) {
+    throw new WorkflowError(`Task "${task.title}" changed: its latest attempt is no longer the ${expected.join('/')} attempt ${repair.fromAttempt} being repaired`);
   }
-  if (repair.number !== repairsUsed(task) + 1) {
-    throw new WorkflowError(`Task "${task.title}" changed: repair ${repair.number} does not follow its ${repairsUsed(task)} earlier repair(s)`);
+  const number = nextRepairNumber(task, repair.trigger);
+  if (repair.number !== number) {
+    throw new WorkflowError(`Task "${task.title}" changed: ${repair.trigger} attempt ${repair.number} does not follow its ${number - 1} earlier one(s)`);
   }
 }
 

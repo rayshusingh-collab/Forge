@@ -1,3 +1,4 @@
+export { attemptsWithTrigger, implementationAttempts, isRecoveryAttempt, isRecoveryTrigger, nextRepairNumber } from './attempts.ts';
 export { MAX_DOCUMENT_BYTES, acquireFileLock, isErrorCode, readJsonDocument, serializeJson, withFileLock, writeFileAtomic } from './files.ts';
 export type { HeldFileLock } from './files.ts';
 export { describeDependencyProblem, findCycle, findDependencyProblem } from './graph.ts';
@@ -22,6 +23,8 @@ export {
   ORCHESTRATION_RUN_STATUSES,
   FINDING_ASSESSMENTS,
   REMEDIATION_STATUSES,
+  RECOVERABLE_OUTCOMES,
+  RECOVERY_TRIGGERS,
   REPAIR_TRIGGERS,
   REQUIREMENT_ASSESSMENTS,
   REVIEW_CONCERN_POLICIES,
@@ -78,6 +81,7 @@ export type {
   OrchestrationEvent,
   OrchestrationPolicy,
   OrchestrationRun,
+  RecoveryPolicy,
   OrchestrationRunMode,
   OrchestrationRunStatus,
   OrchestrationStop,

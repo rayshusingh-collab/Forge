@@ -18,7 +18,19 @@ import type { ExecutorLiveness } from '../tasks/index.ts';
  * stop reason — never prompts, diffs, validation output, or provider text.
  */
 
-export const EMPTY_COUNTERS: OrchestrationCounters = { steps: 0, tasks: 0, repairs: 0, reviews: 0, decisions: 0, commits: 0, milestones: 0 };
+export const EMPTY_COUNTERS: OrchestrationCounters = {
+  steps: 0,
+  tasks: 0,
+  repairs: 0,
+  reviews: 0,
+  decisions: 0,
+  commits: 0,
+  milestones: 0,
+  timeoutRecoveries: 0,
+  providerRetries: 0,
+  evidenceReviews: 0,
+  humanInterventions: 0,
+};
 
 export interface BeginRunInput {
   readonly id: string;

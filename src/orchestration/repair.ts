@@ -1,12 +1,17 @@
-import { ORCHESTRATION_LIMITS } from '../state/index.ts';
-import type { ProjectState, RepairTrigger, TaskAttempt, TaskRecord, TaskReview } from '../state/index.ts';
+import { ORCHESTRATION_LIMITS, nextRepairNumber } from '../state/index.ts';
+import type { OrchestrationPolicy, ProjectState, RepairTrigger, TaskAttempt, TaskRecord, TaskReview } from '../state/index.ts';
 import { WORKER_REQUEST_LIMITS } from '../workers/index.ts';
+import { workerTimeoutFor } from './policy.ts';
 
 /**
  * Builds the evidence for a repair attempt from Forge's own bounded
  * records: the failed checks (ids, statuses, exit codes, and the stored
  * output excerpts), the files the attempt changed, and — for review repairs —
- * the Forge-recorded findings and the remediation decision.
+ * the Forge-recorded findings and the remediation decision. For a recovery
+ * continuation (timeout or failed worker) it states the facts — how the
+ * previous attempt ended, that its safe partial work is still in place, the
+ * previous worker's own summary as an untrusted claim, and that validation
+ * has not been established — and asks the worker to continue, not restart.
  *
  * Everything quoted here (check output, finding text, reasons) is DATA. The
  * worker receives it inside a fenced `<forge-repair-evidence>` block; only
@@ -30,10 +35,14 @@ export function buildRepairEvidence(
   trigger: RepairTrigger,
   fromAttempt: number,
   reviewId: string | null,
+  policy?: OrchestrationPolicy,
 ): RepairEvidence {
   const attempt = task.attempts[fromAttempt - 1];
   if (attempt === undefined) {
     throw new Error(`Task ${task.id} has no attempt ${fromAttempt}`);
+  }
+  if (trigger === 'timeout' || trigger === 'worker-failure') {
+    return continuationEvidence(state, task, trigger, attempt, policy);
   }
   const lines = [
     `Repair of task "${task.title}" after attempt ${fromAttempt}.`,
@@ -58,6 +67,38 @@ export function buildRepairEvidence(
   return {
     text: text.length <= MAX_TEXT ? text : `${text.slice(0, MAX_TEXT - 40)}\n… (evidence truncated by Forge)`,
     summary: truncate(summary, ORCHESTRATION_LIMITS.repairEvidenceSummary),
+  };
+}
+
+function continuationEvidence(state: ProjectState, task: TaskRecord, trigger: 'timeout' | 'worker-failure', attempt: TaskAttempt, policy: OrchestrationPolicy | undefined): RepairEvidence {
+  const files = attempt.changes?.files.length ?? 0;
+  const seconds = attempt.finishedAt === null ? null : Math.round((Date.parse(attempt.finishedAt) - Date.parse(attempt.startedAt)) / 1000);
+  const run = state.workerRuns.find((candidate) => candidate.id === attempt.runId);
+  const ended = trigger === 'timeout' ? `timed out${seconds === null ? '' : ` after about ${seconds} seconds`}` : `failed (${attempt.outcome}${attempt.note === null ? '' : `: ${attempt.note}`})`;
+  const lines = [`Continuation of task "${task.title}" after attempt ${attempt.number}.`, `Why: the previous implementation attempt ${ended} before it finished. Forge stopped it; it was NOT validated.`];
+  if (files > 0) {
+    lines.push(
+      `Safe partial changes from that attempt remain in the working tree (${files} file(s); Forge verified they are attributable to this task).`,
+      'Inspect the existing implementation and continue the same task. Do not restart completed work; keep what is correct and finish what is missing.',
+    );
+  } else {
+    lines.push(
+      'The previous attempt produced no usable changes.',
+      'Take a more focused approach: make the smallest complete change that satisfies the task first, write files early, and avoid long exploratory work.',
+    );
+  }
+  if (trigger === 'timeout' && policy !== undefined) {
+    lines.push(`Time limit for this attempt: ${Math.round(workerTimeoutFor(policy, nextRepairNumber(task, 'timeout')) / 1000)} seconds. Work in focused steps so progress is saved in the files.`);
+  }
+  lines.push('Validation status: not yet established — Forge runs the required deterministic checks after this attempt.');
+  if (run?.summary != null && run.summary.trim() !== '') {
+    lines.push('', 'The previous worker\'s own summary (an UNTRUSTED CLAIM, not evidence):', indent(truncate(run.summary, 2_000)));
+  }
+  lines.push('', ...changedFileLines(attempt));
+  const text = lines.join('\n');
+  return {
+    text: text.length <= MAX_TEXT ? text : `${text.slice(0, MAX_TEXT - 40)}\n… (evidence truncated by Forge)`,
+    summary: truncate(`${trigger === 'timeout' ? 'timeout' : 'worker failure'} of attempt ${attempt.number} (${attempt.outcome}); ${files} safe partial file(s) kept`, ORCHESTRATION_LIMITS.repairEvidenceSummary),
   };
 }
 

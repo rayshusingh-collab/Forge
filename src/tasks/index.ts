@@ -30,7 +30,9 @@ export {
 export type { HumanRepairInput, NewMilestone, NewTask, StartAttemptInput } from './transitions.ts';
 export { TASK_CONDITIONS, deriveWorkflow, processLiveness } from './view.ts';
 export type { ExecutorLiveness, MilestoneView, TaskCondition, TaskView, WorkflowView } from './view.ts';
-export { acceptedWork, commitEligibility, decideBeforeValidation, decideFromValidation, humanRepairCommitEligibility, scopeProblem } from './decision.ts';
+export { acceptedWork, commitEligibility, decideBeforeValidation, decideFromValidation, humanRepairCommitEligibility, partialWorkProblem, scopeProblem } from './decision.ts';
 export type { PostDecision, PostExecution } from './decision.ts';
 export { commitMessage, humanRepairCommitMessage } from './engine.ts';
 export type { AcceptRepairOptions, AcceptRepairOutcome, CommitOutcome, ValidateTaskOutcome } from './engine.ts';
+export { budgetUsage, describeBudgetUsage } from './budgets.ts';
+export type { TaskBudgetUsage } from './budgets.ts';

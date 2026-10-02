@@ -173,7 +173,7 @@ describe('forge run (CLI)', () => {
     assert.match(stdout.text, /TASK 1\.1 Add multiply\n {2}Worker: fake — success \(a claim, not evidence\)\n {2}Validation: PASSED/);
     assert.match(stdout.text, /Review: CLEAR \(advisory\)/);
     assert.match(stdout.text, /Commit: 1 file\(s\) committed/);
-    assert.match(stdout.text, /FORGE RUN RESULT\nOutcome:\s+COMPLETE/);
+    assert.match(stdout.text, /FORGE RUN RESULT\nOutcome:\s+WORKFLOW COMPLETE/);
     assert.match(stdout.text, /Commits:\s+2/);
     assert.match(stdout.text, /Human action required: none/);
     assert.match(stdout.text, /Nothing was pushed\./);

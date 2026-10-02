@@ -25,6 +25,28 @@ export const POLICY_DEFAULTS = {
   maxRepairsPerTask: 2,
 } as const;
 
+/**
+ * What `--autonomous` (or `run.autonomous`) changes: the defaults below,
+ * each still overridable by an explicit option. It never relaxes a hard
+ * stop (see ALWAYS_STOP_CONDITIONS); it only lets Forge handle recoverable
+ * engineering events itself, within these bounded budgets.
+ */
+export const AUTONOMOUS_DEFAULTS = {
+  access: 'edit',
+  review: true,
+  autoDecide: true,
+  repairOnValidationFailure: true,
+  repairOnBlockingReview: true,
+  autoCommit: true,
+  maxTasks: ORCHESTRATION_LIMITS.maxTasks,
+  maxSteps: ORCHESTRATION_LIMITS.maxSteps,
+  maxRepairsPerTask: 3,
+  timeoutRecoveries: 2,
+  providerRetries: 2,
+  retryBackoffMs: 5_000,
+  evidenceReviews: 1,
+} as const;
+
 /** Human choices for one run. Absent means "use the conservative default". */
 export interface PolicyOptions {
   readonly maxTasks?: number;
@@ -44,6 +66,20 @@ export interface PolicyOptions {
   readonly decisionMaker?: string;
   readonly decisionTimeoutMs?: number;
   readonly autoCommit?: boolean;
+  /** Hands-off mode: safe automation defaults for long runs (see AUTONOMOUS_DEFAULTS). */
+  readonly autonomous?: boolean;
+  /** Timeout recoveries per task (autonomous default 2). */
+  readonly timeoutRecoveries?: number;
+  /** Added to the worker timeout per successive timeout recovery (autonomous default: half the worker timeout). */
+  readonly timeoutIncreaseMs?: number;
+  /** Hard cap on any recovery's worker timeout (autonomous default: twice the worker timeout). */
+  readonly maxWorkerTimeoutMs?: number;
+  /** Retries after transient provider failures (autonomous default 2). */
+  readonly providerRetries?: number;
+  /** Wait before the Nth provider retry: N × this (autonomous default 5 s). */
+  readonly retryBackoffMs?: number;
+  /** Evidence-expansion re-reviews per attempt (autonomous default 1). */
+  readonly evidenceReviews?: number;
 }
 
 /**
@@ -54,7 +90,8 @@ export const ALWAYS_STOP_CONDITIONS: readonly string[] = [
   'integrity or scope violation (never acknowledged automatically)',
   'interrupted or concurrently running task',
   'task awaiting manual validation (validation is never overridden automatically)',
-  'failed worker invocation, or repair budget / attempts exhausted',
+  'a timed-out or failed worker beyond its recovery budget, or one that left changes Forge cannot attribute to the task',
+  'repair, recovery, evidence-review or attempt budget exhausted (each reported by name)',
   'unresolved merge conflicts or other unsafe Git state',
   'AI decision-maker escalation, low confidence, malformed output, or unavailability (never treated as acceptance)',
   'commit refused by the safe-commit rules (e.g. mixed attribution)',
@@ -62,10 +99,13 @@ export const ALWAYS_STOP_CONDITIONS: readonly string[] = [
   'workflow complete, limit reached, or Ctrl+C',
 ];
 
-export function buildPolicy(options: PolicyOptions, defaults: { readonly workerTimeoutMs: number }): OrchestrationPolicy {
+export function buildPolicy(given: PolicyOptions, defaults: { readonly workerTimeoutMs: number }): OrchestrationPolicy {
+  const autonomous = given.autonomous ?? false;
+  const options = autonomous ? withAutonomousDefaults(given) : given;
   const repairOnValidationFailure = options.repairOnValidationFailure ?? false;
   const repairOnBlockingReview = options.repairOnBlockingReview ?? false;
   const maxPerTask = options.maxRepairsPerTask ?? POLICY_DEFAULTS.maxRepairsPerTask;
+  const workerTimeoutMs = options.workerTimeoutMs ?? defaults.workerTimeoutMs;
   if ((repairOnValidationFailure || repairOnBlockingReview) && maxPerTask === 0) {
     throw new ValidationError('Repairs are enabled but the repair budget is 0; use a budget of at least 1, or do not enable repairs');
   }
@@ -87,7 +127,7 @@ export function buildPolicy(options: PolicyOptions, defaults: { readonly workerT
     maxSteps: options.maxSteps ?? POLICY_DEFAULTS.maxSteps,
     access: options.access ?? 'read-only',
     worker: options.worker ?? 'claude',
-    workerTimeoutMs: options.workerTimeoutMs ?? defaults.workerTimeoutMs,
+    workerTimeoutMs,
     repair: { onValidationFailure: repairOnValidationFailure, onBlockingReview: repairOnBlockingReview, maxPerTask },
     review: {
       enabled: reviewEnabled,
@@ -102,6 +142,16 @@ export function buildPolicy(options: PolicyOptions, defaults: { readonly workerT
       timeoutMs: options.decisionTimeoutMs ?? options.reviewTimeoutMs ?? defaults.workerTimeoutMs,
     },
     autoCommit: options.autoCommit ?? false,
+    autonomous,
+    recovery: {
+      timeoutRecoveries: options.timeoutRecoveries ?? 0,
+      // Autonomous defaults: 600 s -> 900 s -> 1200 s (cap) for a 600 s worker timeout.
+      timeoutIncreaseMs: options.timeoutIncreaseMs ?? (autonomous ? Math.round(workerTimeoutMs / 2) : 0),
+      maxWorkerTimeoutMs: options.maxWorkerTimeoutMs ?? (autonomous ? Math.min(workerTimeoutMs * 2, Math.max(workerTimeoutMs, MAX_AUTONOMOUS_TIMEOUT_MS)) : workerTimeoutMs),
+      providerRetries: options.providerRetries ?? 0,
+      retryBackoffMs: options.retryBackoffMs ?? 0,
+      evidenceReviews: options.evidenceReviews ?? 0,
+    },
   };
   try {
     // The same decoder guards stored policies, so the hard limits live in one place.
@@ -112,6 +162,20 @@ export function buildPolicy(options: PolicyOptions, defaults: { readonly workerT
     }
     throw error;
   }
+}
+
+/** The default timeout cap never exceeds this; an explicit `maxWorkerTimeoutMs` may (up to the stored 24 h ceiling). */
+const MAX_AUTONOMOUS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+/** Fills every option the human did not set with its autonomous default. */
+function withAutonomousDefaults(options: PolicyOptions): PolicyOptions {
+  const merged: Record<string, unknown> = { ...options };
+  for (const [key, value] of Object.entries(AUTONOMOUS_DEFAULTS)) {
+    if (merged[key] === undefined) {
+      merged[key] = value;
+    }
+  }
+  return merged as PolicyOptions;
 }
 
 export type PolicySource = 'cli' | 'project' | 'default';
@@ -143,6 +207,13 @@ export function policyOptionsFromProject(settings: ProjectSettings): PolicyOptio
     ['run.autoCommit', 'autoCommit', (value) => value],
     ['run.workerTimeoutSeconds', 'workerTimeoutMs', (value) => (value as number) * 1000],
     ['run.reviewTimeoutSeconds', 'reviewTimeoutMs', (value) => (value as number) * 1000],
+    ['run.autonomous', 'autonomous', (value) => value],
+    ['run.timeoutRecoveries', 'timeoutRecoveries', (value) => value],
+    ['run.timeoutIncreaseSeconds', 'timeoutIncreaseMs', (value) => (value as number) * 1000],
+    ['run.maxWorkerTimeoutSeconds', 'maxWorkerTimeoutMs', (value) => (value as number) * 1000],
+    ['run.providerRetries', 'providerRetries', (value) => value],
+    ['run.retryBackoffSeconds', 'retryBackoffMs', (value) => (value as number) * 1000],
+    ['run.evidenceReviews', 'evidenceReviews', (value) => value],
   ];
   for (const [key, option, convert] of map) {
     const value = settings[key];
@@ -182,7 +253,18 @@ export function resolvePolicy(cli: PolicyOptions, project: ProjectSettings, defa
 }
 
 export function describeLimits(): string {
-  return `max tasks ${ORCHESTRATION_LIMITS.maxTasks}, max steps ${ORCHESTRATION_LIMITS.maxSteps}, max repairs per task ${ORCHESTRATION_LIMITS.maxRepairsPerTask}`;
+  return `max tasks ${ORCHESTRATION_LIMITS.maxTasks}, max steps ${ORCHESTRATION_LIMITS.maxSteps}, max repairs per task ${ORCHESTRATION_LIMITS.maxRepairsPerTask}, max timeout recoveries ${ORCHESTRATION_LIMITS.maxTimeoutRecoveries}, max provider retries ${ORCHESTRATION_LIMITS.maxProviderRetries}, max evidence reviews ${ORCHESTRATION_LIMITS.maxEvidenceReviews}, max retry backoff ${ORCHESTRATION_LIMITS.maxRetryBackoffMs / 1000} s`;
+}
+
+/**
+ * Worker timeout for an attempt: the normal timeout, or for the Nth timeout
+ * recovery the normal timeout plus N increases, never above the hard cap.
+ */
+export function workerTimeoutFor(policy: OrchestrationPolicy, timeoutRecovery: number | null): number {
+  if (timeoutRecovery === null) {
+    return policy.workerTimeoutMs;
+  }
+  return Math.min(policy.recovery.maxWorkerTimeoutMs, policy.workerTimeoutMs + timeoutRecovery * policy.recovery.timeoutIncreaseMs);
 }
 
 /** SHA-256 over the policy with sorted keys, recorded with every run. */
@@ -222,6 +304,20 @@ export function describePolicy(policy: OrchestrationPolicy): string[] {
     `Clean review required: ${requiresCleanReview(policy) ? 'yes' : 'no'}`,
     `Auto-decision: ${decision}`,
     `Auto-commit:   ${policy.autoCommit ? 'enabled (local only, safe-commit rules; never pushes)' : 'disabled'}`,
+    `Mode:          ${policy.autonomous ? 'AUTONOMOUS (recoverable events handled within budgets; hard stops unchanged)' : 'standard (recoverable events stop for a human unless a recovery budget is set)'}`,
+    `Recovery:      ${describeRecovery(policy)}`,
     'Push:          never',
   ];
+}
+
+function describeRecovery(policy: OrchestrationPolicy): string {
+  const r = policy.recovery;
+  const seconds = (ms: number): string => `${Math.round(ms / 1000)} s`;
+  const timeouts =
+    r.timeoutRecoveries === 0
+      ? 'timeout recovery off'
+      : `timeout recovery ${r.timeoutRecoveries}/task (${Array.from({ length: r.timeoutRecoveries }, (_, index) => seconds(workerTimeoutFor(policy, index + 1))).join(' -> ')}, cap ${seconds(r.maxWorkerTimeoutMs)})`;
+  const retries = r.providerRetries === 0 ? 'provider retries off' : `provider retries ${r.providerRetries} (backoff ${seconds(r.retryBackoffMs)} x n)`;
+  const evidence = r.evidenceReviews === 0 ? 'evidence re-review off' : `evidence re-reviews ${r.evidenceReviews}/attempt`;
+  return `${timeouts}; ${retries}; ${evidence}`;
 }

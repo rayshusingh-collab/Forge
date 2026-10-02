@@ -19,7 +19,11 @@ export function formatPolicyHeader(
   decisionMaker: AiProvider | null = null,
 ): string {
   return [
-    mode === 'step' ? 'FORGE RUN STEP (at most one workflow step)' : 'FORGE RUN (bounded autonomous orchestration)',
+    mode === 'step'
+      ? 'FORGE RUN STEP (at most one workflow step)'
+      : policy.autonomous
+        ? 'FORGE RUN --AUTONOMOUS (hands-off: recoverable events handled within budgets; hard safety stops unchanged)'
+        : 'FORGE RUN (bounded autonomous orchestration)',
     `Project:       ${projectName}`,
     `Roles:         implementer ${worker.id}; reviewer ${reviewer === null ? 'none' : reviewer.id}; decision-maker ${decisionMaker === null ? 'none (humans decide reviews)' : decisionMaker.id}; validation = deterministic checks run by Forge`,
     ...describePolicy(policy),
@@ -35,10 +39,15 @@ export function formatStep(step: StepResult): string {
   switch (step.action) {
     case 'execute':
     case 'repair': {
-      const repair = step.repair === null ? '' : ` — Repair: ${step.repair.number}/${step.repair.max} (${step.repair.trigger})`;
-      lines.push(`TASK ${step.taskKey ?? '?'} ${step.taskTitle ?? ''}${repair}`);
+      lines.push(`TASK ${step.taskKey ?? '?'} ${step.taskTitle ?? ''}${describeRepair(step)}`);
       if (step.worker !== null) {
         lines.push(`  Worker: ${step.worker.id} — ${step.worker.outcome} (a claim, not evidence)`);
+        if (step.worker.outcome !== 'success' && step.timeoutMs !== undefined) {
+          lines.push(`  Worker ${step.worker.outcome === 'timeout' ? 'timed out' : 'did not complete'}${step.worker.outcome === 'timeout' ? ` after ${Math.round(step.timeoutMs / 1000)}s` : ''}`);
+        }
+        if (step.partialWork !== undefined && step.partialWork !== null) {
+          lines.push(`  Partial work: ${step.partialWork.files} changed file(s) kept in the working tree (attribution is checked before any recovery)`);
+        }
       }
       lines.push(`  Validation: ${step.validation === null ? 'not run' : step.validation === 'passed' ? 'PASSED' : step.validation.toUpperCase()}`);
       lines.push(`  Forge decision: ${decision(step.outcome)}${step.detail === null ? '' : ` — ${step.detail}`}`);
@@ -81,7 +90,15 @@ export function formatStep(step: StepResult): string {
 export function formatRunResult(result: RunResult): string {
   const info = describeStop(result.stop.reason);
   const outcome =
-    info.category === 'complete' ? 'COMPLETE' : info.category === 'limit' ? 'STOPPED (limit)' : info.category === 'cancelled' ? 'CANCELLED' : 'STOPPED';
+    result.stop.reason === 'complete'
+      ? 'WORKFLOW COMPLETE'
+      : info.category === 'complete'
+        ? 'COMPLETE'
+        : info.category === 'limit'
+          ? 'STOPPED (limit)'
+          : info.category === 'cancelled'
+            ? 'CANCELLED'
+            : 'STOPPED';
   return [
     '',
     `STOP: ${info.label}${result.stop.detail === null ? '' : ` — ${result.stop.detail}`}`,
@@ -92,9 +109,14 @@ export function formatRunResult(result: RunResult): string {
     `Steps:                 ${result.counters.steps}`,
     `Tasks processed:       ${result.counters.tasks}`,
     `Repairs:               ${result.counters.repairs}`,
+    `Timeout recoveries:    ${result.counters.timeoutRecoveries}`,
+    `Provider retries:      ${result.counters.providerRetries}`,
+    `Evidence re-reviews:   ${result.counters.evidenceReviews}`,
     `Reviews:               ${result.counters.reviews}`,
+    `AI decisions:          ${result.counters.decisions}`,
     `Commits:               ${result.counters.commits}`,
     `Milestones completed:  ${result.counters.milestones}`,
+    `Human interventions:   ${result.counters.humanInterventions}`,
     `Stop reason:           ${info.label} (${result.stop.reason})`,
     `Next runnable task:    ${result.nextRunnable ?? 'none'}`,
     `Human action required: ${info.category === 'complete' && result.stop.reason === 'complete' ? 'none' : withTask(info.action, result.stopTaskKey) ?? 'none'}`,
@@ -166,6 +188,22 @@ export function formatRunStatus(projectName: string, defaults: OrchestrationPoli
   return `${lines.join('\n')}\n`;
 }
 
+/** The repair or recovery an attempt step was, with its budget (and the adaptive timeout of a timeout recovery). */
+function describeRepair(step: StepResult): string {
+  const repair = step.repair;
+  if (repair === null) {
+    return '';
+  }
+  switch (repair.trigger) {
+    case 'timeout':
+      return ` — Recovery: continuing the timed-out attempt (timeout recovery ${repair.number}/${repair.max}${step.timeoutMs === undefined ? '' : `, worker timeout ${Math.round(step.timeoutMs / 1000)}s`})`;
+    case 'worker-failure':
+      return ` — Recovery: retrying after a worker failure (provider retry ${repair.number}/${repair.max})`;
+    default:
+      return ` — Repair: ${repair.number}/${repair.max} (${repair.trigger})`;
+  }
+}
+
 /** Fills the `<task>` placeholder of a suggested command with the task the stop is about. */
 function withTask(action: string | null, key: string | null): string | null {
   return action === null || key === null ? action : action.split('<task>').join(key);
@@ -181,7 +219,9 @@ function describeNext(preview: RunPreview): string {
       return `STOP: ${info.label} — ${next.detail}${action === null ? '' : ` (${action})`}`;
     }
     case 'repair':
-      return `repair task${task} (${next.trigger})`;
+      return next.trigger === 'timeout' || next.trigger === 'worker-failure' ? `recover task${task} (${next.trigger} continuation)` : `repair task${task} (${next.trigger})`;
+    case 'review':
+      return next.purpose === 'expand' ? `re-review task${task} with expanded evidence (round ${next.evidenceRound})` : `review task${task}`;
     case 'complete-milestone':
       return 'complete a milestone';
     default:

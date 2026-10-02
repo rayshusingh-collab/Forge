@@ -150,10 +150,11 @@ describe('orchestration: validation repair', () => {
     const setup = await orchestrationProject(temp);
     const worker = scriptedWorker(setup.root, [{ 'src/math.js': BROKEN_MULTIPLY }]);
     const first = await makeOrchestrator(setup, worker, { repairOnValidationFailure: true, maxRepairsPerTask: 1 }).run();
-    assert.equal(first.stop.reason, 'repair-budget-exhausted');
+    assert.equal(first.stop.reason, 'validation-repair-exhausted', 'the exhausted budget is named precisely');
+    assert.match(first.stop.detail ?? '', /repair budget is used up \(1\/1: 1 validation, 0 review\)/);
     assert.equal(worker.requests.length, 2);
     const second = await makeOrchestrator(setup, worker, { repairOnValidationFailure: true, maxRepairsPerTask: 1 }).run();
-    assert.equal(second.stop.reason, 'repair-budget-exhausted');
+    assert.equal(second.stop.reason, 'validation-repair-exhausted');
     assert.equal(worker.requests.length, 2, 'the budget is per task, not per run');
   });
 

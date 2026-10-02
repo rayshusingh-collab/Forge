@@ -123,22 +123,43 @@ function changesEligibility(changes: ChangeSummary | null, commit: CommitRecord 
   if (changes === null || changes.files.length === 0) {
     return { ok: false, reason: 'the task produced no attributed changes' };
   }
+  const problem = attributionProblem(changes);
+  return problem === null ? { ok: true } : { ok: false, reason: problem };
+}
+
+/**
+ * Why Forge cannot attribute this changeset to the task with certainty, or
+ * null. The single rule set behind safe commit AND the safety check on an
+ * interrupted (timed-out or failed) attempt's partial work.
+ */
+function attributionProblem(changes: ChangeSummary): string | null {
   if (changes.truncated || changes.baseline.truncated) {
-    return { ok: false, reason: 'too many changed paths to attribute safely' };
+    return 'too many changed paths to attribute safely';
   }
   const mixed = changes.files.filter((file) => file.attribution === 'mixed');
   if (mixed.length > 0) {
-    return {
-      ok: false,
-      reason: `${mixed.length} file(s) already had uncommitted changes before the task (${mixed.slice(0, 3).map((f) => f.path).join(', ')}); Forge cannot separate your changes from the task's — commit them yourself`,
-    };
+    return `${mixed.length} file(s) already had uncommitted changes before the task (${mixed.slice(0, 3).map((f) => f.path).join(', ')}); Forge cannot separate your changes from the task's — commit them yourself`;
   }
   if (changes.indexChanged.length > 0) {
-    return { ok: false, reason: `staged changes appeared during the task (${changes.indexChanged.slice(0, 3).join(', ')})` };
+    return `staged changes appeared during the task (${changes.indexChanged.slice(0, 3).join(', ')})`;
   }
   if (changes.files.some((file) => file.change === 'renamed')) {
-    return { ok: false, reason: 'staged renames are not committed automatically' };
+    return 'staged renames are not committed automatically';
   }
-  const problem = scopeProblem(changes);
-  return problem === null ? { ok: true } : { ok: false, reason: problem };
+  return scopeProblem(changes);
+}
+
+/**
+ * Whether the partial work an interrupted attempt (worker timeout or failed
+ * invocation) left in the working tree can be kept and continued safely:
+ * Forge measured it, and every change is attributable to the task — no
+ * out-of-scope path, no moved HEAD/branch, no mixed or staged files. Null
+ * means safe (including "no changes at all"). Protected Forge state is
+ * guarded separately: touching it makes the attempt an integrity violation.
+ */
+export function partialWorkProblem(changes: ChangeSummary | null): string | null {
+  if (changes === null) {
+    return 'its changes could not be measured, so they cannot be attributed to the task';
+  }
+  return attributionProblem(changes);
 }

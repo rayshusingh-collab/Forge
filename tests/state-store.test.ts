@@ -143,8 +143,27 @@ function populatedState(): ProjectState {
   };
 }
 
-/** Removes fields introduced in schema version 9, for documents of older versions. */
+/** Removes fields introduced in schema versions 10 and 11, for documents of older versions. */
+function stripV10(doc: Record<string, unknown>): Record<string, unknown> {
+  for (const review of (doc['taskReviews'] as Record<string, unknown>[] | undefined) ?? []) {
+    delete review['evidenceRound'];
+    if (review['decision'] !== null && typeof review['decision'] === 'object') {
+      delete (review['decision'] as Record<string, unknown>)['approvalId'];
+    }
+  }
+  for (const run of (doc['orchestrationRuns'] as Record<string, unknown>[] | undefined) ?? []) {
+    delete (run['policy'] as Record<string, unknown>)['autonomous'];
+    delete (run['policy'] as Record<string, unknown>)['recovery'];
+    for (const counter of ['timeoutRecoveries', 'providerRetries', 'evidenceReviews', 'humanInterventions']) {
+      delete (run['counters'] as Record<string, unknown>)[counter];
+    }
+  }
+  return doc;
+}
+
+/** Removes fields introduced in schema version 9 (and later), for documents of older versions. */
 function stripV9(doc: Record<string, unknown>): Record<string, unknown> {
+  stripV10(doc);
   delete doc['remediations'];
   delete doc['aiDecisions'];
   for (const review of (doc['taskReviews'] as Record<string, unknown>[] | undefined) ?? []) {
@@ -525,6 +544,8 @@ describe('StateStore: rejecting bad data', () => {
       review: { enabled: false, reviewer: null, timeoutMs: 600_000, onConcerns: 'stop', onFailure: 'stop' },
       decision: { enabled: false, provider: null, timeoutMs: 600_000 },
       autoCommit: false,
+      autonomous: false,
+      recovery: { timeoutRecoveries: 0, timeoutIncreaseMs: 0, maxWorkerTimeoutMs: 600_000, providerRetries: 0, retryBackoffMs: 0, evidenceReviews: 0 },
     };
     const run = (fields: Record<string, unknown>) => ({
       id: 'run1',
@@ -535,7 +556,7 @@ describe('StateStore: rejecting bad data', () => {
       finishedAt: T0.toISOString(),
       policy,
       policyHash: 'a'.repeat(64),
-      counters: { steps: 0, tasks: 0, repairs: 0, reviews: 0, decisions: 0, commits: 0, milestones: 0 },
+      counters: { steps: 0, tasks: 0, repairs: 0, reviews: 0, decisions: 0, commits: 0, milestones: 0, timeoutRecoveries: 0, providerRetries: 0, evidenceReviews: 0, humanInterventions: 0 },
       events: [],
       eventsDropped: 0,
       stop: { reason: 'complete', detail: null, taskId: null },
@@ -590,6 +611,7 @@ describe('StateStore: rejecting bad data', () => {
       diagnostic: null,
       createdAt: T0.toISOString(),
       decision: null,
+      evidenceRound: 0,
       ...fields,
     });
 

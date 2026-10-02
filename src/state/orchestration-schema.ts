@@ -18,6 +18,7 @@ import type {
   OrchestrationPolicy,
   OrchestrationRun,
   OrchestrationStop,
+  RecoveryPolicy,
   RepairRecord,
 } from './model.ts';
 
@@ -40,7 +41,8 @@ export function decodeAttemptOrigin(value: unknown, path: string): AttemptOrigin
 function decodeRepairRecord(value: unknown, path: string): RepairRecord {
   const r = new ObjectReader(value, path, ['number', 'trigger', 'fromAttempt', 'reviewId', 'evidence']);
   const repair: RepairRecord = {
-    number: r.integer('number', { min: 1, max: ORCHESTRATION_LIMITS.maxRepairsPerTask }),
+    // Numbered per kind: implementation repairs, timeout recoveries, provider retries.
+    number: r.integer('number', { min: 1, max: Math.max(ORCHESTRATION_LIMITS.maxRepairsPerTask, ORCHESTRATION_LIMITS.maxTimeoutRecoveries, ORCHESTRATION_LIMITS.maxProviderRetries) }),
     trigger: r.oneOf('trigger', REPAIR_TRIGGERS),
     fromAttempt: r.integer('fromAttempt', { min: 1 }),
     reviewId: r.nullableId('reviewId'),
@@ -97,7 +99,7 @@ function decodeOwner(value: unknown, path: string): AttemptExecutor {
 
 /** Decodes a policy and enforces the hard limits, so stored policy can never exceed them. */
 export function decodeOrchestrationPolicy(value: unknown, path: string): OrchestrationPolicy {
-  const r = new ObjectReader(value, path, ['maxTasks', 'maxSteps', 'access', 'worker', 'workerTimeoutMs', 'repair', 'review', 'decision', 'autoCommit']);
+  const r = new ObjectReader(value, path, ['maxTasks', 'maxSteps', 'access', 'worker', 'workerTimeoutMs', 'repair', 'review', 'decision', 'autoCommit', 'autonomous', 'recovery']);
   const policy: OrchestrationPolicy = {
     maxTasks: r.integer('maxTasks', { min: 1, max: ORCHESTRATION_LIMITS.maxTasks }),
     maxSteps: r.integer('maxSteps', { min: 1, max: ORCHESTRATION_LIMITS.maxSteps }),
@@ -139,7 +141,12 @@ export function decodeOrchestrationPolicy(value: unknown, path: string): Orchest
       return decoded;
     }),
     autoCommit: r.field('autoCommit', decodeBoolean),
+    autonomous: r.field('autonomous', decodeBoolean),
+    recovery: r.field('recovery', decodeRecoveryPolicy),
   };
+  if (policy.recovery.maxWorkerTimeoutMs < policy.workerTimeoutMs) {
+    throw new SchemaViolation(`${path}.recovery.maxWorkerTimeoutMs`, 'must be at least the normal worker timeout');
+  }
   // The decision-maker judges completed reviews, so it is meaningless (and refused) without review.
   if (policy.decision.enabled && !policy.review.enabled) {
     throw new SchemaViolation(`${path}.decision`, 'auto-decision requires AI review to be enabled');
@@ -147,8 +154,32 @@ export function decodeOrchestrationPolicy(value: unknown, path: string): Orchest
   return policy;
 }
 
+function decodeRecoveryPolicy(value: unknown, path: string): RecoveryPolicy {
+  const r = new ObjectReader(value, path, ['timeoutRecoveries', 'timeoutIncreaseMs', 'maxWorkerTimeoutMs', 'providerRetries', 'retryBackoffMs', 'evidenceReviews']);
+  return {
+    timeoutRecoveries: r.integer('timeoutRecoveries', { min: 0, max: ORCHESTRATION_LIMITS.maxTimeoutRecoveries }),
+    timeoutIncreaseMs: r.integer('timeoutIncreaseMs', { min: 0, max: MAX_TIMEOUT_MS }),
+    maxWorkerTimeoutMs: r.integer('maxWorkerTimeoutMs', { min: 1, max: MAX_TIMEOUT_MS }),
+    providerRetries: r.integer('providerRetries', { min: 0, max: ORCHESTRATION_LIMITS.maxProviderRetries }),
+    retryBackoffMs: r.integer('retryBackoffMs', { min: 0, max: ORCHESTRATION_LIMITS.maxRetryBackoffMs }),
+    evidenceReviews: r.integer('evidenceReviews', { min: 0, max: ORCHESTRATION_LIMITS.maxEvidenceReviews }),
+  };
+}
+
 function decodeCounters(value: unknown, path: string): OrchestrationCounters {
-  const r = new ObjectReader(value, path, ['steps', 'tasks', 'repairs', 'reviews', 'decisions', 'commits', 'milestones']);
+  const r = new ObjectReader(value, path, [
+    'steps',
+    'tasks',
+    'repairs',
+    'reviews',
+    'decisions',
+    'commits',
+    'milestones',
+    'timeoutRecoveries',
+    'providerRetries',
+    'evidenceReviews',
+    'humanInterventions',
+  ]);
   return {
     steps: r.integer('steps', { min: 0, max: ORCHESTRATION_LIMITS.maxSteps }),
     tasks: r.integer('tasks', { min: 0, max: ORCHESTRATION_LIMITS.maxTasks }),
@@ -157,6 +188,10 @@ function decodeCounters(value: unknown, path: string): OrchestrationCounters {
     decisions: r.integer('decisions', { min: 0 }),
     commits: r.integer('commits', { min: 0 }),
     milestones: r.integer('milestones', { min: 0 }),
+    timeoutRecoveries: r.integer('timeoutRecoveries', { min: 0 }),
+    providerRetries: r.integer('providerRetries', { min: 0 }),
+    evidenceReviews: r.integer('evidenceReviews', { min: 0 }),
+    humanInterventions: r.integer('humanInterventions', { min: 0 }),
   };
 }
 

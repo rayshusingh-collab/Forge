@@ -50,6 +50,41 @@ export const SETTINGS = {
   'run.workerTimeoutSeconds': { type: 'integer', min: 1, max: 86_400, default: null, description: 'Implementer timeout per attempt (default: FORGE_WORKER_TIMEOUT_MS)' },
   'run.reviewTimeoutSeconds': { type: 'integer', min: 1, max: 86_400, default: null, description: 'Reviewer timeout (default: the worker timeout)' },
   'run.decisionTimeoutSeconds': { type: 'integer', min: 1, max: 86_400, default: null, description: 'Decision-maker timeout (default: the reviewer timeout)' },
+  'run.autonomous': {
+    type: 'boolean',
+    default: false,
+    description: 'Hands-off mode: handle recoverable events (timeouts, provider failures, truncated evidence, repairs) within bounded budgets; hard stops unchanged',
+  },
+  'run.timeoutRecoveries': {
+    type: 'integer',
+    min: 0,
+    max: ORCHESTRATION_LIMITS.maxTimeoutRecoveries,
+    default: null,
+    description: 'Continuations of a timed-out attempt per task (default: 2 when autonomous, else 0)',
+  },
+  'run.timeoutIncreaseSeconds': { type: 'integer', min: 0, max: 86_400, default: null, description: 'Worker timeout added per timeout recovery (default: half the worker timeout when autonomous)' },
+  'run.maxWorkerTimeoutSeconds': { type: 'integer', min: 1, max: 86_400, default: null, description: 'Hard cap on a recovery\'s worker timeout (default: twice the worker timeout when autonomous)' },
+  'run.providerRetries': {
+    type: 'integer',
+    min: 0,
+    max: ORCHESTRATION_LIMITS.maxProviderRetries,
+    default: null,
+    description: 'Retries after transient provider failures (default: 2 when autonomous, else 0)',
+  },
+  'run.retryBackoffSeconds': {
+    type: 'integer',
+    min: 0,
+    max: ORCHESTRATION_LIMITS.maxRetryBackoffMs / 1000,
+    default: null,
+    description: 'Wait before the Nth provider retry: N × this (default: 5 when autonomous, else 0)',
+  },
+  'run.evidenceReviews': {
+    type: 'integer',
+    min: 0,
+    max: ORCHESTRATION_LIMITS.maxEvidenceReviews,
+    default: null,
+    description: 'Re-reviews with expanded evidence per attempt (default: 1 when autonomous, else 0)',
+  },
 } as const satisfies Readonly<Record<string, SettingSpec>>;
 
 export type SettingKey = keyof typeof SETTINGS;

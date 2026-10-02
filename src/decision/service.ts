@@ -8,8 +8,9 @@ import type { ProcessExecutor } from '../execution/index.ts';
 import { GitClient } from '../git/index.ts';
 import { openStateStore } from '../projects/index.ts';
 import type { LoadedProject } from '../projects/index.ts';
+import { expandedLimits } from '../review/index.ts';
 import type { ReviewPacketLimits } from '../review/index.ts';
-import { AI_LIMITS } from '../state/index.ts';
+import { AI_LIMITS, implementationAttempts } from '../state/index.ts';
 import type { AiDecisionRecord, AiDecisionStatus, StateStore, TaskRecord } from '../state/index.ts';
 import { deriveWorkflow, repairsUsed, resolveTaskReference } from '../tasks/index.ts';
 import { ValidationProfileStore } from '../validation/index.ts';
@@ -68,7 +69,8 @@ export async function decideTask(options: DecideTaskOptions): Promise<DecideTask
     review,
     profile,
     maxRepairs: options.maxRepairs,
-    limits: options.limits ?? DEFAULT_DECISION_LIMITS,
+    // An evidence-expansion re-review is decided on equally expanded evidence.
+    limits: options.limits ?? expandedLimits(DEFAULT_DECISION_LIMITS, review.evidenceRound),
   });
 
   const requestId = (options.generateId ?? randomUUID)();
@@ -150,7 +152,7 @@ function repairBlocked(task: TaskRecord, maxRepairs: number): string | null {
   if (used >= maxRepairs) {
     return `the repair budget is used up (${used}/${maxRepairs})`;
   }
-  if (task.attempts.length >= task.maxAttempts) {
+  if (implementationAttempts(task) >= task.maxAttempts) {
     return `all ${task.maxAttempts} attempts have been used`;
   }
   return null;

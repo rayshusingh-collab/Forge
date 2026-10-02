@@ -589,11 +589,11 @@ Values outside the limits are **refused, never clamped**; there is no "0 means u
 
 **Automatic local commits.** With `--auto-commit`, a task validated in this run is committed with exactly the M5 `forge task commit` rules: only task-attributed paths, re-verified against the working tree, `git commit --only`. Your other dirty or staged files stay as they are. Mixed attribution, drift, renames or staged changes during the task make Forge **stop**; it never forces, stashes, resets, amends, or pushes. To continue after such a stop, commit the changes yourself and run `forge run` without `--auto-commit`.
 
-**Always stops for** (whatever the policy): integrity or scope violations (never acknowledged automatically), interrupted or concurrently running tasks, tasks awaiting manual validation (validation is never overridden), failed worker invocations (not a validation failure, so not repaired), exhausted repair budgets or attempts, unresolved merge conflicts, commit refusals, an implementer that is unavailable, blocked dependencies, milestones that cannot complete, limits, and Ctrl+C. `COMPLETE` means every milestone is completed or cancelled and every task succeeded or was cancelled. It is reported separately from `BLOCKED`, `NO RUNNABLE TASK`, `RETRY EXHAUSTED`, `LIMIT REACHED` and the rest.
+**Always stops for** (whatever the policy): integrity or scope violations (never acknowledged automatically), interrupted or concurrently running tasks, tasks awaiting manual validation (validation is never overridden), failed or timed-out worker invocations (unless a recovery budget is set, see Hands-off mode), exhausted repair budgets or attempts (named precisely: validation or review repair), unresolved merge conflicts, commit refusals, an implementer that is unavailable, blocked dependencies, milestones that cannot complete, limits, and Ctrl+C. `COMPLETE` means every milestone is completed or cancelled and every task succeeded or was cancelled. It is reported separately from `BLOCKED`, `NO RUNNABLE TASK`, `RETRY EXHAUSTED`, `LIMIT REACHED` and the rest.
 
 **Interruption and recovery.** Ctrl+C cancels the active worker or reviewer through the normal cancellation path. The attempt is recorded truthfully (`cancelled`), the loop stops, and nothing else starts. A cancelled or crashed attempt is never re-run or committed automatically: the next `forge run` stops with `WORKER FAILED` or `INTERRUPTED TASK` (`forge task recover`). A run record left `running` by a dead process is marked `interrupted` by the next run.
 
-**One run at a time.** A run holds `.forge/orchestration.lock` (run ID, process, host, random token). A second `forge run` is refused. A lock whose owner is gone is reported as probably stale, but **never taken over** automatically: recover it with `forge run recover` (see Human control). Forge checks before every step that the lock is still its own; if it was removed or replaced, the run stops and leaves it alone. The lock is separate from the state lock, which the task engine keeps using per operation, so the two cannot deadlock.
+**One run at a time.** A run holds `.forge/orchestration.lock` (run ID, process, host, random token). A second `forge run` is refused. A lock whose owner is gone is reported as probably stale, but **never taken over** by a normal run: recover it with `forge run recover` (see Human control). Only `--autonomous` performs that same provable recovery itself. Forge checks before every step that the lock is still its own; if it was removed or replaced, the run stops and leaves it alone. The lock is separate from the state lock, which the task engine keeps using per operation, so the two cannot deadlock.
 
 **History.** `state.json` keeps the last 50 runs, each with at most 200 events (action, task, attempt, outcome code, a detail of at most 300 characters), counters, the policy and its hash, and the stop reason. Prompts, diffs, validation output, worker claims and provider text are never stored there.
 
@@ -674,6 +674,79 @@ Its instructions also tell it to escalate product ambiguity, major scope expansi
 - `forge explain`: what the decision-maker decided during the last run, and why Forge stopped.
 - `forge audit`: each AI decision (provider, model when known, verdict, confidence, effect, reason, review), and each remediation required and satisfied.
 
+## Hands-off mode (`forge run --autonomous`)
+
+`forge run` is conservative: every recoverable event that is not a validation failure (a worker timeout, a provider hiccup, a not-quite-confident decision) stops for a human. `forge run --autonomous` (or `forge config set run.autonomous true`) lets Forge handle those **recoverable engineering events** itself, within explicit, bounded budgets, so one command can take an ordinary project from its plan to `WORKFLOW COMPLETE`. It does **not** mean "approve everything": every hard safety stop is unchanged.
+
+**What `--autonomous` changes** (each is only a default; any explicit option still wins, e.g. `--autonomous --no-auto-commit`):
+
+| Setting | `forge run` | `forge run --autonomous` | Hard maximum |
+| --- | --- | --- | --- |
+| implementer edits (`--allow-edits`) | off | on | — |
+| AI review / auto-decision | off / off | on / on | — |
+| repair after failed validation / blocking review | off / off | on / on | — |
+| repairs per task (`--max-repairs`), shared by validation and review repairs | 2 | 3 | 5 |
+| local safe commits (`--auto-commit`) | off | on | — |
+| tasks / steps per run | 5 / 30 | 50 / 200 | 50 / 200 |
+| timeout recoveries per task (`--timeout-recoveries`) | 0 | 2 | 5 |
+| timeout added per recovery (`--timeout-increase`) | — | half the worker timeout | 24 h |
+| recovery timeout cap (`--max-worker-timeout`) | — | twice the worker timeout | 24 h |
+| provider retries (`--provider-retries`) | 0 | 2 | 5 |
+| wait before the Nth provider retry (`--retry-backoff`) | — | 5 s × N | 60 s |
+| evidence re-reviews per attempt (`--evidence-reviews`) | 0 | 1 | 3 |
+
+The matching project settings are `run.autonomous`, `run.timeoutRecoveries`, `run.timeoutIncreaseSeconds`, `run.maxWorkerTimeoutSeconds`, `run.providerRetries`, `run.retryBackoffSeconds` and `run.evidenceReviews`. With the default 600 s worker timeout, the timeouts are 600 s, then 900 s, then 1200 s (the cap). Execution is never unbounded.
+
+**Budgets are separate**, and every counter is derived from the stored attempts and reviews, so restarts never reset or double-count them:
+- *implementation attempts*: the first attempt, manual attempts and implementation repairs; bounded by the task's `maxAttempts` (default 3);
+- *repairs*: validation repairs and review repairs, sharing `--max-repairs`;
+- *timeout recoveries* and *provider retries*: continuations of an unfinished attempt. They do **not** use an implementation attempt or a repair;
+- *evidence re-reviews*: reviews of the same attempt with more evidence. No code changes, so no attempt or repair is used.
+
+`forge task show`, `forge explain` and the run summary show each one.
+
+**Worker timeout recovery.** When the implementer times out, Forge measures what it changed against the attempt's baseline, using the same attribution rules as a safe commit:
+- If every change is attributable to the task (in scope, HEAD and branch unchanged, no mixed or staged files, measurable), the partial work is **kept** (Forge never reverts it). Forge then starts a continuation attempt with a longer timeout. It tells the worker that the previous attempt timed out after N seconds and that the safe partial changes are still in the working tree. It asks the worker to inspect them and continue the same task without restarting completed work. The continuation also gets the previous worker's summary (as an untrusted claim), the changed-file list, and the fact that validation is not yet established. Open remediation requirements are added as always.
+- If the attempt changed nothing, the retry asks for a more focused approach.
+- The continuation is validated, reviewed, decided and committed normally.
+- **Unsafe timeouts stop:** out-of-scope changes, a moved HEAD, mixed attribution, staged changes, or unmeasurable changes stop with `UNSAFE PARTIAL WORK`. A protected-path (`.forge/`) change is an `INTEGRITY VIOLATION`.
+
+**Provider retries.** A worker invocation that fails, is unavailable or returns unusable output is retried after a backoff. An unavailable worker is retried before any attempt is recorded. An unavailable reviewer or an unusable decision-maker answer is retried within the same run. Never retried: Ctrl+C or cancellation, integrity or scope violations, configuration problems, and deterministic validation failures (which have their own repair flow).
+
+**Evidence re-review.** High confidence remains the standard for automatic acceptance. Sometimes the decision-maker would accept but only with medium or low confidence, and Forge's own records show the evidence it saw was cut short: the review or decision packet was truncated, or files were omitted. In that case Forge first re-reviews the same attempt with expanded evidence limits (more files, more bytes per file) and asks for a new decision on equally expanded evidence. The model's own claim never triggers this; only the recorded truncation does. Identical evidence is never re-reviewed. If confidence is still not high after the budget, the run stops with `EVIDENCE REVIEW BUDGET EXHAUSTED`. If the evidence was complete, low confidence means the work itself may be wrong, so the normal rules apply (repair or escalation).
+
+**Review decisions.** Ordinary advisory findings do not need you. The decision-maker may accept automatically when validation passed, no finding is critical, no blocking finding is unresolved, every outstanding requirement is satisfied, every warning was assessed, and confidence is high. It is instructed to settle engineering choices itself (refactoring, tests, implementation details, equivalent designs) and to escalate only **product** questions: genuinely ambiguous requirements, materially different user-visible behaviors, unspecified destructive-data or security/privacy trade-offs, or contradictions with accepted requirements.
+
+**Exhaustion is named precisely.** When a budget runs out, the run stops and says which one: `VALIDATION REPAIR BUDGET EXHAUSTED`, `REVIEW REPAIR BUDGET EXHAUSTED`, `TIMEOUT RECOVERY EXHAUSTED`, `PROVIDER RETRY BUDGET EXHAUSTED` or `EVIDENCE REVIEW BUDGET EXHAUSTED`. It does not report a generic `WORKER FAILED`.
+
+**Still always stops** in autonomous mode:
+- integrity violations;
+- scope or protected-path violations;
+- unattributable or mixed changes;
+- unresolved Git conflicts;
+- unexpected HEAD or history movement;
+- commit refusals;
+- interrupted attempts;
+- destructive or approval-gated operations;
+- product-decision escalations;
+- exhausted budgets;
+- Ctrl+C;
+- a human pause.
+
+**Crash and restart.** All recovery state is derived from `.forge/state.json`, so the next `forge run --autonomous` continues deterministically without repeating attempts, recoveries, reviews, decisions or commits. If the previous run crashed and left its orchestration lock behind, an autonomous run removes it only when Forge can **prove** the owner is gone. That means a process on this machine that no longer exists, running a run this project knows. This is exactly `forge run recover` without `--force`, and it is recorded as a control event. Anything unprovable still needs a human.
+
+**Output.** Recovery steps say what happened, for example:
+
+```
+TASK 3.2 Build app shell, routing, styles and shared UI components
+  Worker: codex — timeout (a claim, not evidence)
+  Worker timed out after 600s
+  Partial work: 8 changed file(s) kept in the working tree (attribution is checked before any recovery)
+TASK 3.2 Build app shell, routing, styles and shared UI components — Recovery: continuing the timed-out attempt (timeout recovery 1/2, worker timeout 900s)
+```
+
+The final summary adds timeout recoveries, provider retries, evidence re-reviews, AI decisions and human interventions; a finished project reports `Outcome: WORKFLOW COMPLETE`.
+
 ## Human control
 
 **Authority.** Approvals, rejections, pause/resume, configuration changes, lease recovery, violation acknowledgements, policy selection and every forced operation are deterministic human actions through the CLI. No AI provider, worker output, review finding, validation output, or repository file can start or authorize any of them.
@@ -739,6 +812,9 @@ Its instructions also tell it to escalate product ambiguity, major scope expansi
 - **Approvals stop at the first human-blocked task:** independent tasks are not run around a task waiting for a human decision.
 - **Pause during an edit-enabled task** cannot be recorded until that task's step finishes (the task holds the project lock); use Ctrl+C to stop it immediately.
 - **Lease recovery across machines** always needs `--force` and a human approval: Forge cannot check processes on another host.
+- **Interrupted attempts need you, even in autonomous mode:** a worker killed by a crash never had its changes measured, so Forge cannot attribute them and stops for `forge task recover`.
+- **Evidence insufficiency is judged from Forge's records only:** a re-review happens when the packet was observably truncated, not when a finding merely says evidence was missing.
+- **Product vs engineering decisions** are guided by the decision-maker's instructions; Forge enforces the evidence rules, not that classification.
 - **Auto-commit refusals need you:** after a commit refusal, commit the changes yourself and continue without `--auto-commit`. Forge cannot tell that you committed them.
 - **Ignored files are invisible:** attribution and scope checks rely on `git status`, so a worker writing to a Git-ignored path (`dist/`, `.env`) isn't observed. Forge verifies what Git and the file system show inside the project, not the whole machine.
 - **Validation runs project code:** a check such as `npm test` executes code the worker may have changed. Forge protects the check definitions, not the code they run. V1 is not a sandbox.

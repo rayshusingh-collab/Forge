@@ -1,7 +1,7 @@
-import { AI_LIMITS } from '../state/index.ts';
+import { AI_LIMITS, ORCHESTRATION_LIMITS, RECOVERABLE_OUTCOMES, attemptsWithTrigger } from '../state/index.ts';
 import type { AiDecisionRecord, ApprovalType, OrchestrationPolicy, ProjectState, RepairTrigger, StopReason, TaskReview } from '../state/index.ts';
 import { taskApprovalBinding } from '../approvals/index.ts';
-import { commitEligibility, repairsUsed } from '../tasks/index.ts';
+import { commitEligibility, partialWorkProblem, repairsUsed } from '../tasks/index.ts';
 import type { TaskView, WorkflowView } from '../tasks/index.ts';
 
 /**
@@ -22,8 +22,10 @@ import type { TaskView, WorkflowView } from '../tasks/index.ts';
  *      attempt answering an open remediation): review, AI decision when
  *      auto-decision is enabled, then commit (orchestrated work only);
  *   3. completing a milestone the existing rules say is complete;
- *   4. the first runnable task in milestone/task order: execute it, or
- *      repair it when policy permits and budget remains;
+ *   4. the first runnable task in milestone/task order (or a failed task
+ *      whose unfinished attempt may be recovered): execute it, repair it when
+ *      policy permits and budget remains, or recover a timed-out / failed
+ *      worker attempt within the recovery budgets;
  *   5. otherwise explain why nothing can run (complete vs blocked vs ...).
  */
 
@@ -32,14 +34,34 @@ export type NextAction =
   | {
       readonly kind: 'repair';
       readonly taskId: string;
+      /** `timeout` / `worker-failure` are recovery continuations, not implementation repairs. */
       readonly trigger: RepairTrigger;
       readonly fromAttempt: number;
       readonly reviewId: string | null;
       /** A succeeded task must first be reopened by a policy review decision. */
       readonly reopen: boolean;
+      /** Wait this long first (a provider retry's backoff). */
+      readonly backoffMs?: number;
     }
-  | { readonly kind: 'review'; readonly taskId: string; readonly attempt: number }
-  | { readonly kind: 'decide'; readonly taskId: string; readonly attempt: number; readonly reviewId: string }
+  | {
+      readonly kind: 'review';
+      readonly taskId: string;
+      readonly attempt: number;
+      /** 0 for a normal review; N for the Nth evidence-expansion round. */
+      readonly evidenceRound: number;
+      /** `retry`: the previous review of this attempt failed; `expand`: re-review with more evidence. */
+      readonly purpose: 'review' | 'retry' | 'expand';
+      readonly backoffMs?: number;
+    }
+  | {
+      readonly kind: 'decide';
+      readonly taskId: string;
+      readonly attempt: number;
+      readonly reviewId: string;
+      /** The previous decision attempt on this review gave no usable answer. */
+      readonly retry: boolean;
+      readonly backoffMs?: number;
+    }
   | { readonly kind: 'commit'; readonly taskId: string; readonly attempt: number }
   | { readonly kind: 'complete-milestone'; readonly milestoneId: string }
   | {
@@ -110,7 +132,9 @@ export function decideNext(state: ProjectState, view: WorkflowView, policy: Orch
     return { kind: 'complete-milestone', milestoneId: completable.milestone.id };
   }
 
-  const next = view.runnable[0];
+  // A failed task whose attempts are used up may still have an unfinished (timed-out or failed)
+  // attempt to recover: recovery continues that attempt and has its own budget.
+  const next = view.tasks.find((task) => task.runnable || recoveryKindFor(task, policy) !== null);
   if (next !== undefined) {
     return runnableAction(state, next, policy, context);
   }
@@ -206,18 +230,27 @@ function nothingStartedSince(state: ProjectState, finishedAt: string | null): bo
 function reviewGate(state: ProjectState, task: TaskView, attempt: number, policy: OrchestrationPolicy, context: DecisionContext): NextAction | null {
   const review = latestReview(state, task.task.id, attempt);
   if (review === undefined) {
-    return { kind: 'review', taskId: task.task.id, attempt };
+    return { kind: 'review', taskId: task.task.id, attempt, evidenceRound: 0, purpose: 'review' };
   }
   if (!COMPLETED_REVIEW.has(review.status)) {
     // Never treat a missing review as "clear": continue only if policy explicitly allows it.
     if (policy.review.onFailure === 'continue') {
       return null;
     }
+    const retry: NextAction = { kind: 'review', taskId: task.task.id, attempt, evidenceRound: review.evidenceRound, purpose: 'retry' };
     if (context.reviewsThisRun.has(review.id)) {
-      return stop('reviewer-unavailable', `Review of task ${task.key} did not complete (${review.status}${review.diagnostic === null ? '' : `: ${review.diagnostic}`})`, task);
+      // Transient reviewer failures are retried within the provider-retry budget (per attempt).
+      const failures = state.taskReviews.filter((candidate) => candidate.taskId === task.task.id && candidate.attempt === attempt && !COMPLETED_REVIEW.has(candidate.status)).length;
+      const detail = `Review of task ${task.key} did not complete (${review.status}${review.diagnostic === null ? '' : `: ${review.diagnostic}`})`;
+      if (failures <= policy.recovery.providerRetries) {
+        return { ...retry, backoffMs: backoff(policy, failures) };
+      }
+      return policy.recovery.providerRetries > 0
+        ? stop('provider-retry-exhausted', `${detail}; ${failures} reviewer failure(s) for this attempt, provider-retry budget ${policy.recovery.providerRetries}`, task)
+        : stop('reviewer-unavailable', detail, task);
     }
     // A failure from an earlier run: this new run is the retry.
-    return { kind: 'review', taskId: task.task.id, attempt };
+    return retry;
   }
   if (review.decision?.kind === 'accepted') {
     return null;
@@ -243,7 +276,7 @@ function reviewGate(state: ProjectState, task: TaskView, attempt: number, policy
   // Policy-driven repair of blocking concerns (the conservative direction) keeps precedence over auto-decision.
   const policyRepair = review.status === 'blocking-concerns' && policy.repair.onBlockingReview;
   if (policy.decision.enabled && !policyRepair) {
-    return decisionGate(state, task, review, context, humanGate);
+    return decisionGate(state, task, review, policy, context, humanGate);
   }
   if (review.status === 'concerns') {
     return humanGate(`Review of task ${task.key} raised ${count(['warning'])} concern(s); a human decision is required`);
@@ -251,7 +284,7 @@ function reviewGate(state: ProjectState, task: TaskView, attempt: number, policy
   if (!policy.repair.onBlockingReview) {
     return humanGate(`${blocking}; a human decision is required`);
   }
-  const problem = repairProblem(task, policy) ?? reopenProblem(state, task);
+  const problem = repairProblem(task, policy, 'review') ?? reopenProblem(state, task);
   if (problem !== null) {
     return acceptanceGate(stop(problem.reason, `${blocking}; ${problem.detail}`, task));
   }
@@ -291,7 +324,7 @@ function runnableAction(state: ProjectState, task: TaskView, policy: Orchestrati
     if (!policy.repair.onValidationFailure) {
       return gate(state, 'task-retry', task, stop('repair-not-permitted', `Task ${task.key} failed deterministic validation${last.note === null ? '' : ` (${last.note})`}`, task), evidence, retry, overLimit);
     }
-    const problem = repairProblem(task, policy);
+    const problem = repairProblem(task, policy, 'validation');
     if (problem !== null) {
       return gate(state, 'task-retry', task, stop(problem.reason, `Task ${task.key} failed deterministic validation; ${problem.detail}`, task), evidence, retry, overLimit);
     }
@@ -310,14 +343,110 @@ function runnableAction(state: ProjectState, task: TaskView, policy: Orchestrati
     if (!permitted || review === undefined) {
       return gate(state, 'task-retry', task, stop('review-remediation-required', `Task ${task.key} was reopened for remediation after a review`, task), evidence, retry, overLimit);
     }
-    const problem = repairProblem(task, policy);
+    const problem = repairProblem(task, policy, 'review');
     if (problem !== null) {
       return gate(state, 'task-retry', task, stop(problem.reason, `Task ${task.key} requires remediation; ${problem.detail}`, task), evidence, retry, overLimit);
     }
     return overLimit ?? { kind: 'repair', taskId: task.task.id, trigger: 'review', fromAttempt: last.number, reviewId: review.id, reopen: false };
   }
-  // Worker failures, timeouts, cancellations, human rejections: not a repair; a human decides.
+  // A timed-out or failed worker invocation is recovered within its budget, when its partial work is safe.
+  const kind = recoveryKindFor(task, policy);
+  if (kind !== null) {
+    return recoveryAction(state, task, policy, kind, evidence, overLimit);
+  }
+  // Cancellations, human rejections, and failures without a recovery budget: a human decides.
   return gate(state, 'task-retry', task, stop('worker-failed', `Task ${task.key}'s last attempt ended as ${last.outcome}${last.note === null ? '' : ` (${last.note})`}`, task), evidence, retry, overLimit);
+}
+
+/**
+ * The recovery that applies to a failed task's unfinished last attempt, or
+ * null: `timeout` after a worker timeout, `worker-failure` after a failed
+ * invocation (process failure, unavailable, unusable output) — and only
+ * when the policy gives that kind a budget. Cancellation, integrity and scope
+ * violations, validation failures and review rejections are never recovered
+ * this way.
+ */
+function recoveryKindFor(task: TaskView, policy: OrchestrationPolicy): 'timeout' | 'worker-failure' | null {
+  const last = task.lastAttempt;
+  if (task.task.status !== 'failed' || last === undefined || task.requiresIntegrityAcknowledgement) {
+    return null;
+  }
+  if (RECOVERABLE_OUTCOMES.timeout.includes(last.outcome)) {
+    return policy.recovery.timeoutRecoveries > 0 ? 'timeout' : null;
+  }
+  if (RECOVERABLE_OUTCOMES['worker-failure'].includes(last.outcome)) {
+    return policy.recovery.providerRetries > 0 ? 'worker-failure' : null;
+  }
+  return null;
+}
+
+/**
+ * Continues an unfinished attempt — never blindly. The partial work the
+ * interrupted worker left is judged by the same attribution rules as a safe
+ * commit (no out-of-scope path, moved HEAD, mixed or staged files, and it
+ * must have been measured); protected Forge state was already guarded (that
+ * attempt would be an integrity violation, never recovered). Safe work is
+ * kept and continued; anything else stops for a human. Each kind is bounded
+ * by its own budget, counted from the stored attempts.
+ */
+function recoveryAction(
+  state: ProjectState,
+  task: TaskView,
+  policy: OrchestrationPolicy,
+  kind: 'timeout' | 'worker-failure',
+  evidence: readonly string[],
+  overLimit: NextAction | null,
+): NextAction {
+  const last = task.lastAttempt!;
+  const retry = 'Run ONE more attempt of the task (with the failure evidence when it failed validation or review); it is validated normally.';
+  const what = kind === 'timeout' ? 'timed out' : `failed (${last.outcome})`;
+  // A read-only worker cannot change files, so there is nothing to attribute.
+  const problem = last.changes === null && policy.access === 'read-only' ? null : partialWorkProblem(last.changes);
+  if (problem !== null) {
+    return gate(
+      state,
+      'task-retry',
+      task,
+      stop('unsafe-partial-work', `Task ${task.key}'s worker ${what} and left work Forge will not continue automatically: ${problem}`, task),
+      evidence,
+      retry,
+      overLimit,
+    );
+  }
+  const used = attemptsWithTrigger(task.task, kind);
+  const budget = kind === 'timeout' ? policy.recovery.timeoutRecoveries : policy.recovery.providerRetries;
+  const hardLimit = kind === 'timeout' ? ORCHESTRATION_LIMITS.maxTimeoutRecoveries : ORCHESTRATION_LIMITS.maxProviderRetries;
+  if (used >= Math.min(budget, hardLimit)) {
+    return gate(
+      state,
+      'task-retry',
+      task,
+      stop(
+        kind === 'timeout' ? 'timeout-recovery-exhausted' : 'provider-retry-exhausted',
+        `Task ${task.key}'s worker ${what} again; ${used}/${budget} ${kind === 'timeout' ? 'timeout recoveries' : 'provider retries'} used`,
+        task,
+      ),
+      evidence,
+      retry,
+      overLimit,
+    );
+  }
+  return (
+    overLimit ?? {
+      kind: 'repair',
+      taskId: task.task.id,
+      trigger: kind,
+      fromAttempt: last.number,
+      reviewId: null,
+      reopen: false,
+      ...(kind === 'worker-failure' ? { backoffMs: backoff(policy, used + 1) } : {}),
+    }
+  );
+}
+
+/** Wait before the Nth provider retry (linear backoff, bounded by policy). */
+function backoff(policy: OrchestrationPolicy, retry: number): number {
+  return Math.min(ORCHESTRATION_LIMITS.maxRetryBackoffMs, policy.recovery.retryBackoffMs * retry);
 }
 
 /**
@@ -386,23 +515,33 @@ function reviewEvidence(task: TaskView, review: TaskReview): string[] {
 function attemptEvidence(task: TaskView, policy: OrchestrationPolicy): string[] {
   const last = task.lastAttempt!;
   return [
-    `attempt ${last.number}/${task.task.maxAttempts}: ${last.outcome}${last.note === null ? '' : ` — ${last.note}`}`,
+    `attempt ${last.number} (implementation attempts ${task.attemptsUsed}/${task.task.maxAttempts}): ${last.outcome}${last.note === null ? '' : ` — ${last.note}`}`,
     `deterministic validation: ${last.validation?.status ?? 'not run'}`,
     `repairs used: ${repairsUsed(task.task)} (policy allows ${policy.repair.onValidationFailure || policy.repair.onBlockingReview ? policy.repair.maxPerTask : 0})`,
+    `timeout recoveries used: ${attemptsWithTrigger(task.task, 'timeout')}/${policy.recovery.timeoutRecoveries}; provider retries used: ${attemptsWithTrigger(task.task, 'worker-failure')}/${policy.recovery.providerRetries}`,
     `changed files: ${last.changes?.files.length ?? 0}`,
   ];
 }
 
-/** Why the task cannot be repaired now (budget or attempts), or null. */
-function repairProblem(task: TaskView, policy: OrchestrationPolicy): { reason: StopReason; detail: string } | null {
+/**
+ * Why the task cannot get another implementation repair of this kind (the
+ * shared repair budget, or its implementation attempts), or null. The stop
+ * reason names the kind of repair that was needed.
+ */
+function repairProblem(task: TaskView, policy: OrchestrationPolicy, trigger: 'validation' | 'review'): { reason: StopReason; detail: string } | null {
+  const reason: StopReason = trigger === 'validation' ? 'validation-repair-exhausted' : 'review-repair-exhausted';
   const used = repairsUsed(task.task);
   if (used >= policy.repair.maxPerTask) {
-    return { reason: 'repair-budget-exhausted', detail: `the repair budget is used up (${used}/${policy.repair.maxPerTask})` };
+    return { reason, detail: `the repair budget is used up (${used}/${policy.repair.maxPerTask}: ${describeRepairs(task)})` };
   }
   if (task.attemptsUsed >= task.task.maxAttempts) {
-    return { reason: 'repair-budget-exhausted', detail: `all ${task.task.maxAttempts} attempts have been used` };
+    return { reason, detail: `all ${task.task.maxAttempts} attempts have been used` };
   }
   return null;
+}
+
+function describeRepairs(task: TaskView): string {
+  return `${attemptsWithTrigger(task.task, 'validation')} validation, ${attemptsWithTrigger(task.task, 'review')} review`;
 }
 
 /** A succeeded task can only be reopened while nothing was built on it (same rule as a human remediation). */
@@ -453,25 +592,45 @@ function explainIdle(state: ProjectState, view: WorkflowView): NextAction {
 /**
  * Auto-decision for a review that would otherwise stop for a human:
  *   no decision yet                  -> ask the decision-maker
+ *   accepted below high confidence while the evidence was observably
+ *   truncated                        -> re-review with expanded evidence and
+ *                                       decide again (bounded per attempt)
  *   decided, but escalated           -> stop for a human (its reason is evidence)
  *   no usable answer, earlier run    -> ask again (bounded per review), unless a
  *                                       human already approved or rejected the
  *                                       acceptance for this exact evidence
- *   no usable answer, this run / cap -> stop for a human; never treated as acceptance
+ *   no usable answer, this run       -> ask again only within the provider-retry budget
+ *   otherwise                        -> stop for a human; never treated as acceptance
  * Accepted and remediation-required effects never reach here: they decided the review.
  */
 function decisionGate(
   state: ProjectState,
   task: TaskView,
   review: TaskReview,
+  policy: OrchestrationPolicy,
   context: DecisionContext,
   humanGate: (detail: string, reason: StopReason, extra: readonly string[]) => NextAction,
 ): NextAction {
   const tries = state.aiDecisions.filter((decision) => decision.reviewId === review.id);
   const last = tries.at(-1);
-  const ask: NextAction = { kind: 'decide', taskId: task.task.id, attempt: review.attempt, reviewId: review.id };
+  const ask: NextAction = { kind: 'decide', taskId: task.task.id, attempt: review.attempt, reviewId: review.id, retry: false };
   if (last === undefined) {
     return ask;
+  }
+  if (last.status === 'decided' && evidenceLimited(review, last)) {
+    // The decision-maker would accept but was not confident, and Forge's own records show the evidence
+    // it saw was cut short (truncated or omitted files): first show it more, then decide again.
+    const round = review.evidenceRound + 1;
+    if (round <= Math.min(policy.recovery.evidenceReviews, ORCHESTRATION_LIMITS.maxEvidenceReviews)) {
+      return { kind: 'review', taskId: task.task.id, attempt: review.attempt, evidenceRound: round, purpose: 'expand' };
+    }
+    if (policy.recovery.evidenceReviews > 0) {
+      return humanGate(
+        `The AI decision-maker would accept task ${task.key} but only with ${last.confidence} confidence, and the evidence is still truncated after ${review.evidenceRound} expanded re-review(s)`,
+        'evidence-review-exhausted',
+        decisionEvidence(last),
+      );
+    }
   }
   if (last.status === 'decided') {
     const why = last.humanReason ?? last.policyNote ?? last.reason ?? 'no reason given';
@@ -481,12 +640,15 @@ function decisionGate(
       ? humanGate(`The AI decision-maker escalated review of task ${task.key} (${verdict}): ${why}`, 'decision-escalated', decisionEvidence(last))
       : humanGate(`Forge did not apply the AI decision-maker's verdict on review of task ${task.key} (${verdict}): ${why}`, 'decision-overruled', decisionEvidence(last));
   }
+  const thisRun = context.decisionsThisRun?.has(last.id) ?? false;
+  // Within this run, an unusable answer is retried only within the provider-retry budget.
+  const retryAllowed = tries.length < AI_LIMITS.aiDecisionsPerReview && (!thisRun || tries.length <= policy.recovery.providerRetries);
   const human = humanGate(
     `The AI decision-maker gave no usable answer for task ${task.key} (${last.status}${last.diagnostic === null ? '' : `: ${last.diagnostic}`}); a human decision is required`,
-    unusableAnswerReason(last),
+    !retryAllowed && policy.recovery.providerRetries > 0 ? 'provider-retry-exhausted' : unusableAnswerReason(last),
     decisionEvidence(last),
   );
-  if ((context.decisionsThisRun?.has(last.id) ?? false) || tries.length >= AI_LIMITS.aiDecisionsPerReview) {
+  if (!retryAllowed) {
     return human;
   }
   // A human's answer to the request for this same evidence outranks asking the AI again: an
@@ -496,7 +658,17 @@ function decisionGate(
   if (human.kind === 'apply-approval' || (human.kind === 'stop' && (human.reason === 'approval-rejected' || human.reason === 'review-rejection-blocked'))) {
     return human;
   }
-  return ask;
+  return { ...ask, retry: true, ...(thisRun ? { backoffMs: backoff(policy, tries.length) } : {}) };
+}
+
+/**
+ * Whether a usable decision was limited by evidence rather than by the work:
+ * the decision-maker answered "accept" but below high confidence, AND Forge's
+ * own records (not the model) show the review or decision packet was
+ * truncated — files omitted or cut short by the evidence limits.
+ */
+function evidenceLimited(review: TaskReview, decision: AiDecisionRecord): boolean {
+  return decision.verdict === 'accept' && decision.confidence !== 'high' && (review.context.truncated || decision.context.truncated);
 }
 
 /** The stop reason for a decision attempt that produced no usable answer, by what actually happened. */
@@ -534,7 +706,7 @@ function rejectionAsRemediation(state: ProjectState, task: TaskView, policy: Orc
   if (approval === undefined || approval.type !== 'review-acceptance' || approval.status !== 'rejected') {
     return action;
   }
-  const blocker = repairProblem(task, policy) ?? reopenProblem(state, task);
+  const blocker = repairProblem(task, policy, 'review') ?? reopenProblem(state, task);
   if (blocker !== null) {
     return {
       kind: 'stop',

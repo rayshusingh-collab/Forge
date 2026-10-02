@@ -1,5 +1,5 @@
 import type { ChangeSummary, ProjectState, WorkerRunRecord } from '../state/index.ts';
-import { TASK_CONDITIONS, acceptedWork, shortId } from '../tasks/index.ts';
+import { TASK_CONDITIONS, acceptedWork, budgetUsage, describeBudgetUsage, shortId } from '../tasks/index.ts';
 import { formatValidation } from './commands/validation.ts';
 import type { MilestoneView, TaskCondition, TaskView, WorkflowView } from '../tasks/index.ts';
 
@@ -58,7 +58,8 @@ export function formatTask(task: TaskView, view: WorkflowView, state: ProjectSta
     `  Milestone:   ${task.milestone.order} ${task.milestone.title} (${task.milestone.status})`,
     `  Status:      ${task.task.status}`,
     `  Condition:   ${task.condition}${conditionHint(task)}`,
-    `  Attempts:    ${task.attemptsUsed} of ${task.task.maxAttempts} used`,
+    `  Attempts:    ${task.task.attempts.length} recorded; ${task.attemptsUsed} of ${task.task.maxAttempts} implementation attempts used`,
+    `  Budgets:     ${describeBudgetUsage(budgetUsage(state, task.task), null).join('; ')}`,
   ];
   if (task.task.dependsOn.length > 0) {
     lines.push('  Depends on:');

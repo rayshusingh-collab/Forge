@@ -141,6 +141,41 @@ export const STOP_REASON_INFO: Readonly<Record<StopReason, StopReasonInfo>> = {
     action:
       'A human rejected the approval Forge needed (a retry, violation acknowledgement or recovery: rejection means STOP); resolve the task manually (e.g. `forge task cancel <task>`) or change the situation. (A rejected review-acceptance request is different: the next `forge run` applies it as the human\'s remediation decision and repairs the task.)',
   },
+  'validation-repair-exhausted': {
+    label: 'VALIDATION REPAIR BUDGET EXHAUSTED',
+    category: 'human',
+    action:
+      'The task still fails deterministic validation and its implementation-repair budget (shared by validation and review repairs) is used up. Inspect `forge task show <task>`; repair it by hand, raise `--max-repairs`, or cancel it.',
+  },
+  'review-repair-exhausted': {
+    label: 'REVIEW REPAIR BUDGET EXHAUSTED',
+    category: 'human',
+    action:
+      'The review still requires remediation and the implementation-repair budget (shared by validation and review repairs) is used up. Read `forge task review-show <task>`; accept or reject the review yourself, raise `--max-repairs`, or cancel the task.',
+  },
+  'timeout-recovery-exhausted': {
+    label: 'TIMEOUT RECOVERY EXHAUSTED',
+    category: 'human',
+    action:
+      'The worker kept timing out and the timeout-recovery budget is used up (its partial work is still in the working tree). Split the task, raise `--timeout` / `--max-worker-timeout` / `--timeout-recoveries`, or approve one more attempt (`forge approval`).',
+  },
+  'provider-retry-exhausted': {
+    label: 'PROVIDER RETRY BUDGET EXHAUSTED',
+    category: 'human',
+    action: 'A provider kept failing and the provider-retry budget is used up. Check it (`forge provider check`, `forge doctor`), then run `forge run` again.',
+  },
+  'evidence-review-exhausted': {
+    label: 'EVIDENCE REVIEW BUDGET EXHAUSTED',
+    category: 'human',
+    action:
+      'The decision-maker was still not confident after reviewing expanded evidence. Read `forge task review-show <task>`, then decide: `forge task review-accept|review-reject <task> --reason "..."` (or the pending approval).',
+  },
+  'unsafe-partial-work': {
+    label: 'UNSAFE PARTIAL WORK — HUMAN REQUIRED',
+    category: 'unsafe',
+    action:
+      'The interrupted worker left changes Forge cannot safely attribute to the task (out of scope, moved HEAD, mixed or staged files, or unmeasurable). Inspect the working tree; then approve one more attempt (`forge approval`) or repair it by hand.',
+  },
   'review-rejection-blocked': {
     label: 'REVIEW REJECTED — CANNOT REOPEN FOR REPAIR',
     category: 'human',

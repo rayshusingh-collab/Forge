@@ -120,7 +120,7 @@ describe('mixed-provider workflows (real CLI + registries, fake provider CLIs)',
     const second = cli(e.setup.root, e.env);
     assert.equal(await second.run(['run']), 0);
     assert.match(second.stdout.text, /Roles:\s+implementer claude-code; reviewer codex/);
-    assert.match(second.stdout.text, /Outcome:\s+COMPLETE/);
+    assert.match(second.stdout.text, /Outcome:\s+WORKFLOW COMPLETE/);
     const state = await e.setup.store.load();
     assert.deepEqual(state.workerRuns.map((run) => run.worker), ['claude-code', 'claude-code']);
     assert.deepEqual(state.taskReviews.map((review) => review.call.provider), ['codex', 'codex']);

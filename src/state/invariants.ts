@@ -1,6 +1,7 @@
 import { SchemaViolation } from '../core/validation.ts';
 import { describeDependencyProblem, findDependencyProblem } from './graph.ts';
-import { AI_LIMITS } from './model.ts';
+import { attemptsWithTrigger, implementationAttempts, isRecoveryTrigger } from './attempts.ts';
+import { AI_LIMITS, ORCHESTRATION_LIMITS, RECOVERABLE_OUTCOMES } from './model.ts';
 import type { AttemptOutcome, ProjectState, TaskAttempt, TaskRecord, TaskStatus, WorkerRunRecord, WorkerRunStatus } from './model.ts';
 
 /**
@@ -158,30 +159,35 @@ function checkApprovals(state: ProjectState, taskIds: ReadonlySet<string>): void
 
 /**
  * A repair attempt must follow directly from the attempt whose evidence
- * triggered it: failed validation, or a review-driven remediation decision
- * on a recorded review. Repair numbers count up by one per task.
+ * triggered it: failed validation, a review-driven remediation decision on a
+ * recorded review, a worker timeout (timeout recovery), or a failed worker
+ * invocation (provider retry). Implementation repairs share one numbering
+ * per task; each recovery kind counts up on its own.
  */
 function checkRepairs(state: ProjectState): void {
   const reviews = new Map(state.taskReviews.map((review) => [review.id, review]));
   for (const [taskIndex, task] of state.tasks.entries()) {
-    let repairs = 0;
+    const counts = new Map<string, number>();
     for (const [index, attempt] of task.attempts.entries()) {
       const repair = attempt.origin?.repair ?? null;
       if (repair === null) {
         continue;
       }
       const path = `tasks[${taskIndex}].attempts[${index}].origin.repair`;
-      repairs += 1;
-      if (repair.number !== repairs) {
-        throw new SchemaViolation(`${path}.number`, `must be ${repairs} (repairs are counted per task)`);
+      const sequence = isRecoveryTrigger(repair.trigger) ? repair.trigger : 'implementation';
+      const expectedNumber = (counts.get(sequence) ?? 0) + 1;
+      counts.set(sequence, expectedNumber);
+      if (repair.number !== expectedNumber) {
+        throw new SchemaViolation(`${path}.number`, `must be ${expectedNumber} (${sequence === 'implementation' ? 'repairs' : `${sequence} recoveries`} are counted per task)`);
       }
       const source = task.attempts[repair.fromAttempt - 1];
       if (repair.fromAttempt !== attempt.number - 1 || source === undefined) {
         throw new SchemaViolation(`${path}.fromAttempt`, 'must be the previous attempt');
       }
-      const expected = repair.trigger === 'validation' ? 'validation-failed' : 'review-rejected';
-      if (source.outcome !== expected) {
-        throw new SchemaViolation(`${path}.trigger`, `"${repair.trigger}" requires the previous attempt to be ${expected}`);
+      const expected: readonly AttemptOutcome[] =
+        repair.trigger === 'validation' ? ['validation-failed'] : repair.trigger === 'review' ? ['review-rejected'] : RECOVERABLE_OUTCOMES[repair.trigger];
+      if (!expected.includes(source.outcome)) {
+        throw new SchemaViolation(`${path}.trigger`, `"${repair.trigger}" requires the previous attempt to be ${expected.join(' or ')}`);
       }
       if (repair.reviewId !== null) {
         const review = reviews.get(repair.reviewId);
@@ -381,8 +387,12 @@ function checkTask(
   linkedRuns: Set<string>,
   statusById: ReadonlyMap<string, TaskStatus>,
 ): void {
-  if (task.attempts.length > task.maxAttempts) {
-    throw new SchemaViolation(`${path}.attempts`, `exceed maxAttempts (${task.maxAttempts})`);
+  // Recovery attempts continue an unfinished attempt and have their own hard budgets.
+  if (implementationAttempts(task) > task.maxAttempts) {
+    throw new SchemaViolation(`${path}.attempts`, `exceed maxAttempts (${task.maxAttempts} implementation attempts)`);
+  }
+  if (attemptsWithTrigger(task, 'timeout') > ORCHESTRATION_LIMITS.maxTimeoutRecoveries || attemptsWithTrigger(task, 'worker-failure') > ORCHESTRATION_LIMITS.maxProviderRetries) {
+    throw new SchemaViolation(`${path}.attempts`, 'exceed the hard recovery limits');
   }
   task.attempts.forEach((attempt, index) => {
     const attemptPath = `${path}.attempts[${index}]`;
@@ -437,7 +447,7 @@ function checkTask(
 function checkHumanRepair(task: TaskRecord, path: string): void {
   const repair = task.humanRepair!;
   const last = task.attempts.at(-1);
-  if (last === undefined || task.attempts.length < task.maxAttempts || repair.afterAttempt !== last.number) {
+  if (last === undefined || implementationAttempts(task) < task.maxAttempts || repair.afterAttempt !== last.number) {
     throw new SchemaViolation(`${path}.afterAttempt`, 'must be the last attempt of a task that used all its attempts');
   }
   if (!FAILED_ATTEMPT_OUTCOMES.includes(last.outcome)) {

@@ -28,6 +28,26 @@ export interface ReviewPacketLimits {
 
 export const DEFAULT_REVIEW_LIMITS: ReviewPacketLimits = { maxFiles: 50, maxBytes: 100_000, maxFileBytes: 8_000 };
 
+/** Upper bound of any expanded packet, whatever the round: evidence stays bounded. */
+const MAX_EXPANDED_BYTES = 1_000_000;
+
+/**
+ * Limits for the Nth evidence-expansion round (0 = the given base limits).
+ * Each round shows strictly more: more files, more bytes in total and per
+ * file (per-file content grows fastest, since truncated files are the usual
+ * reason a decision lacked evidence). Still bounded.
+ */
+export function expandedLimits(base: ReviewPacketLimits, round: number): ReviewPacketLimits {
+  if (round <= 0) {
+    return base;
+  }
+  return {
+    maxFiles: base.maxFiles * 2 ** round,
+    maxBytes: Math.min(MAX_EXPANDED_BYTES, base.maxBytes * 3 ** round),
+    maxFileBytes: Math.min(MAX_EXPANDED_BYTES, base.maxFileBytes * 4 ** round),
+  };
+}
+
 export interface ReviewPacket {
   readonly text: string;
   readonly summary: ContextSummary;

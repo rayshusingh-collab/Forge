@@ -1,7 +1,7 @@
 import { decideNext } from '../orchestration/decision.ts';
 import { describeStop } from '../orchestration/stop-reason.ts';
 import type { ApprovalRecord, OrchestrationPolicy, OrchestrationRun, ProjectState, StopReason } from '../state/index.ts';
-import { repairsUsed } from '../tasks/index.ts';
+import { budgetUsage, describeBudgetUsage, repairsUsed } from '../tasks/index.ts';
 import type { TaskView, WorkflowView } from '../tasks/index.ts';
 
 /**
@@ -89,6 +89,7 @@ function explainRun(state: ProjectState, view: WorkflowView, run: OrchestrationR
       `Deterministic validation: ${last?.validation === null || last?.validation === undefined ? 'NOT RUN' : last.validation.status === 'passed' ? 'PASS' : last.validation.status.toUpperCase()}`,
       `AI review: ${!run.policy.review.enabled ? 'disabled for that run' : review === undefined ? 'NOT REVIEWED' : review.status.toUpperCase().replace('-', ' ')}${review === undefined ? '' : ` (review ${review.id.slice(0, 8)})`}`,
       `Automatic repair: ${repairOn ? `enabled (${repairsUsed(task.task)}/${run.policy.repair.maxPerTask} used)` : 'disabled'}`,
+      `Budgets used: ${describeBudgetUsage(budgetUsage(state, task.task), run.policy).join('; ')}`,
     );
     lines.push(...explainDecision(state, task, run.policy));
   }
@@ -204,6 +205,18 @@ function sentence(reason: StopReason, task: TaskView | undefined, state: Project
       return 'a human paused the project.';
     case 'approval-rejected':
       return `a human rejected the approval ${name.toLowerCase()} needed.`;
+    case 'timeout-recovery-exhausted':
+      return `${name}'s worker kept timing out and its timeout-recovery budget is used up (its partial work is still in the working tree).`;
+    case 'provider-retry-exhausted':
+      return `a provider kept failing for ${name.toLowerCase()} and the provider-retry budget is used up.`;
+    case 'unsafe-partial-work':
+      return `${name}'s interrupted worker left changes Forge cannot safely attribute to the task, so it will not continue them automatically.`;
+    case 'evidence-review-exhausted':
+      return `the AI decision-maker was still not confident about ${name.toLowerCase()} after the evidence re-review budget was used.`;
+    case 'validation-repair-exhausted':
+      return `${name} still fails deterministic validation and its implementation-repair budget is used up.`;
+    case 'review-repair-exhausted':
+      return `${name}'s review still requires remediation and its implementation-repair budget is used up.`;
     case 'review-rejection-blocked':
       return `a human rejected acceptance of ${name.toLowerCase()}, but Forge cannot reopen it for a repair.`;
     default:

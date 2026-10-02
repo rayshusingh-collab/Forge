@@ -245,6 +245,37 @@ export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
       return { ...review, decision: { ...decision, approvalId: null } };
     }),
   }),
+  // 10 -> 11: hands-off autonomous completion. Every existing review was a
+  // normal one (evidence round 0); stored policies were not autonomous and
+  // had no recovery budgets (a timeout or provider failure stopped for a
+  // human, which is exactly what 0 budgets mean); run counters had no
+  // recoveries. Nothing else changes.
+  10: (document) => ({
+    ...document,
+    schemaVersion: 11,
+    taskReviews: arrayOfObjects(document['taskReviews'], 'taskReviews').map((review, index) => {
+      if (Object.hasOwn(review, 'evidenceRound')) {
+        throw new SchemaViolation(`taskReviews[${index}].evidenceRound`, 'is not a recognised field in schema version 10');
+      }
+      return { ...review, evidenceRound: 0 };
+    }),
+    orchestrationRuns: arrayOfObjects(document['orchestrationRuns'], 'orchestrationRuns').map((run, index) => {
+      const policy = run['policy'];
+      const counters = run['counters'];
+      if (!isPlainObject(policy) || !isPlainObject(counters) || Object.hasOwn(policy, 'autonomous') || Object.hasOwn(policy, 'recovery') || Object.hasOwn(counters, 'timeoutRecoveries')) {
+        throw new SchemaViolation(`orchestrationRuns[${index}]`, 'is not a schema version 10 orchestration run');
+      }
+      return {
+        ...run,
+        policy: {
+          ...policy,
+          autonomous: false,
+          recovery: { timeoutRecoveries: 0, timeoutIncreaseMs: 0, maxWorkerTimeoutMs: policy['workerTimeoutMs'], providerRetries: 0, retryBackoffMs: 0, evidenceReviews: 0 },
+        },
+        counters: { ...counters, timeoutRecoveries: 0, providerRetries: 0, evidenceReviews: 0, humanInterventions: 0 },
+      };
+    }),
+  }),
 };
 
 /** Version 9 remediation records for the remediation decisions a version 8 document already holds. */
@@ -682,6 +713,7 @@ function decodeTaskReview(value: unknown, path: string): TaskReview {
     'diagnostic',
     'createdAt',
     'decision',
+    'evidenceRound',
   ]);
   return {
     id: r.id('id'),
@@ -697,6 +729,7 @@ function decodeTaskReview(value: unknown, path: string): TaskReview {
     diagnostic: r.nullableString('diagnostic', { maxLength: AI_LIMITS.diagnostic }),
     createdAt: r.timestamp('createdAt'),
     decision: r.nullable('decision', decodeReviewDecision),
+    evidenceRound: r.integer('evidenceRound', { min: 0, max: ORCHESTRATION_LIMITS.maxEvidenceReviews }),
   };
 }
 
