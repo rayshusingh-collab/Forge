@@ -217,12 +217,12 @@ describe('auto-decision: fail closed', () => {
     const decider = scriptedDecider(['I think this is fine, accept it.']);
     const options = auto(reviewer, decider);
     const first = await makeOrchestrator(setup, worker, options, { reviewer, decisionMaker: decider }).run();
-    assert.equal(first.stop.reason, 'decision-maker-unavailable');
+    assert.equal(first.stop.reason, 'decision-maker-invalid-output');
     let state = await setup.store.load();
     assert.deepEqual([state.aiDecisions[0]!.status, state.aiDecisions[0]!.effect, state.aiDecisions[0]!.verdict], ['invalid-output', 'escalated', null]);
     assert.equal(state.taskReviews[0]!.decision, null);
     for (let run = 0; run < 3; run++) {
-      assert.equal((await makeOrchestrator(setup, worker, options, { reviewer, decisionMaker: decider }).run()).stop.reason, 'decision-maker-unavailable');
+      assert.equal((await makeOrchestrator(setup, worker, options, { reviewer, decisionMaker: decider }).run()).stop.reason, 'decision-maker-invalid-output');
     }
     assert.equal(decider.requests.length, 3, 'asked at most 3 times for one review, once per run');
     state = await setup.store.load();
@@ -392,7 +392,7 @@ describe('auto-decision: hard human boundaries never reach the decision-maker', 
     const reviewer = scriptedReviewer([CONCERN]);
     const decider = scriptedDecider([decisionJson({ decision: 'reject', requiredActions: ['Add tests'], findingAssessments: ASSESS_1_ACCEPTABLE })]);
     const result = await makeOrchestrator(setup, worker, auto(reviewer, decider), { reviewer, decisionMaker: decider }).run();
-    assert.equal(result.stop.reason, 'decision-escalated');
+    assert.equal(result.stop.reason, 'decision-overruled');
     const state = await setup.store.load();
     assert.deepEqual([state.tasks[0]!.status, state.tasks[0]!.attempts.length, state.tasks[0]!.maxAttempts], ['succeeded', 1, 1]);
     assert.match(state.aiDecisions[0]!.policyNote ?? '', /all 1 attempts have been used/);
@@ -409,7 +409,7 @@ describe('auto-decision: hard human boundaries never reach the decision-maker', 
       decisionJson({ ...reject, requirementAssessments: [{ requirement: 'R1', status: 'unsatisfied', evidence: 'still no tests' }] }),
     ]);
     const result = await makeOrchestrator(setup, worker, auto(reviewer, decider, { maxRepairsPerTask: 1 }), { reviewer, decisionMaker: decider }).run();
-    assert.equal(result.stop.reason, 'decision-escalated');
+    assert.equal(result.stop.reason, 'decision-overruled');
     assert.match(result.stop.detail ?? '', /repair budget is used up \(1\/1\)/);
     assert.equal(worker.requests.length, 2);
     assert.equal(decider.requests.length, 2);
@@ -465,7 +465,7 @@ describe('auto-decision: remediation tracking', () => {
     ]);
     const result = await makeOrchestrator(setup, worker, auto(reviewer, decider), { reviewer, decisionMaker: decider }).run();
     assert.deepEqual(steps(result), ['review:concerns', 'decide:ai-escalated']);
-    assert.equal(result.stop.reason, 'decision-escalated');
+    assert.equal(result.stop.reason, 'decision-overruled');
     assert.match(result.stop.detail ?? '', /nothing changed since remediation was required/, 'Forge refuses the naive acceptance');
     assert.ok(decider.requests[0]!.input.includes('NO attributed file changed since attempt 1'));
   });
@@ -600,7 +600,7 @@ describe('auto-decision: evidence over claims (real-world regression modelled on
       decisionJson({ reason: 'The worker says tests pass.', requirementAssessments: [{ requirement: 'R1', status: 'satisfied', evidence: 'worker claim' }] }),
     ]);
     const result = await makeOrchestrator(setup, worker, auto(reviewer, naive), { reviewer, decisionMaker: naive }).run();
-    assert.equal(result.stop.reason, 'decision-escalated');
+    assert.equal(result.stop.reason, 'decision-overruled');
     assert.match(result.stop.detail ?? '', /nothing changed since remediation was required/);
     assert.equal((await setup.store.load()).tasks[1]!.attempts.length, 0);
   });

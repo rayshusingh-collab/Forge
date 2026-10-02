@@ -34,9 +34,18 @@ export function taskApprovalBinding(state: ProjectState, type: Exclude<ApprovalT
   switch (type) {
     case 'review-acceptance': {
       const review = last === undefined ? undefined : [...state.taskReviews].reverse().find((candidate) => candidate.taskId === taskId && candidate.attempt === last.number);
+      // A usable AI decision on the review is evidence the human sees (its verdict and reasons), so
+      // a request made before it (e.g. after an invalid answer) cannot authorize what came after.
+      // Unusable answers add nothing to judge and leave the binding as it was; the key is only
+      // present when such a decision exists, so earlier fingerprints stay valid.
+      const aiDecision = review === undefined ? undefined : state.aiDecisions.findLast((decision) => decision.reviewId === review.id && decision.status === 'decided');
       return {
-        fingerprint: fingerprintOf({ ...base, review: review === undefined ? null : { id: review.id, status: review.status, decision: review.decision?.kind ?? null } }),
-        boundTo: `task ${taskId.slice(0, 8)} ${attemptText}; review ${review?.id.slice(0, 8) ?? 'none'} (${review?.status ?? '-'})`,
+        fingerprint: fingerprintOf({
+          ...base,
+          review: review === undefined ? null : { id: review.id, status: review.status, decision: review.decision?.kind ?? null },
+          ...(aiDecision === undefined ? {} : { aiDecision: { id: aiDecision.id, effect: aiDecision.effect } }),
+        }),
+        boundTo: `task ${taskId.slice(0, 8)} ${attemptText}; review ${review?.id.slice(0, 8) ?? 'none'} (${review?.status ?? '-'})${aiDecision === undefined ? '' : `; AI decision ${aiDecision.id.slice(0, 8)}`}`,
       };
     }
     case 'interrupted-recovery':

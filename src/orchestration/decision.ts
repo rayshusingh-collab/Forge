@@ -436,7 +436,9 @@ function explainIdle(state: ProjectState, view: WorkflowView): NextAction {
  * Auto-decision for a review that would otherwise stop for a human:
  *   no decision yet                  -> ask the decision-maker
  *   decided, but escalated           -> stop for a human (its reason is evidence)
- *   no usable answer, earlier run    -> ask again (bounded per review)
+ *   no usable answer, earlier run    -> ask again (bounded per review), unless a
+ *                                       human already approved or rejected the
+ *                                       acceptance for this exact evidence
  *   no usable answer, this run / cap -> stop for a human; never treated as acceptance
  * Accepted and remediation-required effects never reach here: they decided the review.
  */
@@ -455,16 +457,41 @@ function decisionGate(
   }
   if (last.status === 'decided') {
     const why = last.humanReason ?? last.policyNote ?? last.reason ?? 'no reason given';
-    return humanGate(`The AI decision-maker escalated review of task ${task.key} (${last.verdict}, confidence ${last.confidence}): ${why}`, 'decision-escalated', decisionEvidence(last));
+    // The model asked for a human, or Forge's rules refused to let its verdict take effect.
+    const verdict = `${last.verdict}, confidence ${last.confidence}`;
+    return last.verdict === 'escalate'
+      ? humanGate(`The AI decision-maker escalated review of task ${task.key} (${verdict}): ${why}`, 'decision-escalated', decisionEvidence(last))
+      : humanGate(`Forge did not apply the AI decision-maker's verdict on review of task ${task.key} (${verdict}): ${why}`, 'decision-overruled', decisionEvidence(last));
   }
+  const human = humanGate(
+    `The AI decision-maker gave no usable answer for task ${task.key} (${last.status}${last.diagnostic === null ? '' : `: ${last.diagnostic}`}); a human decision is required`,
+    unusableAnswerReason(last),
+    decisionEvidence(last),
+  );
   if ((context.decisionsThisRun?.has(last.id) ?? false) || tries.length >= AI_LIMITS.aiDecisionsPerReview) {
-    return humanGate(
-      `The AI decision-maker gave no usable answer for task ${task.key} (${last.status}${last.diagnostic === null ? '' : `: ${last.diagnostic}`}); a human decision is required`,
-      'decision-maker-unavailable',
-      decisionEvidence(last),
-    );
+    return human;
+  }
+  // A human's answer to the request for this same evidence outranks asking the AI again: an
+  // approval is used as approved, and a rejection is never overridden by a later AI acceptance.
+  // A still-pending request does not block the retry; a usable answer changes the evidence the
+  // request is bound to (see `taskApprovalBinding`), so the request can no longer be used.
+  if (human.kind === 'apply-approval' || (human.kind === 'stop' && human.reason === 'approval-rejected')) {
+    return human;
   }
   return ask;
+}
+
+/** The stop reason for a decision attempt that produced no usable answer, by what actually happened. */
+function unusableAnswerReason(decision: AiDecisionRecord): StopReason {
+  switch (decision.status) {
+    case 'invalid-output':
+      return 'decision-maker-invalid-output';
+    case 'timeout':
+      return 'decision-maker-timeout';
+    default:
+      // unavailable, failed, or cancelled in an earlier run: the provider produced no answer at all.
+      return 'decision-maker-unavailable';
+  }
 }
 
 /** Bounded evidence lines from an AI decision, for the human approval request. */

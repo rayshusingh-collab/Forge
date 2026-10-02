@@ -1,4 +1,4 @@
-export { DECISION_MAKER_INSTRUCTIONS, buildDecisionRequest, parseDecisionResponse } from './decider.ts';
+export { DECISION_MAKER_INSTRUCTIONS, DECISION_OUTPUT_LIMITS, buildDecisionRequest, parseDecisionResponse } from './decider.ts';
 export type { DecisionExpectations, DecisionParse, ParsedDecision } from './decider.ts';
 export { DEFAULT_DECISION_LIMITS, buildDecisionPacket, changedSince } from './packet.ts';
 export type { DecisionPacket, DecisionPacketInput, OutstandingRequirement } from './packet.ts';

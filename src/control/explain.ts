@@ -178,8 +178,14 @@ function sentence(reason: StopReason, task: TaskView | undefined, state: Project
       return `${name} changed things outside its permitted scope.`;
     case 'decision-escalated':
       return `the AI decision-maker escalated ${name.toLowerCase()}'s review to a human instead of deciding it.`;
+    case 'decision-overruled':
+      return `Forge's rules did not let the AI decision-maker's verdict on ${name.toLowerCase()}'s review take effect.`;
     case 'decision-maker-unavailable':
-      return `the AI decision-maker gave no usable answer for ${name.toLowerCase()} (never treated as acceptance).`;
+      return `the AI decision-maker could not be reached for ${name.toLowerCase()} (never treated as acceptance).`;
+    case 'decision-maker-invalid-output':
+      return `the AI decision-maker's answer for ${name.toLowerCase()} broke the decision contract and was rejected (never treated as acceptance).`;
+    case 'decision-maker-timeout':
+      return `the AI decision-maker did not answer in time for ${name.toLowerCase()} (never treated as acceptance).`;
     case 'reviewer-unavailable':
       return `the AI reviewer did not produce a usable review of ${name.toLowerCase()} (never treated as clear).`;
     case 'commit-refused':

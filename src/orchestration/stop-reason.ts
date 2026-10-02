@@ -83,10 +83,25 @@ export const STOP_REASON_INFO: Readonly<Record<StopReason, StopReasonInfo>> = {
     category: 'human',
     action: 'Read the escalation (`forge task review-show <task>`), then decide: `forge task review-accept <task> --reason "..."` or `forge task review-reject <task> --reason "..."` (or the pending approval).',
   },
+  'decision-overruled': {
+    label: 'AI DECISION NOT APPLIED BY FORGE RULES — HUMAN DECISION REQUIRED',
+    category: 'human',
+    action: 'The AI decision-maker answered, but Forge\'s evidence rules (confidence, validation, findings, requirements, repair budget) did not let its verdict take effect. Read `forge task review-show <task>`, then decide: `forge task review-accept|review-reject <task> --reason "..."` (or the pending approval).',
+  },
   'decision-maker-unavailable': {
     label: 'DECISION-MAKER UNAVAILABLE — HUMAN DECISION REQUIRED',
     category: 'human',
-    action: 'The AI decision-maker gave no usable answer (never treated as acceptance). Decide the review yourself (`forge task review-accept|review-reject <task>`), or check the provider (`forge provider check --role decision-maker`) and run again.',
+    action: 'The AI decision-maker could not be reached or failed (never treated as acceptance). Check the provider (`forge provider check --role decision-maker`) and run `forge run` again (bounded retries per review), or decide the review yourself (`forge task review-accept|review-reject <task>`).',
+  },
+  'decision-maker-invalid-output': {
+    label: 'DECISION-MAKER INVALID OUTPUT — HUMAN DECISION REQUIRED',
+    category: 'human',
+    action: 'The AI decision-maker answered, but its answer broke Forge\'s decision contract and was rejected (never treated as acceptance). Run `forge run` again to re-ask it (bounded retries per review), or decide the review yourself (`forge task review-accept|review-reject <task>`).',
+  },
+  'decision-maker-timeout': {
+    label: 'DECISION-MAKER TIMED OUT — HUMAN DECISION REQUIRED',
+    category: 'human',
+    action: 'The AI decision-maker did not answer in time (never treated as acceptance). Run `forge run` again, perhaps with a longer `--decision-timeout` (bounded retries per review), or decide the review yourself (`forge task review-accept|review-reject <task>`).',
   },
   'commit-refused': {
     label: 'COMMIT REFUSED',

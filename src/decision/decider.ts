@@ -1,6 +1,7 @@
 import { DATA_RULES } from '../ai/envelope.ts';
 import { extractJsonObject } from '../ai/structured.ts';
 import type { AiRequest, AiResponse } from '../ai/types.ts';
+import { MAX_AI_OUTPUT_CHARACTERS } from '../ai/types.ts';
 import { ObjectReader, SchemaViolation } from '../core/validation.ts';
 import { AI_DECISION_VERDICTS, AI_LIMITS, FINDING_ASSESSMENTS, REQUIREMENT_ASSESSMENTS, REVIEW_CONFIDENCE } from '../state/index.ts';
 import type { AiDecisionVerdict, FindingAssessment, RequirementAssessment, ReviewConfidence } from '../state/index.ts';
@@ -16,9 +17,34 @@ import type { AiDecisionVerdict, FindingAssessment, RequirementAssessment, Revie
  * (`rules.ts`) before anything changes.
  */
 
+/**
+ * Every bound the decoder enforces on an answer, in one place. The
+ * instructions below are generated from this table, so the model is told
+ * every limit Forge applies; there is no hidden decoder limit. An answer
+ * that exceeds any of them is invalid output: rejected, never truncated or
+ * partly used.
+ */
+export const DECISION_OUTPUT_LIMITS = {
+  reason: AI_LIMITS.decisionReason,
+  humanReason: AI_LIMITS.decisionReason,
+  findingAssessments: AI_LIMITS.reviewFindings,
+  findingNote: AI_LIMITS.assessmentNote,
+  requirementAssessments: AI_LIMITS.remediationRequirements * 10,
+  requirementEvidence: AI_LIMITS.assessmentNote,
+  requiredActions: AI_LIMITS.remediationRequirements,
+  requiredAction: AI_LIMITS.requirementText,
+  answer: MAX_AI_OUTPUT_CHARACTERS,
+} as const;
+
+const LIMITS = DECISION_OUTPUT_LIMITS;
+/** Requirement labels as the packet presents them (`R1`…`R999`); the state schema uses the same pattern. */
+const REQUIREMENT_LABEL = /^R[1-9][0-9]{0,2}$/;
+/** Guidance only, well under the hard limit, so a somewhat verbose answer still fits. */
+const SHORT_TEXT_TARGET = 300;
+
 export const DECISION_MAKER_INSTRUCTIONS = [
   'You are the engineering decision-maker for Forge, a local software-development orchestrator.',
-  'An implementer (another AI) worked on ONE task. Forge ran the project\'s configured deterministic checks and they PASSED. An AI reviewer then reviewed the work and raised concerns.',
+  'An implementer (another AI) worked on ONE task. Forge ran the project\'s configured deterministic checks and they PASSED. An AI reviewer then reviewed the work: it raised concerns, or remediation required earlier must still be confirmed against the evidence.',
   'Your job is NOT to review the code again. Your job is to JUDGE, from the evidence, whether the work should be accepted, sent back for remediation, or escalated to a human.',
   '',
   'Evidence hierarchy (strongest first):',
@@ -45,13 +71,23 @@ export const DECISION_MAKER_INSTRUCTIONS = [
   '{',
   '  "decision": "accept" | "reject" | "escalate",',
   '  "confidence": "low" | "medium" | "high",',
-  '  "reason": string,',
-  '  "findingAssessments": [{ "finding": number, "status": "resolved" | "unresolved" | "not-applicable" | "acceptable", "note": string }],',
-  '  "requirementAssessments": [{ "requirement": "R1", "status": "satisfied" | "unsatisfied" | "unverifiable", "evidence": string }],',
-  '  "requiredActions": string[],',
-  '  "humanReason": string | null',
+  `  "reason": string (at most ${LIMITS.reason} characters),`,
+  `  "findingAssessments": [{ "finding": number, "status": "resolved" | "unresolved" | "not-applicable" | "acceptable", "note": string (at most ${LIMITS.findingNote} characters) }],`,
+  `  "requirementAssessments": [{ "requirement": "R1", "status": "satisfied" | "unsatisfied" | "unverifiable", "evidence": string (at most ${LIMITS.requirementEvidence} characters) }],`,
+  `  "requiredActions": string[] (each at most ${LIMITS.requiredAction} characters),`,
+  `  "humanReason": string (at most ${LIMITS.humanReason} characters) | null`,
   '}',
-  `"requiredActions" must be non-empty (at most ${AI_LIMITS.remediationRequirements}) exactly when the decision is "reject", otherwise []. "humanReason" must be a string exactly when the decision is "escalate", otherwise null.`,
+  `"requiredActions" must be non-empty (at most ${LIMITS.requiredActions}) exactly when the decision is "reject", otherwise []. "humanReason" must be a string exactly when the decision is "escalate", otherwise null.`,
+  '',
+  'OUTPUT LIMITS. These are HARD limits and Forge checks every one. An answer that exceeds any of them is rejected as invalid (nothing is truncated or partly used) and the decision goes to a human instead:',
+  `- "reason": 1 to ${LIMITS.reason} characters.`,
+  `- "humanReason": 1 to ${LIMITS.humanReason} characters when the decision is "escalate", otherwise null.`,
+  `- "findingAssessments": at most ${LIMITS.findingAssessments} items, one per finding number as presented; each "note" at most ${LIMITS.findingNote} characters.`,
+  `- "requirementAssessments": at most ${LIMITS.requirementAssessments} items, one per requirement label exactly as presented (e.g. "R1"); each "evidence" at most ${LIMITS.requirementEvidence} characters.`,
+  `- "requiredActions": at most ${LIMITS.requiredActions} items, each 1 to ${LIMITS.requiredAction} characters.`,
+  `- The whole answer: at most ${LIMITS.answer} characters.`,
+  `Each "evidence" and "note" is concise factual evidence only: one or two sentences, in your own words, naming the files, checks or finding numbers that support the status. SUMMARIZE the evidence; do NOT reproduce it: never quote diffs, file contents, test or check output, or the requirement text. Aim for under ${SHORT_TEXT_TARGET} characters; never approach ${LIMITS.requirementEvidence}.`,
+  'Keep "reason", "humanReason" and each required action equally concise: state the judgment and the decisive evidence, not a transcript of it.',
 ].join('\n');
 
 export interface ParsedDecision {
@@ -103,11 +139,11 @@ export function parseDecisionResponse(response: AiResponse, expected: DecisionEx
     const decision: ParsedDecision = {
       verdict: r.oneOf('decision', AI_DECISION_VERDICTS),
       confidence: r.oneOf('confidence', REVIEW_CONFIDENCE),
-      reason: r.string('reason', { maxLength: AI_LIMITS.decisionReason }),
-      findingAssessments: r.array('findingAssessments', decodeFindingAssessment, AI_LIMITS.reviewFindings),
-      requirementAssessments: r.array('requirementAssessments', decodeRequirementAssessment, AI_LIMITS.remediationRequirements * 10),
-      requiredActions: r.array('requiredActions', decodeAction, AI_LIMITS.remediationRequirements),
-      humanReason: r.nullableString('humanReason', { maxLength: AI_LIMITS.decisionReason }),
+      reason: r.string('reason', { maxLength: LIMITS.reason }),
+      findingAssessments: r.array('findingAssessments', decodeFindingAssessment, LIMITS.findingAssessments),
+      requirementAssessments: r.array('requirementAssessments', decodeRequirementAssessment, LIMITS.requirementAssessments),
+      requiredActions: r.array('requiredActions', decodeAction, LIMITS.requiredActions),
+      humanReason: r.nullableString('humanReason', { maxLength: LIMITS.humanReason }),
     };
     const problem = coverageProblem(decision, expected);
     return problem === null ? { ok: true, decision } : { ok: false, diagnostic: `invalid decision: ${problem}` };
@@ -159,24 +195,24 @@ function coverageProblem(decision: ParsedDecision, expected: DecisionExpectation
 function decodeFindingAssessment(value: unknown, path: string): FindingAssessment {
   const r = new ObjectReader(value, path, ['finding', 'status', 'note']);
   return {
-    finding: r.integer('finding', { min: 1, max: AI_LIMITS.reviewFindings }),
+    finding: r.integer('finding', { min: 1, max: LIMITS.findingAssessments }),
     status: r.oneOf('status', FINDING_ASSESSMENTS),
-    note: r.string('note', { minLength: 0, maxLength: AI_LIMITS.assessmentNote }),
+    note: r.string('note', { minLength: 0, maxLength: LIMITS.findingNote }),
   };
 }
 
 function decodeRequirementAssessment(value: unknown, path: string): RequirementAssessment {
   const r = new ObjectReader(value, path, ['requirement', 'status', 'evidence']);
   return {
-    requirement: r.string('requirement', { maxLength: 8 }),
+    requirement: r.string('requirement', { pattern: REQUIREMENT_LABEL, patternDescription: 'a requirement label such as R1' }),
     status: r.oneOf('status', REQUIREMENT_ASSESSMENTS),
-    evidence: r.string('evidence', { minLength: 0, maxLength: AI_LIMITS.assessmentNote }),
+    evidence: r.string('evidence', { minLength: 0, maxLength: LIMITS.requirementEvidence }),
   };
 }
 
 function decodeAction(value: unknown, path: string): string {
-  if (typeof value !== 'string' || value.trim() === '' || value.length > AI_LIMITS.requirementText) {
-    throw new SchemaViolation(path, `must be a non-empty string of at most ${AI_LIMITS.requirementText} characters`);
+  if (typeof value !== 'string' || value.trim() === '' || value.length > LIMITS.requiredAction) {
+    throw new SchemaViolation(path, `must be a non-empty string of at most ${LIMITS.requiredAction} characters`);
   }
   return value.trim();
 }
