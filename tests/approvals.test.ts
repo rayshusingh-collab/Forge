@@ -143,14 +143,16 @@ describe('approvals in the orchestration loop', () => {
     );
   });
 
-  it('a rejected approval stops the run without executing anything or re-asking', async () => {
+  it('a rejected review-acceptance approval is applied as the human\'s remediation decision, never as acceptance or a new request', async () => {
+    // Rejecting acceptance means "revise it" (tests/review-rejection.test.ts); other rejected types stop.
     const { setup, approvalId, worker } = await concernStop();
     await setup.store.update((state) => resolveApproval(state, approvalId, 'rejected', 'Concern is valid', new Date(), state.approvals[0]!.fingerprint).state);
-    const result = await makeOrchestrator(setup, worker, { review: true, reviewer: 'fake-reviewer' }, { reviewer: scriptedReviewer([reviewJson([])]) }).run();
-    assert.equal(result.stop.reason, 'approval-rejected');
-    assert.match(result.stop.detail ?? '', /Concern is valid/);
-    assert.equal(worker.requests.length, 1);
-    assert.equal((await setup.store.load()).approvals.length, 1, 'no new request while the rejection applies');
+    const result = await makeOrchestrator(setup, worker, { review: true, reviewer: 'fake-reviewer' }, { reviewer: scriptedReviewer([reviewJson([])]) }).run('step');
+    assert.deepEqual(result.steps.map((step) => `${step.action}:${step.outcome}`), ['apply-approval:remediation-required']);
+    assert.equal(worker.requests.length, 1, 'nothing executed in that step');
+    const state = await setup.store.load();
+    assert.deepEqual([state.taskReviews[0]!.decision?.kind, state.taskReviews[0]!.decision?.approvalId, state.remediations[0]!.requirements], ['remediation-required', approvalId, ['Concern is valid']]);
+    assert.deepEqual(state.approvals.map((approval) => approval.status), ['rejected'], 'no new request; the rejection stays on record');
   });
 
   it('a task-retry approval authorizes exactly one more attempt (a repair with evidence)', async () => {

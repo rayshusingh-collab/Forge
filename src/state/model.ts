@@ -30,8 +30,11 @@
  *     remediation decisions), `aiDecisions`, review decisions gain
  *     `aiDecisionId`, stored policies gain `decision` (disabled) and run
  *     counters `decisions` (migrated from 8).
+ * 10 — Review decisions record the human approval they came through
+ *     (`approvalId`, migrated from 9 as null), so a rejected
+ *     review-acceptance approval can become traceable remediation.
  */
-export const STATE_SCHEMA_VERSION = 9;
+export const STATE_SCHEMA_VERSION = 10;
 
 /** High-level lifecycle of the work Forge is doing on a project. */
 export const PROJECT_PHASES = ['idle', 'planning', 'executing', 'blocked', 'completed'] as const;
@@ -595,6 +598,12 @@ export interface ReviewDecision {
   readonly by: ReviewDecider;
   /** The AI decision this applies; set exactly when `by` is `ai`. */
   readonly aiDecisionId: string | null;
+  /**
+   * The review-acceptance approval through which a human decided, when they
+   * did so by approving (accepted) or rejecting (remediation-required) a
+   * request Forge made; null otherwise. Only ever set when `by` is `human`.
+   */
+  readonly approvalId: string | null;
 }
 
 /**
@@ -825,6 +834,7 @@ export const STOP_REASONS = [
   'error',
   'paused',
   'approval-rejected',
+  'review-rejection-blocked',
 ] as const;
 export type StopReason = (typeof STOP_REASONS)[number];
 

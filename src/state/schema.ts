@@ -228,6 +228,23 @@ export const STATE_MIGRATIONS: Readonly<Record<number, Migration>> = {
       }),
     };
   },
+  // 9 -> 10: review decisions record the approval a human decided through.
+  // Earlier decisions did not record one (an approval's ID only appeared in
+  // its reason text), so they migrate as null; nothing else changes.
+  9: (document) => ({
+    ...document,
+    schemaVersion: 10,
+    taskReviews: arrayOfObjects(document['taskReviews'], 'taskReviews').map((review, index) => {
+      const decision = review['decision'];
+      if (decision === null || decision === undefined) {
+        return review;
+      }
+      if (!isPlainObject(decision) || Object.hasOwn(decision, 'approvalId')) {
+        throw new SchemaViolation(`taskReviews[${index}].decision`, 'is not a schema version 9 review decision');
+      }
+      return { ...review, decision: { ...decision, approvalId: null } };
+    }),
+  }),
 };
 
 /** Version 9 remediation records for the remediation decisions a version 8 document already holds. */
@@ -700,16 +717,20 @@ export function decodeFinding(value: unknown, path: string): ReviewFinding {
 }
 
 function decodeReviewDecision(value: unknown, path: string): ReviewDecision {
-  const r = new ObjectReader(value, path, ['kind', 'reason', 'decidedAt', 'by', 'aiDecisionId']);
+  const r = new ObjectReader(value, path, ['kind', 'reason', 'decidedAt', 'by', 'aiDecisionId', 'approvalId']);
   const decision: ReviewDecision = {
     kind: r.oneOf('kind', REVIEW_DECISIONS),
     reason: r.string('reason', { maxLength: AI_LIMITS.reason }),
     decidedAt: r.timestamp('decidedAt'),
     by: r.oneOf('by', REVIEW_DECIDERS),
     aiDecisionId: r.nullableId('aiDecisionId'),
+    approvalId: r.nullableId('approvalId'),
   };
   if ((decision.by === 'ai') !== (decision.aiDecisionId !== null)) {
     throw new SchemaViolation(`${path}.aiDecisionId`, 'must be set exactly when the AI decision-maker decided');
+  }
+  if (decision.approvalId !== null && decision.by !== 'human') {
+    throw new SchemaViolation(`${path}.approvalId`, 'can only be set for a human decision');
   }
   return decision;
 }

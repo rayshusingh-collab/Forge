@@ -42,7 +42,18 @@ export type NextAction =
   | { readonly kind: 'decide'; readonly taskId: string; readonly attempt: number; readonly reviewId: string }
   | { readonly kind: 'commit'; readonly taskId: string; readonly attempt: number }
   | { readonly kind: 'complete-milestone'; readonly milestoneId: string }
-  | { readonly kind: 'apply-approval'; readonly approvalId: string; readonly approvalType: ApprovalType; readonly taskId: string }
+  | {
+      readonly kind: 'apply-approval';
+      readonly approvalId: string;
+      readonly approvalType: ApprovalType;
+      readonly taskId: string;
+      /**
+       * How the human resolved it. Normally only an approval is applied; a REJECTED
+       * review-acceptance request is applied too, as the human's remediation decision
+       * (see `rejectionAsRemediation`). Every other rejection stops.
+       */
+      readonly resolution: 'approved' | 'rejected';
+    }
   | {
       readonly kind: 'stop';
       readonly reason: StopReason;
@@ -219,9 +230,12 @@ function reviewGate(state: ProjectState, task: TaskView, attempt: number, policy
   }
   const count = (severities: readonly string[]): number => review.findings.filter((finding) => severities.includes(finding.severity)).length;
   const evidence = reviewEvidence(task, review);
-  const accept = 'Accept the implementation despite the review (recorded as a human review decision); the run then continues.';
+  const accept =
+    'Accept the implementation despite the review (recorded as a human review decision); the run then continues. Rejecting (with a reason saying what to fix) reopens the task for a bounded repair with that reason as its remediation.';
+  const acceptanceGate = (stopAction: NextAction, extra: readonly string[] = []): NextAction =>
+    rejectionAsRemediation(state, task, policy, gate(state, 'review-acceptance', task, stopAction, [...evidence, ...extra], accept));
   const humanGate = (detail: string, reason: StopReason = 'review-decision-required', extra: readonly string[] = []): NextAction =>
-    gate(state, 'review-acceptance', task, stop(reason, detail, task), [...evidence, ...extra], accept);
+    acceptanceGate(stop(reason, detail, task), extra);
   if (review.status === 'concerns' && policy.review.onConcerns === 'continue') {
     return null;
   }
@@ -239,7 +253,7 @@ function reviewGate(state: ProjectState, task: TaskView, attempt: number, policy
   }
   const problem = repairProblem(task, policy) ?? reopenProblem(state, task);
   if (problem !== null) {
-    return gate(state, 'review-acceptance', task, stop(problem.reason, `${blocking}; ${problem.detail}`, task), evidence, accept);
+    return acceptanceGate(stop(problem.reason, `${blocking}; ${problem.detail}`, task));
   }
   return { kind: 'repair', taskId: task.task.id, trigger: 'review', fromAttempt: attempt, reviewId: review.id, reopen: true };
 }
@@ -287,8 +301,12 @@ function runnableAction(state: ProjectState, task: TaskView, policy: Orchestrati
     const review = state.taskReviews.find(
       (candidate) => candidate.taskId === task.task.id && candidate.attempt === last.number && candidate.decision?.kind === 'remediation-required',
     );
-    // Remediation decided by the AI decision-maker is repaired automatically in an auto-decision run (budget permitting).
-    const permitted = policy.repair.onBlockingReview || (policy.decision.enabled && review?.decision?.by === 'ai');
+    // Remediation decided by the AI decision-maker is repaired automatically in an auto-decision run (budget permitting),
+    // and so is remediation a human asked for by rejecting Forge's review-acceptance request: that rejection IS the
+    // instruction to repair.
+    const decision = review?.decision ?? null;
+    const permitted =
+      policy.repair.onBlockingReview || (policy.decision.enabled && decision?.by === 'ai') || (decision?.by === 'human' && decision.approvalId !== null);
     if (!permitted || review === undefined) {
       return gate(state, 'task-retry', task, stop('review-remediation-required', `Task ${task.key} was reopened for remediation after a review`, task), evidence, retry, overLimit);
     }
@@ -333,7 +351,7 @@ function gate(
         (approval.status === 'pending' || approval.status === 'approved' || approval.status === 'rejected'),
     );
   if (match?.status === 'approved') {
-    return overLimit ?? { kind: 'apply-approval', approvalId: match.id, approvalType: type, taskId: task.task.id };
+    return overLimit ?? { kind: 'apply-approval', approvalId: match.id, approvalType: type, taskId: task.task.id, resolution: 'approved' };
   }
   if (match?.status === 'rejected') {
     return {
@@ -475,7 +493,7 @@ function decisionGate(
   // approval is used as approved, and a rejection is never overridden by a later AI acceptance.
   // A still-pending request does not block the retry; a usable answer changes the evidence the
   // request is bound to (see `taskApprovalBinding`), so the request can no longer be used.
-  if (human.kind === 'apply-approval' || (human.kind === 'stop' && human.reason === 'approval-rejected')) {
+  if (human.kind === 'apply-approval' || (human.kind === 'stop' && (human.reason === 'approval-rejected' || human.reason === 'review-rejection-blocked'))) {
     return human;
   }
   return ask;
@@ -492,6 +510,41 @@ function unusableAnswerReason(decision: AiDecisionRecord): StopReason {
       // unavailable, failed, or cancelled in an earlier run: the provider produced no answer at all.
       return 'decision-maker-unavailable';
   }
+}
+
+/**
+ * A human REJECTED Forge's request to accept this implementation. Approval
+ * semantics are type-specific: for `review-acceptance` (and only it) a
+ * rejection means "not accepted; revise it", so it is applied as the human's
+ * `remediation-required` review decision with the rejection reason as the
+ * requirement, through the same transition as `forge task review-reject`.
+ * Reopening is only proposed when a bounded repair can follow and the task
+ * may still be reopened; otherwise the run stops and names the blocker.
+ * Every other rejected approval (retry, violation acknowledgement, recovery)
+ * stays a stop.
+ *
+ * Exactly once: applying it decides the review the approval was bound to, so
+ * its fingerprint no longer matches and it is never matched again.
+ */
+function rejectionAsRemediation(state: ProjectState, task: TaskView, policy: OrchestrationPolicy, action: NextAction): NextAction {
+  if (action.kind !== 'stop' || action.reason !== 'approval-rejected' || action.approvalId === undefined) {
+    return action;
+  }
+  const approval = state.approvals.find((candidate) => candidate.id === action.approvalId);
+  if (approval === undefined || approval.type !== 'review-acceptance' || approval.status !== 'rejected') {
+    return action;
+  }
+  const blocker = repairProblem(task, policy) ?? reopenProblem(state, task);
+  if (blocker !== null) {
+    return {
+      kind: 'stop',
+      reason: 'review-rejection-blocked',
+      detail: `A human rejected review acceptance of task ${task.key} (approval ${approval.id.slice(0, 8)}: ${approval.resolution?.reason ?? ''}), but Forge cannot reopen it for remediation: ${blocker.detail}`,
+      taskId: task.task.id,
+      approvalId: approval.id,
+    };
+  }
+  return { kind: 'apply-approval', approvalId: approval.id, approvalType: 'review-acceptance', taskId: task.task.id, resolution: 'rejected' };
 }
 
 /** Bounded evidence lines from an AI decision, for the human approval request. */

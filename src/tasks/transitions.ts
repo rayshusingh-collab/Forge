@@ -359,7 +359,7 @@ export function reopenForRemediation(state: ProjectState, taskId: string, attemp
     throw new WorkflowError(`Task "${task.title}" belongs to a completed milestone; add a follow-up task instead`);
   }
   const note = requireText(reason, 'Remediation reason', TASK_LIMITS.note);
-  return replaceTask(state, resolveLastAttempt(task, 'review-rejected', `review remediation: ${note}`, now, 'failed'));
+  return replaceTask(state, resolveLastAttempt(task, 'review-rejected', bounded(`review remediation: ${note}`)!, now, 'failed'));
 }
 
 /** Records the local commit Forge created for a validated task. */

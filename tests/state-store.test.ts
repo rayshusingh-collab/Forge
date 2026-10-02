@@ -605,13 +605,13 @@ describe('StateStore: rejecting bad data', () => {
 
     it('rejects a decision on a review that did not complete', () =>
       expectLoadError(
-        { ...valid(), taskReviews: [review({ status: 'invalid-output', decision: { kind: 'accepted', reason: 'x', decidedAt: T0.toISOString(), by: 'human', aiDecisionId: null } })] },
+        { ...valid(), taskReviews: [review({ status: 'invalid-output', decision: { kind: 'accepted', reason: 'x', decidedAt: T0.toISOString(), by: 'human', aiDecisionId: null, approvalId: null } })] },
         /only allowed on a completed review/,
       ));
 
     it('rejects a remediation decision whose attempt was not reopened', () =>
       expectLoadError(
-        { ...valid(), taskReviews: [review({ decision: { kind: 'remediation-required', reason: 'x', decidedAt: T0.toISOString(), by: 'human', aiDecisionId: null } })] },
+        { ...valid(), taskReviews: [review({ decision: { kind: 'remediation-required', reason: 'x', decidedAt: T0.toISOString(), by: 'human', aiDecisionId: null, approvalId: null } })] },
         /requires remediation, but the attempt was not reopened/,
       ));
 

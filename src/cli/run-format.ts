@@ -60,7 +60,7 @@ export function formatStep(step: StepResult): string {
       lines.push(`MILESTONE: ${step.outcome.toUpperCase()}${step.detail === null ? '' : ` — ${step.detail}`}`);
       break;
     case 'apply-approval':
-      lines.push(`TASK ${step.taskKey ?? '?'} ${step.taskTitle ?? ''}`, `  Human approval: ${step.detail ?? step.outcome}`);
+      lines.push(`TASK ${step.taskKey ?? '?'} ${step.taskTitle ?? ''}`, `  ${step.outcome === 'remediation-required' ? 'Human review rejection' : 'Human approval'}: ${step.detail ?? step.outcome}`);
       if (step.worker !== null) {
         lines.push(
           `  Worker: ${step.worker.id} — ${step.worker.outcome} (a claim, not evidence)`,

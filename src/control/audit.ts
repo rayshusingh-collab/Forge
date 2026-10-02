@@ -74,7 +74,8 @@ export function deriveAudit(state: ProjectState, view: WorkflowView): AuditEvent
   for (const review of state.taskReviews) {
     add(review.createdAt, 'review', `${key(review.taskId)} #${review.attempt}`, `${review.status} by ${review.call.provider} (review ${review.id.slice(0, 8)}, ${review.findings.length} finding(s); advisory)`);
     if (review.decision !== null) {
-      add(review.decision.decidedAt, 'review decision', `${key(review.taskId)} #${review.attempt}`, `${review.decision.kind} by ${review.decision.by}: ${review.decision.reason}`);
+      const via = review.decision.approvalId === null ? '' : ` through approval ${review.decision.approvalId.slice(0, 8)}`;
+      add(review.decision.decidedAt, 'review decision', `${key(review.taskId)} #${review.attempt}`, `${review.decision.kind} by ${review.decision.by}${via}: ${review.decision.reason}`);
     }
   }
   for (const decision of state.aiDecisions) {

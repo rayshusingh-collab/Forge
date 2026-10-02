@@ -334,6 +334,9 @@ export class Orchestrator {
    * single action it authorizes happens through the normal services.
    */
   private async applyApproval(action: Extract<NextAction, { kind: 'apply-approval' }>, base: StepResult): Promise<StepResult> {
+    if (action.resolution === 'rejected') {
+      return this.applyReviewRejection(action, base);
+    }
     const { store } = this.options;
     const now = this.clock();
     let stale = false;
@@ -348,7 +351,9 @@ export class Orchestrator {
       }
       switch (action.approvalType) {
         case 'review-acceptance':
-          return decideReview(result.state, action.taskId, 'accepted', `Accepted by a human through approval ${approval.id.slice(0, 8)}: ${reason}`, now, 'human');
+          return decideReview(result.state, action.taskId, 'accepted', boundedReason(`Accepted by a human through approval ${approval.id.slice(0, 8)}: ${reason}`), now, 'human', {
+            approvalId: approval.id,
+          });
         case 'interrupted-recovery':
           // Marks the interrupted attempt failed; never re-runs it.
           return recoverTask(result.state, action.taskId, { force: false, liveness: this.liveness }, now);
@@ -511,6 +516,48 @@ export class Orchestrator {
   }
 
   /**
+   * Applies a human's REJECTION of a review-acceptance request as their
+   * remediation decision: in one atomic write, the review the request was
+   * bound to is decided `remediation-required` by the human (linked to the
+   * approval), the rejection reason becomes the remediation requirement
+   * verbatim, and the task is reopened through the normal transition (its
+   * attempt and validation evidence are kept). The approval itself stays
+   * `rejected`. Refused (nothing written) unless the request is still
+   * rejected and still bound to the current evidence; once applied the
+   * review is decided, so the request can never match or apply again.
+   */
+  private async applyReviewRejection(action: Extract<NextAction, { kind: 'apply-approval' }>, base: StepResult): Promise<StepResult> {
+    const now = this.clock();
+    const id = action.approvalId.slice(0, 8);
+    let reason = '';
+    let applied = false;
+    await this.options.store.update((current) => {
+      const approval = current.approvals.find((candidate) => candidate.id === action.approvalId);
+      if (approval === undefined || approval.type !== 'review-acceptance' || approval.status !== 'rejected' || approval.resolution === null) {
+        throw new WorkflowError(`Approval ${id} is no longer a rejected review-acceptance request`);
+      }
+      if (currentFingerprint(current, approval) !== approval.fingerprint) {
+        // Already applied (the review is decided) or the evidence changed: nothing to do.
+        return current;
+      }
+      reason = approval.resolution.reason;
+      applied = true;
+      return decideReview(current, action.taskId, 'remediation-required', boundedReason(`Rejected by a human through approval ${id}: ${reason}`), now, 'human', {
+        approvalId: approval.id,
+        requirements: [reason],
+      });
+    });
+    if (!applied) {
+      return { ...base, outcome: 'approval-not-applicable', detail: `Approval ${id} no longer matches the task's evidence; nothing was done` };
+    }
+    return {
+      ...base,
+      outcome: 'remediation-required',
+      detail: `Human rejected review acceptance through approval ${id}. Reason: ${reason} Forge reopened the task for remediation; next: repair it.`,
+    };
+  }
+
+  /**
    * Asks the AI decision-maker to judge the task's latest review. Forge's
    * rules decide the effect: acceptance (the run continues to the safe
    * commit), remediation (the next decision repairs the task), or
@@ -602,4 +649,10 @@ function blockingRequirements(state: ProjectState, reviewId: string | null): str
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** A review decision reason within the state bound (an approval reason may already use all of it). */
+function boundedReason(text: string): string {
+  const single = text.replace(/\s+/g, ' ').trim();
+  return single.length <= AI_LIMITS.reason ? single : `${single.slice(0, AI_LIMITS.reason - 1)}…`;
 }

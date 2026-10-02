@@ -49,6 +49,14 @@ export function explain(input: ExplainInput): string[] {
     if (now.approvalRequest !== undefined) {
       lines.push('  (Running `forge run` would record an approval request for this.)');
     }
+  } else if (now.kind === 'apply-approval' && now.resolution === 'rejected') {
+    const task = view.task(now.taskId);
+    const approval = state.approvals.find((candidate) => candidate.id === now.approvalId);
+    lines.push(
+      `  A human rejected review acceptance for task ${task?.key ?? now.taskId.slice(0, 8)} (approval ${now.approvalId.slice(0, 8)}).`,
+      `  Reason: ${approval?.resolution?.reason ?? ''}`,
+      "  A run would record that as the human's remediation decision, reopen the task for remediation, and then repair it (validated and reviewed again).",
+    );
   } else {
     const task = 'taskId' in now ? view.task(now.taskId) : undefined;
     lines.push(`  A run would ${describeAction(now.kind)}${task === undefined ? '' : ` task ${task.key} "${task.task.title}"`}.`);
@@ -196,6 +204,8 @@ function sentence(reason: StopReason, task: TaskView | undefined, state: Project
       return 'a human paused the project.';
     case 'approval-rejected':
       return `a human rejected the approval ${name.toLowerCase()} needed.`;
+    case 'review-rejection-blocked':
+      return `a human rejected acceptance of ${name.toLowerCase()}, but Forge cannot reopen it for a repair.`;
     default:
       return `${describeStop(reason).label.toLowerCase()}.`;
   }

@@ -115,7 +115,9 @@ function expectedPipeline(next: NextAction, policy: OrchestrationPolicy, require
     case 'complete-milestone':
       return ['complete the milestone (every task is succeeded or cancelled)'];
     case 'apply-approval':
-      return [`use human approval ${next.approvalId.slice(0, 8)} (${next.approvalType}) once, then continue`];
+      return next.resolution === 'rejected'
+        ? [`apply the human's rejection ${next.approvalId.slice(0, 8)} of review acceptance: reopen the task for remediation with its reason, then repair it`]
+        : [`use human approval ${next.approvalId.slice(0, 8)} (${next.approvalType}) once, then continue`];
     case 'stop':
       return [];
   }

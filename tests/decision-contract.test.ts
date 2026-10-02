@@ -386,15 +386,19 @@ describe('decision contract: resuming the real TaskFlow 2.1 failure', () => {
   });
 
   it('H: a human who answers the request first is not overridden by a retried AI decision', async () => {
-    // Rejected: the AI is not asked again, so it can never accept over a human "no".
+    // Rejected: the AI is not asked again about that evidence, so it can never accept over a human
+    // "no"; the rejection becomes the human's remediation decision (tests/review-rejection.test.ts).
     const rejected = await taskFlowAfterInvalidDecision();
     const request = pendingApproval(await rejected.setup.store.load());
+    const reviewId = (await rejected.setup.store.load()).taskReviews.at(-1)!.id;
     assert.equal(await resolve(rejected.setup, request.id, 'rejected', 'Tests are not convincing'), 'resolved');
     rejected.decider.next.splice(0, rejected.decider.next.length, VALID);
-    const stopped = await rejected.run();
-    assert.equal(stopped.stop.reason, 'approval-rejected');
-    assert.equal(rejected.decider.provider.requests.length, 1);
-    assert.equal((await rejected.setup.store.load()).tasks[1]!.attempts.length, 0);
+    const continued = await rejected.run();
+    assert.equal(steps(continued)[0], 'apply-approval:remediation-required');
+    const after = await rejected.setup.store.load();
+    assert.equal(after.aiDecisions.filter((decision) => decision.reviewId === reviewId).length, 1, 'no AI retry on the rejected evidence');
+    assert.deepEqual([after.taskReviews.find((review) => review.id === reviewId)!.decision?.by, after.tasks[0]!.attempts[1]!.outcome], ['human', 'review-rejected']);
+    assert.equal(after.tasks[0]!.attempts[1]!.commit, null, 'the rejected attempt is never committed');
 
     // Approved: the human decision is used (explicitly, once); the AI is not asked again.
     const approved = await taskFlowAfterInvalidDecision();

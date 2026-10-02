@@ -28,6 +28,8 @@ export interface ReviewDecisionExtras {
   readonly requirements?: readonly string[];
   /** Required exactly when `by` is `ai`: the AI decision being applied. */
   readonly aiDecisionId?: string;
+  /** A human decision made through a review-acceptance approval: that approval. */
+  readonly approvalId?: string;
 }
 
 /**
@@ -53,6 +55,9 @@ export function decideReview(
   if ((by === 'ai') !== (extras.aiDecisionId !== undefined)) {
     throw new WorkflowError('An AI review decision must reference its AI decision record (and only an AI decision may)');
   }
+  if (extras.approvalId !== undefined && by !== 'human') {
+    throw new WorkflowError('Only a human decision can come through an approval');
+  }
   const text = reason.trim();
   if (text === '' || text.length > AI_LIMITS.reason) {
     throw new WorkflowError(`A reason of 1-${AI_LIMITS.reason} characters is required`);
@@ -71,7 +76,7 @@ export function decideReview(
   if (review.decision !== null) {
     throw new WorkflowError(`The latest review was already decided (${review.decision.kind})`);
   }
-  const decided: TaskReview = { ...review, decision: { kind, reason: text, decidedAt: now.toISOString(), by, aiDecisionId: extras.aiDecisionId ?? null } };
+  const decided: TaskReview = { ...review, decision: { kind, reason: text, decidedAt: now.toISOString(), by, aiDecisionId: extras.aiDecisionId ?? null, approvalId: extras.approvalId ?? null } };
   const next = { ...state, taskReviews: state.taskReviews.map((candidate) => (candidate.id === review.id ? decided : candidate)) };
   if (kind === 'accepted') {
     return satisfyRemediations(next, taskId, attempt.number, review.id, now);

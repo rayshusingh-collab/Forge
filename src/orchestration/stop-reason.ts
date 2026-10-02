@@ -138,7 +138,14 @@ export const STOP_REASON_INFO: Readonly<Record<StopReason, StopReasonInfo>> = {
   'approval-rejected': {
     label: 'APPROVAL REJECTED',
     category: 'human',
-    action: 'A human rejected the approval Forge needed; resolve the task manually (e.g. `forge task cancel <task>`) or change the situation.',
+    action:
+      'A human rejected the approval Forge needed (a retry, violation acknowledgement or recovery: rejection means STOP); resolve the task manually (e.g. `forge task cancel <task>`) or change the situation. (A rejected review-acceptance request is different: the next `forge run` applies it as the human\'s remediation decision and repairs the task.)',
+  },
+  'review-rejection-blocked': {
+    label: 'REVIEW REJECTED — CANNOT REOPEN FOR REPAIR',
+    category: 'human',
+    action:
+      'A human rejected acceptance of the implementation, but Forge cannot reopen the task for a repair (the detail names the blocker: repair or attempt budget used up, or dependent work already ran). Repair it by hand, raise the budget (`forge run --max-repairs <n>`), cancel the task, or add a follow-up task.',
   },
 };
 

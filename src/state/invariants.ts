@@ -357,6 +357,16 @@ function checkRemediationsAndAiDecisions(state: ProjectState): void {
         throw new SchemaViolation(`taskReviews[${index}].decision.aiDecisionId`, 'must reference the AI decision whose effect it records');
       }
     }
+    // Approvals are pruned over time, so only a retained one can be checked: it must be this
+    // task's review-acceptance request, used (accepted) or rejected (remediation) by a human.
+    const approvalId = review.decision?.approvalId ?? null;
+    const approval = approvalId === null ? undefined : state.approvals.find((candidate) => candidate.id === approvalId);
+    if (approval !== undefined) {
+      const expected = review.decision!.kind === 'accepted' ? 'consumed' : 'rejected';
+      if (approval.type !== 'review-acceptance' || approval.taskId !== review.taskId || approval.status !== expected) {
+        throw new SchemaViolation(`taskReviews[${index}].decision.approvalId`, `must reference this task's review-acceptance approval, ${expected} by a human`);
+      }
+    }
   });
 }
 

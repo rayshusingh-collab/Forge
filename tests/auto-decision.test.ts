@@ -707,6 +707,7 @@ describe('auto-decision: resuming state written by the previous Forge (schema 8)
     for (const review of doc['taskReviews'] as Record<string, unknown>[]) {
       if (review['decision'] !== null) {
         delete (review['decision'] as Record<string, unknown>)['aiDecisionId'];
+        delete (review['decision'] as Record<string, unknown>)['approvalId'];
       }
     }
     for (const run of doc['orchestrationRuns'] as Record<string, Record<string, unknown>>[]) {
@@ -727,7 +728,7 @@ describe('auto-decision: resuming state written by the previous Forge (schema 8)
     await downgradeToV8(setup);
 
     const migrated = await openStateStore(setup.project).load();
-    assert.equal(migrated.schemaVersion, 9);
+    assert.equal(migrated.schemaVersion, 10, 'migrated through version 9 to the current version');
     assert.deepEqual(
       migrated.remediations.map((remediation) => [remediation.source, remediation.fromAttempt, remediation.status, remediation.requirements]),
       [['human', 1, 'open', ['Add deterministic unit tests for the date helpers']]],
